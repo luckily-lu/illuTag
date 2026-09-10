@@ -43,7 +43,7 @@ use illutag_core::library::{
     import_reference_board_item_to_library, list_library_from_state,
     list_image_auto_tags, list_image_user_tags, add_image_user_custom_tag, remove_image_user_custom_tag,
     add_image_user_supplement_tag, remove_image_user_supplement_tag,
-    list_tag_management_state, create_user_tag_folder, rename_user_tag_folder, delete_user_tag_folder,
+    list_tag_management_state, list_tag_dictionary_browser, create_user_tag_folder, rename_user_tag_folder, delete_user_tag_folder,
     assign_user_tag_to_folder, unassign_user_tag_from_folder, create_user_custom_tag, delete_user_custom_tag,
     dev_cleanup_stress_test_data, dev_create_fake_gallery_data, dev_create_small_file_test_set,
     export_data_migration_backup, export_organized_folder_result, inspect_data_migration_backup, import_data_migration_backup,
@@ -60,8 +60,8 @@ use illutag_core::library::{
     restore_reference_board_item,
     rename_reference_board, rename_reference_board_folder, reorder_reference_board,
     reorder_reference_board_folder, reorder_user_folder, rename_user_folder, update_reference_board_item_layout,
-    bring_reference_board_item_to_front, start_scan_all_folders_collect_only, start_scan_all_folders_with_tagging, start_tag_pending_images_only, test_wd_swinv2_tagger,
-    AppState, AtmosphereGenerationProgress, BackupPathMapping, BackgroundScanProgress, BackgroundScanStatus, BatchSupplementTagInput, BatchSystemTrashResult, ColorSignatureGenerationProgress, DataMigrationBackupInspection, DevFakeGalleryOptions, DevSmallFileSetOptions, DevStressToolResult, GalleryImagePage, GallerySearchFilters, ImageAutoTagSummary, ImageBytes, ImageUserTagSummary, KnownAutoTagSuggestion, LibraryStore, NaturalLanguageScanProgress, NaturalLanguageScanStatus, OrganizedExportManifest, ReferenceBoardPasteImageInput, StartupCleanupStatus, TagManagementState, ThumbnailGenerationProgress,
+    bring_reference_board_item_to_front,     start_scan_all_folders_collect_only, start_scan_all_folders_with_tagging, start_tag_pending_images_only, resume_incomplete_library_scan, test_wd_swinv2_tagger,
+    AppState, AtmosphereGenerationProgress, BackupPathMapping, BackgroundScanProgress, BackgroundScanStatus, BatchSupplementTagInput, BatchSystemTrashResult, ColorSignatureGenerationProgress, DataMigrationBackupInspection, DevFakeGalleryOptions, DevSmallFileSetOptions, DevStressToolResult, GalleryImagePage, GallerySearchFilters, ImageAutoTagSummary, ImageBytes, ImageUserTagSummary, KnownAutoTagSuggestion, LibraryStore, NaturalLanguageScanProgress, NaturalLanguageScanStatus, OrganizedExportManifest, ReferenceBoardPasteImageInput, StartupCleanupStatus, TagDictionaryBrowserState, TagManagementState, ThumbnailGenerationProgress,
     WdTaggerTestResult,
 };
 use std::{
@@ -552,6 +552,11 @@ fn remove_image_user_supplement_tag_command(
 #[tauri::command]
 fn list_tag_management_state_command(state: State<AppState>) -> Result<TagManagementState, String> {
     list_tag_management_state(&state)
+}
+
+#[tauri::command]
+fn list_tag_dictionary_browser_command(state: State<AppState>) -> Result<TagDictionaryBrowserState, String> {
+    list_tag_dictionary_browser(&state)
 }
 
 #[tauri::command]
@@ -1906,6 +1911,9 @@ fn main() {
                 wd_tagger_service: Arc::new(Mutex::new(None)),
             };
             let _ = warmup_clip_vector_cache(&app_state);
+            if let Err(error) = resume_incomplete_library_scan(&app_state) {
+                eprintln!("[wd-scan] resume incomplete scan failed: {error}");
+            }
             app.manage(app_state);
 
             Ok(())
@@ -1975,6 +1983,7 @@ fn main() {
             add_image_user_supplement_tag_command,
             remove_image_user_supplement_tag_command,
             list_tag_management_state_command,
+            list_tag_dictionary_browser_command,
             export_data_migration_backup_command,
             inspect_data_migration_backup_command,
             import_data_migration_backup_command,

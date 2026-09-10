@@ -7,7 +7,6 @@ import time
 
 try:
     import numpy as np
-    import onnxruntime as ort
     from PIL import Image
 except ModuleNotFoundError as e:
     missing = getattr(e, "name", "unknown")
@@ -22,20 +21,37 @@ except ModuleNotFoundError as e:
     )
     sys.exit(2)
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ort_runtime import create_session
+
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="WD SwinV2 tagger service")
+    parser = argparse.ArgumentParser(description="DanbooruTagQuery ONNX tagger service")
     parser.add_argument("--model", required=True, help="model.onnx path")
     parser.add_argument("--tags", required=True, help="selected_tags.csv path")
     parser.add_argument("--provider", choices=["cpu", "cuda"], default="cpu")
     return parser.parse_args()
 
 
-def pick_providers(provider: str):
-    available = ort.get_available_providers()
-    if provider == "cuda" and "CUDAExecutionProvider" in available:
-        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    return ["CPUExecutionProvider"]
+def load_tagger_config(model_path):
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(model_path)), "tagger_config.json")
+    config = {
+        "preprocess": "dtq",
+        "apply_sigmoid": True,
+        "output_name": "",
+        "layout": "nchw",
+        "general_threshold": 0.2,
+        "character_threshold": 0.2,
+    }
+    if os.path.isfile(cfg_path):
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            config.update(loaded)
+    return config
 
 
 def load_tags(csv_path):
@@ -57,30 +73,51 @@ def load_tags(csv_path):
     return tags
 
 
-def to_rgb_with_white_bg(image):
-    rgba = image.convert("RGBA")
-    base = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
-    base.alpha_composite(rgba)
-    return base.convert("RGB")
-
-
-def pad_to_square(image_rgb):
+def letterbox_square(image_rgb, size, fill=(0, 0, 0)):
     w, h = image_rgb.size
-    side = max(w, h)
-    canvas = Image.new("RGB", (side, side), (255, 255, 255))
-    canvas.paste(image_rgb, ((side - w) // 2, (side - h) // 2))
+    scale = size / max(w, h)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    image = image_rgb.resize((new_w, new_h), Image.Resampling.BILINEAR)
+    canvas = Image.new("RGB", (size, size), fill)
+    canvas.paste(image, ((size - new_w) // 2, (size - new_h) // 2))
     return canvas
 
 
-def preprocess(image_path, input_height, input_width):
-    image = Image.open(image_path)
-    image = to_rgb_with_white_bg(image)
-    image = pad_to_square(image)
-    image = image.resize((input_width, input_height), Image.Resampling.BICUBIC)
-    arr = np.asarray(image, dtype=np.float32)
-    arr = arr[:, :, ::-1]
-    arr = np.expand_dims(arr, axis=0)
-    return arr
+def preprocess_image(image_path, _preprocess, input_height, input_width):
+    size = max(input_height, input_width)
+    image = Image.open(image_path).convert("RGB")
+    image = letterbox_square(image, size, (0, 0, 0))
+    if image.size != (input_width, input_height):
+        image = image.resize((input_width, input_height), Image.Resampling.BILINEAR)
+    arr = np.asarray(image, dtype=np.float32) / 255.0
+    arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
+    return np.expand_dims(np.transpose(arr, (2, 0, 1)), axis=0)
+
+
+def resolve_hw(shape, layout):
+    if layout != "nhwc":
+        height = int(shape[2]) if len(shape) > 2 and isinstance(shape[2], int) else 448
+        width = int(shape[3]) if len(shape) > 3 and isinstance(shape[3], int) else 448
+    else:
+        height = int(shape[1]) if len(shape) > 1 and isinstance(shape[1], int) else 448
+        width = int(shape[2]) if len(shape) > 2 and isinstance(shape[2], int) else 448
+    return height, width
+
+
+def infer_layout(shape, _preprocess, configured):
+    if configured == "nhwc":
+        return "nhwc"
+    if len(shape) == 4 and isinstance(shape[1], int) and shape[1] not in (1, 3):
+        return "nhwc"
+    return "nchw"
+
+
+def to_probs(raw, apply_sigmoid):
+    values = np.asarray(raw, dtype=np.float32).reshape(-1)
+    if apply_sigmoid:
+        values = 1.0 / (1.0 + np.exp(-np.clip(values, -80.0, 80.0)))
+    return values.tolist()
 
 
 def main():
@@ -90,18 +127,23 @@ def main():
     if not os.path.isfile(args.tags):
         raise RuntimeError(f"selected_tags.csv not found: {args.tags}")
 
-    providers = pick_providers(args.provider)
+    config = load_tagger_config(args.model)
+    preprocess = str(config.get("preprocess", "dtq")).strip().lower() or "dtq"
+    apply_sigmoid = bool(config.get("apply_sigmoid", True))
+    configured_output = str(config.get("output_name", "") or "").strip()
     tags = load_tags(args.tags)
-    session = ort.InferenceSession(args.model, providers=providers)
+    session = create_session(args.model, args.provider, "wd-service")
     input_info = session.get_inputs()[0]
-    output_info = session.get_outputs()[0]
+    outputs = session.get_outputs()
     input_name = input_info.name
-    output_name = output_info.name
+    output_names = [item.name for item in outputs]
+    if configured_output and configured_output in output_names:
+        output_name = configured_output
+    else:
+        output_name = output_names[0]
     shape = input_info.shape
-    if len(shape) != 4:
-        raise RuntimeError(f"Unexpected input shape: {shape}")
-    input_height = int(shape[1]) if isinstance(shape[1], int) else 448
-    input_width = int(shape[2]) if isinstance(shape[2], int) else 448
+    layout = infer_layout(shape, preprocess, str(config.get("layout", "") or "").strip().lower())
+    input_height, input_width = resolve_hw(shape, layout)
 
     for line in sys.stdin:
         line = line.strip()
@@ -118,8 +160,14 @@ def main():
             request = json.loads(line)
             image_id = str(request.get("image_id", "")).strip()
             image_path = str(request.get("image_path", "")).strip()
-            general_threshold = float(request.get("general_threshold", 0.35))
-            character_threshold = float(request.get("character_threshold", 0.85))
+            if config.get("general_threshold") is not None:
+                general_threshold = float(config["general_threshold"])
+            else:
+                general_threshold = float(request.get("general_threshold", 0.2))
+            if config.get("character_threshold") is not None:
+                character_threshold = float(config["character_threshold"])
+            else:
+                character_threshold = float(request.get("character_threshold", 0.2))
 
             if not image_path:
                 raise RuntimeError("image_path is empty")
@@ -127,15 +175,15 @@ def main():
                 raise RuntimeError(f"Image not found: {image_path}")
 
             p0 = time.perf_counter()
-            tensor = preprocess(image_path, input_height, input_width)
+            tensor = preprocess_image(image_path, preprocess, input_height, input_width)
             preprocess_ms = (time.perf_counter() - p0) * 1000.0
 
             i0 = time.perf_counter()
-            outputs = session.run([output_name], {input_name: tensor})
+            outputs_raw = session.run([output_name], {input_name: tensor})
             inference_ms = (time.perf_counter() - i0) * 1000.0
 
             s0 = time.perf_counter()
-            probs = outputs[0][0].astype(np.float32).tolist()
+            probs = to_probs(outputs_raw[0][0], apply_sigmoid)
             if len(probs) != len(tags):
                 raise RuntimeError(
                     f"Output length mismatch: got {len(probs)} probs, expected {len(tags)} tags"

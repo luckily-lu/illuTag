@@ -8,6 +8,7 @@ import FolderOpen from '@icon-park/vue-next/es/icons/FolderOpen'
 import Like from '@icon-park/vue-next/es/icons/Like'
 import SettingTwo from '@icon-park/vue-next/es/icons/SettingTwo'
 import ShuffleOne from '@icon-park/vue-next/es/icons/ShuffleOne'
+import BookOne from '@icon-park/vue-next/es/icons/BookOne'
 import Tag from '@icon-park/vue-next/es/icons/Tag'
 import WaterfallsV from '@icon-park/vue-next/es/icons/WaterfallsV'
 
@@ -38,6 +39,7 @@ defineProps<{
   viewMode: ViewMode
   activeUserFolderId: number | 'all' | 'random' | 'favorites' | 'unclassified' | 'trash'
   tagManagerOpen: boolean
+  tagManagerTab: 'custom' | 'dict'
   folderTree: FolderTreeItem[]
   imageDragActive: boolean
   folderDragOverId: number | null
@@ -135,12 +137,23 @@ defineProps<{
           <button
             class="sidebar__nav-button"
             type="button"
-            :class="{ 'is-active': tagManagerOpen }"
-            @click="handlers.openTagManager()"
+            :class="{ 'is-active': tagManagerOpen && tagManagerTab === 'custom' }"
+            @click="handlers.openTagManager('custom')"
           >
             <span class="sidebar__nav-content">
               <Tag class="sidebar__nav-icon" theme="outline" :size="15" :stroke-width="3" :fill="['currentColor']" />
               <span class="sidebar__nav-label">标签管理</span>
+            </span>
+          </button>
+          <button
+            class="sidebar__nav-button"
+            type="button"
+            :class="{ 'is-active': tagManagerOpen && tagManagerTab === 'dict' }"
+            @click="handlers.openTagManager('dict')"
+          >
+            <span class="sidebar__nav-content">
+              <BookOne class="sidebar__nav-icon" theme="outline" :size="15" :stroke-width="3" :fill="['currentColor']" />
+              <span class="sidebar__nav-label">标签浏览</span>
             </span>
           </button>
         </div>

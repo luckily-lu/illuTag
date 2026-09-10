@@ -95,6 +95,7 @@ const searchChipsDragState = ref<{
   startX: number
   startScrollLeft: number
 } | null>(null)
+const searchBarMode = ref<'tags' | 'file' | 'image' | 'nl'>('tags')
 const imageSearchDragDepth = ref(0)
 const imageSearchDragActive = ref(false)
 const internalImageSearchDragActive = ref(false)
@@ -261,19 +262,11 @@ function onSearchPointerEnter() {
 
 function onSearchPointerLeave() {
   props.handlers.setSearchPointerInside(false)
-  clearSearchHideTimer()
-  searchHideTimer.value = window.setTimeout(() => {
-    if (props.isSearchFocused) {
-      searchHideTimer.value = null
-      return
-    }
-    if (isPointerInSearchSafeArea()) {
-      searchHideTimer.value = null
-      return
-    }
-    props.handlers.hideSearchPanel()
-    searchHideTimer.value = null
-  }, 60)
+}
+
+function setSearchBarMode(mode: 'tags' | 'file' | 'image' | 'nl') {
+  searchBarMode.value = mode
+  props.handlers.setSearchMode(mode === 'image' ? 'image' : 'text')
 }
 
 function onGalleryScrollEvent(event: Event) {
@@ -646,19 +639,8 @@ function onSearchWheel(event: WheelEvent) {
     @scroll.passive="onGalleryScrollEvent($event)"
   >
     <div
-      class="gallery-search-hotspot"
-      :class="{ 'is-active': searchRevealMode === 'hidden' }"
-      @mouseenter="onSearchHotspotEnter()"
-      @dragenter.prevent="onSearchHotspotDragHover"
-      @dragover.prevent="onSearchHotspotDragHover"
-      @drop.prevent
-    />
-
-    <div
       ref="searchPanelEl"
-      class="gallery-search"
-      :class="{ 'is-floating': searchRevealMode === 'floating' }"
-      :style="searchPanelStyle"
+      class="gallery-search gallery-search--bar"
       @focusin="onSearchFocusIn"
       @focusout="onSearchFocusOut"
       @pointerdown="onSearchPointerDown"
@@ -666,356 +648,106 @@ function onSearchWheel(event: WheelEvent) {
       @mouseleave="onSearchPointerLeave"
       @wheel="onSearchWheel"
     >
-      <div class="gallery-search__grid">
-        <div class="gallery-search__cell gallery-search__cell--tags" :class="{ 'is-chip-dragging': Boolean(searchChipsDragState) }">
-          <div class="gallery-search__label-row">
-            <div class="gallery-search__label">中文标签联想</div>
-            <div
-              ref="searchChipsEl"
-              class="gallery-search__chips"
-              :class="{ 'is-dragging': Boolean(searchChipsDragState) }"
-              @pointerdown="onSearchChipsPointerDown"
-              @pointermove="onSearchChipsPointerMove"
-              @pointerup="onSearchChipsPointerUp"
-              @pointercancel="onSearchChipsPointerCancel"
-              @lostpointercapture="onSearchChipsLostPointerCapture"
-            >
-              <span
-                v-for="tag in searchZhSelected"
-                :key="tag.tagEn"
-                class="gallery-search__chip"
-                :class="{ 'is-user-custom': Boolean(tag.isUserCustom) }"
-              >
-                <span class="gallery-search__chip-text">{{ tag.tagZh || tag.tagEn }}</span>
-                <button
-                  type="button"
-                  class="gallery-search__chip-remove"
-                  @click.stop="handlers.removeSearchZhSuggestion(tag.tagEn)"
-                >
-                  ×
-                </button>
-              </span>
-            </div>
-          </div>
-          <input
-            class="gallery-search__input"
-            type="text"
-            :value="searchZhInput"
-            placeholder="输入中文关键词"
-            autocomplete="off"
-            @focus="handlers.openSearchZhSuggestionPanel()"
-            @input="handlers.setSearchZhInput(($event.target as HTMLInputElement).value)"
-            @blur="handlers.closeSearchZhSuggestionPanelDeferred()"
-          />
-          <div v-if="searchZhOpen" class="gallery-search__suggestions">
-            <button
-              v-for="item in searchZhSuggestions"
-              :key="item.tagEn"
-              class="gallery-search__suggestion"
-              :class="{ 'is-user-custom': Boolean(item.isUserCustom) }"
-              type="button"
-              @mousedown.prevent="handlers.selectSearchZhSuggestion(item)"
-            >
-              <span>{{ item.tagZh || item.tagEn }}</span>
-              <small>{{ item.tagEn }} · {{ item.imageCount }}{{ item.isUserCustom ? ' · 自定义' : '' }}</small>
-            </button>
-          </div>
+      <div class="gallery-search__bar">
+        <div class="gallery-search__modes">
+          <button type="button" class="gallery-search__mode-tab" :class="{ 'is-active': searchBarMode === 'tags' }" @click="setSearchBarMode('tags')">标签</button>
+          <button type="button" class="gallery-search__mode-tab" :class="{ 'is-active': searchBarMode === 'file' }" @click="setSearchBarMode('file')">文件名</button>
+          <button type="button" class="gallery-search__mode-tab" :class="{ 'is-active': searchBarMode === 'image' }" @click="setSearchBarMode('image')">以图</button>
+          <button type="button" class="gallery-search__mode-tab" :class="{ 'is-active': searchBarMode === 'nl' }" @click="setSearchBarMode('nl')">自然语言</button>
         </div>
-
-        <div class="gallery-search__cell">
-          <div class="gallery-search__label">英文标签（空格分词）</div>
+        <input
+          v-if="searchBarMode === 'tags'"
+          class="gallery-search__input"
+          type="text"
+          :value="searchZhInput"
+          placeholder="输入中文关键词"
+          autocomplete="off"
+          @focus="handlers.openSearchZhSuggestionPanel()"
+          @input="handlers.setSearchZhInput(($event.target as HTMLInputElement).value)"
+          @blur="handlers.closeSearchZhSuggestionPanelDeferred()"
+        />
+        <input
+          v-else-if="searchBarMode === 'file'"
+          class="gallery-search__input"
+          type="text"
+          :value="searchFileNameQuery"
+          placeholder="文件名关键词"
+          autocomplete="off"
+          @input="handlers.setSearchFileNameQuery(($event.target as HTMLInputElement).value)"
+          @keydown.enter.prevent="handlers.executeGallerySearch()"
+        />
+        <input
+          v-else-if="searchBarMode === 'nl'"
+          class="gallery-search__input"
+          type="text"
+          :value="searchNaturalLanguageQuery"
+          placeholder="例如：白发女孩在夜景中"
+          autocomplete="off"
+          @input="handlers.setSearchNaturalLanguageQuery(($event.target as HTMLInputElement).value)"
+          @keydown.enter.prevent="handlers.executeGallerySearch()"
+        />
+        <div v-else class="gallery-search__image-compact">
+          <div class="gallery-search__mode-tabs">
+            <button type="button" class="gallery-search__mode-tab" :class="{ 'is-active': externalImageSearchType === 'default' }" @click="handlers.setExternalImageSearchType('default')">默认</button>
+            <button type="button" class="gallery-search__mode-tab" :class="{ 'is-active': externalImageSearchType === 'atmosphere' }" @click="handlers.setExternalImageSearchType('atmosphere')">氛围</button>
+            <button type="button" class="gallery-search__mode-tab" :class="{ 'is-active': externalImageSearchType === 'color' }" @click="handlers.setExternalImageSearchType('color')">色彩</button>
+          </div>
+          <div
+            class="gallery-search__lens-drop gallery-search__lens-drop--bar"
+            :class="{
+              'is-filled': Boolean(externalImageQueryPreviewUrl),
+              'is-drag-active': imageSearchDragActive || internalImageSearchDragActive,
+            }"
+            @contextmenu.prevent="pasteExternalImageAndSearch"
+            @dragenter.prevent="onImageSearchDragEnter"
+            @dragover.prevent="onImageSearchDragOver"
+            @dragleave.prevent="onImageSearchDragLeave"
+            @drop.prevent="onImageSearchDrop"
+          >
+            <img v-if="externalImageQueryPreviewUrl" class="gallery-search__lens-thumb" :src="externalImageQueryPreviewUrl" alt="" />
+            <span v-else>拖入</span>
+          </div>
+          <button type="button" class="gallery-search__lens-link" @click="pasteExternalImageAndSearch">粘贴</button>
+          <button type="button" class="gallery-search__lens-link" @click="handlers.selectExternalImageSearchFile()">上传</button>
           <input
             class="gallery-search__input"
             type="text"
-            :value="searchEnQuery"
-            placeholder="如 black hair smile"
-            autocomplete="off"
-            @input="handlers.setSearchEnQuery(($event.target as HTMLInputElement).value)"
+            :value="externalImageQueryUrl"
+            placeholder="图片链接"
+            @input="handlers.setExternalImageQueryUrl(($event.target as HTMLInputElement).value)"
+            @paste="onImageSearchUrlPaste"
             @keydown.enter.prevent="handlers.executeGallerySearch()"
           />
         </div>
-
-        <div class="gallery-search__cell">
-          <div class="gallery-search__label">文件名模糊搜索</div>
-          <input
-            class="gallery-search__input"
-            type="text"
-            :value="searchFileNameQuery"
-            placeholder="文件名关键词"
-            autocomplete="off"
-            @input="handlers.setSearchFileNameQuery(($event.target as HTMLInputElement).value)"
-            @keydown.enter.prevent="handlers.executeGallerySearch()"
-          />
-        </div>
-
-        <div v-if="false" class="gallery-search__cell gallery-search__cell--confidence">
-          <div class="gallery-search__label">置信度范围</div>
-          <div class="gallery-search__range-row">
-            <input
-              class="gallery-search__range"
-              type="range"
-              min="0"
-              max="1"
-              step="0.01"
-              :value="searchConfidenceMin"
-              @input="handlers.setSearchConfidenceMin(Number(($event.target as HTMLInputElement).value))"
-            />
-            <div class="gallery-search__range-values">
-              <span>Min</span>
-              <span>{{ searchConfidenceMin.toFixed(2) }}</span>
-            </div>
-          </div>
-          <div class="gallery-search__range-row">
-            <input
-              class="gallery-search__range"
-              type="range"
-              min="0"
-              max="1"
-              step="0.01"
-              :value="searchConfidenceMax"
-              @input="handlers.setSearchConfidenceMax(Number(($event.target as HTMLInputElement).value))"
-            />
-            <div class="gallery-search__range-values">
-              <span>Max</span>
-              <span>{{ searchConfidenceMax.toFixed(2) }}</span>
-            </div>
-          </div>
-          </div>
-        </div>
-
-        <div class="gallery-search__cell gallery-search__cell--image-search">
-          <div class="gallery-search__image-head">
-          <div class="gallery-search__label">以图搜图</div>
-            <div class="gallery-search__mode-tabs">
-              <button
-                type="button"
-                class="gallery-search__mode-tab"
-                :class="{ 'is-active': externalImageSearchType === 'default' }"
-                @click="handlers.setExternalImageSearchType('default')"
-              >
-                默认
-              </button>
-              <button
-                type="button"
-                class="gallery-search__mode-tab"
-                :class="{ 'is-active': externalImageSearchType === 'atmosphere' }"
-                @click="handlers.setExternalImageSearchType('atmosphere')"
-              >
-                氛围
-              </button>
-              <button
-                type="button"
-                class="gallery-search__mode-tab"
-                :class="{ 'is-active': externalImageSearchType === 'color' }"
-                @click="handlers.setExternalImageSearchType('color')"
-              >
-                色彩
-              </button>
-            </div>
-          </div>
-          <div class="gallery-search__lens" @contextmenu.prevent="pasteExternalImageAndSearch">
-            <div
-              class="gallery-search__lens-drop"
-              :class="{
-                'is-filled': Boolean(externalImageQueryPreviewUrl),
-                'is-drag-active': imageSearchDragActive || internalImageSearchDragActive,
-              }"
-              @dragenter.prevent="onImageSearchDragEnter"
-              @dragover.prevent="onImageSearchDragOver"
-              @dragleave.prevent="onImageSearchDragLeave"
-              @drop.prevent="onImageSearchDrop"
-            >
-              <div v-if="externalImageQueryPreviewUrl" class="gallery-search__lens-preview">
-                <img :src="externalImageQueryPreviewUrl" alt="" />
-              </div>
-              <div v-else class="gallery-search__lens-icon">
-                <Search
-                  class="gallery-search__lens-icon-search"
-                  theme="outline"
-                  :size="16"
-                  :stroke-width="3"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  :fill="['currentColor']"
-                />
-              </div>
-              <div class="gallery-search__lens-main">
-                <div class="gallery-search__lens-title">
-                  {{ externalImageQueryPreviewUrl ? '已选择查询图片' : '将图片放到此处' }}
-                </div>
-                <div class="gallery-search__lens-mode-hint">
-                  {{
-                    externalImageSearchType === 'atmosphere'
-                      ? '氛围相似模式'
-                      : externalImageSearchType === 'color'
-                        ? '色彩相似模式'
-                        : '默认相似模式'
-                  }}
-                </div>
-                <div class="gallery-search__lens-actions">
-                  <button type="button" class="gallery-search__lens-link" @click="pasteExternalImageAndSearch">
-                    粘贴图片
-                  </button>
-                  <span class="gallery-search__lens-sep">或</span>
-                  <button type="button" class="gallery-search__lens-link" @click="handlers.selectExternalImageSearchFile()">
-                    上传文件
-                  </button>
-                </div>
-                <div v-if="externalImageQueryPreviewUrl && externalImageQueryLabel" class="gallery-search__lens-label">
-                  {{ externalImageQueryLabel }}
-                </div>
-              </div>
-            </div>
-            <div class="gallery-search__lens-divider"><span>或</span></div>
-            <div class="gallery-search__lens-bottom">
-              <input
-                class="gallery-search__lens-url"
-                type="text"
-                :value="externalImageQueryUrl"
-                placeholder="粘贴图片链接"
-                @input="handlers.setExternalImageQueryUrl(($event.target as HTMLInputElement).value)"
-                @paste="onImageSearchUrlPaste"
-                @keydown.enter.prevent="
-                  handlers.setSearchMode('image');
-                  handlers.executeGallerySearch()
-                "
-              />
-              <button
-                type="button"
-                class="gallery-search__lens-search"
-                :disabled="!(externalImageQueryPreviewUrl || externalImageQueryUrl)"
-                @click="
-                  handlers.setSearchMode('image');
-                  handlers.executeGallerySearch()
-                "
-              >
-                搜索
-              </button>
-              <button
-                type="button"
-                class="gallery-search__lens-clear"
-                @click="handlers.clearAllSearchInputs()"
-              >
-                清除
-              </button>
-            </div>
-          </div>
-          <div v-if="false" class="gallery-search__image-query-shell" @contextmenu.prevent="pasteExternalImageAndSearch">
-            <div v-if="!externalImageQueryPreviewUrl" class="gallery-search__image-query gallery-search__image-query--empty">
-              <div class="gallery-search__image-query-empty-icon">
-                <Search
-                  class="gallery-search__image-query-empty-search-icon"
-                  theme="outline"
-                  :size="16"
-                  :stroke-width="3"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  :fill="['currentColor']"
-                />
-              </div>
-              <div class="gallery-search__image-query-empty-title">粘贴、选择或拖入图片</div>
-              <div class="gallery-search__image-query-empty-actions">
-                <button type="button" class="gallery-search__mini-button" @click="pasteExternalImageAndSearch">
-                  粘贴图片
-                </button>
-                <button type="button" class="gallery-search__mini-button" @click="handlers.selectExternalImageSearchFile()">
-                  选择图片
-                </button>
-              </div>
-            </div>
-            <div v-else class="gallery-search__image-query gallery-search__image-query--filled">
-              <div class="gallery-search__image-query-preview">
-              <img :src="externalImageQueryPreviewUrl" alt="" />
-            </div>
-            <div class="gallery-search__image-query-meta">
-              <div class="gallery-search__image-query-title">查询图片</div>
-              <div v-if="externalImageQueryLabel" class="gallery-search__image-query-label">
-                {{ externalImageQueryLabel }}
-              </div>
-            </div>
-            <div class="gallery-search__image-query-actions">
-              <button type="button" class="gallery-search__mini-button" @click="pasteExternalImageAndSearch">
-                粘贴图片
-              </button>
-              <button type="button" class="gallery-search__mini-button" @click="handlers.selectExternalImageSearchFile()">
-                选择图片
-              </button>
-              <button
-                type="button"
-                class="gallery-search__mini-button"
-                :disabled="!externalImageQueryPreviewUrl"
-                @click="
-                  handlers.setSearchMode('image');
-                  handlers.executeGallerySearch()
-                "
-              >
-                搜索
-              </button>
-              <button
-                type="button"
-                class="gallery-search__mini-button"
-                :disabled="!externalImageQueryPreviewUrl"
-                @click="handlers.clearExternalImageSearch()"
-              >
-                清除
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <div class="gallery-search__cell">
-          <div class="gallery-search__label">自然语言搜索</div>
-          <input
-            class="gallery-search__input"
-            type="text"
-            :value="searchNaturalLanguageQuery"
-            placeholder="例如：白发女孩在夜景中"
-            autocomplete="off"
-            @input="handlers.setSearchNaturalLanguageQuery(($event.target as HTMLInputElement).value)"
-            @keydown.enter.prevent="handlers.executeGallerySearch()"
-          />
-          <div class="gallery-search__footer">
-            <div class="gallery-search__status">
-              <div v-if="searchError">{{ searchError }}</div>
-            </div>
-            <button
-              type="button"
-              class="gallery-search__submit"
-              :disabled="searchRunning"
-              @click="handlers.executeGallerySearch()"
-              :aria-label="searchRunning ? '搜索中' : '开始搜索'"
-            >
-              <LoadingOne
-                v-if="searchRunning"
-                class="gallery-search__submit-icon is-loading"
-                theme="outline"
-                :size="16"
-                :stroke-width="3"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                :fill="['currentColor']"
-              />
-              <Search
-                v-else
-                class="gallery-search__submit-icon"
-                theme="outline"
-                :size="16"
-                :stroke-width="3"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                :fill="['currentColor']"
-              />
-            </button>
-          </div>
-        </div>
-      </div>
-      <div class="gallery-search__back-top-row">
         <button
           type="button"
-          class="gallery-search__back-top"
-          aria-label="返回顶部"
-          @click="handlers.scrollGalleryToCurrentTop()"
+          class="gallery-search__submit"
+          :disabled="searchRunning"
+          @click="handlers.executeGallerySearch()"
+          :aria-label="searchRunning ? '搜索中' : '开始搜索'"
         >
+          <LoadingOne
+            v-if="searchRunning"
+            class="gallery-search__submit-icon is-loading"
+            theme="outline"
+            :size="16"
+            :stroke-width="3"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            :fill="['currentColor']"
+          />
+          <Search
+            v-else
+            class="gallery-search__submit-icon"
+            theme="outline"
+            :size="16"
+            :stroke-width="3"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            :fill="['currentColor']"
+          />
+        </button>
+        <button type="button" class="gallery-search__back-top" aria-label="返回顶部" @click="handlers.scrollGalleryToCurrentTop()">
           <CircleDoubleUp
             class="gallery-search__back-top-icon"
             theme="outline"
@@ -1047,36 +779,47 @@ function onSearchWheel(event: WheelEvent) {
             />
           </button>
           <div v-if="browseModeMenuOpen" class="gallery-search__browse-menu" role="menu" @click.stop>
-            <button
-              type="button"
-              class="gallery-search__browse-menu-item"
-              :class="{ 'is-active': galleryBrowseMode === 'default' }"
-              role="menuitem"
-              @click="setBrowseMode('default')"
-            >
-              默认模式
-            </button>
-            <button
-              type="button"
-              class="gallery-search__browse-menu-item"
-              :class="{ 'is-active': galleryBrowseMode === 'sidebar-disabled' }"
-              role="menuitem"
-              @click="setBrowseMode('sidebar-disabled')"
-            >
-              禁用侧栏
-            </button>
-            <button
-              type="button"
-              class="gallery-search__browse-menu-item"
-              :class="{ 'is-active': galleryBrowseMode === 'carousel' }"
-              role="menuitem"
-              @click="setBrowseMode('carousel')"
-            >
-              轮播模式
-            </button>
+            <button type="button" class="gallery-search__browse-menu-item" :class="{ 'is-active': galleryBrowseMode === 'default' }" role="menuitem" @click="setBrowseMode('default')">默认模式</button>
+            <button type="button" class="gallery-search__browse-menu-item" :class="{ 'is-active': galleryBrowseMode === 'sidebar-disabled' }" role="menuitem" @click="setBrowseMode('sidebar-disabled')">禁用侧栏</button>
+            <button type="button" class="gallery-search__browse-menu-item" :class="{ 'is-active': galleryBrowseMode === 'carousel' }" role="menuitem" @click="setBrowseMode('carousel')">轮播模式</button>
           </div>
         </div>
       </div>
+      <div
+        v-if="searchBarMode === 'tags' && searchZhSelected.length > 0"
+        ref="searchChipsEl"
+        class="gallery-search__chips gallery-search__chips--bar"
+        :class="{ 'is-dragging': Boolean(searchChipsDragState) }"
+        @pointerdown="onSearchChipsPointerDown"
+        @pointermove="onSearchChipsPointerMove"
+        @pointerup="onSearchChipsPointerUp"
+        @pointercancel="onSearchChipsPointerCancel"
+        @lostpointercapture="onSearchChipsLostPointerCapture"
+      >
+        <span
+          v-for="tag in searchZhSelected"
+          :key="tag.tagEn"
+          class="gallery-search__chip"
+          :class="{ 'is-user-custom': Boolean(tag.isUserCustom) }"
+        >
+          <span class="gallery-search__chip-text">{{ tag.tagZh || tag.tagEn }}</span>
+          <button type="button" class="gallery-search__chip-remove" @click.stop="handlers.removeSearchZhSuggestion(tag.tagEn)">×</button>
+        </span>
+      </div>
+      <div v-if="searchBarMode === 'tags' && searchZhOpen" class="gallery-search__suggestions">
+        <button
+          v-for="item in searchZhSuggestions"
+          :key="item.tagEn"
+          class="gallery-search__suggestion"
+          :class="{ 'is-user-custom': Boolean(item.isUserCustom) }"
+          type="button"
+          @mousedown.prevent="handlers.selectSearchZhSuggestion(item)"
+        >
+          <span>{{ item.tagZh || item.tagEn }}</span>
+          <small>{{ item.tagEn }} · {{ item.imageCount }}{{ item.isUserCustom ? ' · 自定义' : '' }}</small>
+        </button>
+      </div>
+      <div v-if="searchError" class="gallery-search__status">{{ searchError }}</div>
     </div>
 
     <div v-if="showUnclassifiedToggle" class="gallery-unclassified-toggle-row">

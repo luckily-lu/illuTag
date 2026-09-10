@@ -4,7 +4,7 @@
   "version": "1.0.7",
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1 --port 1420",
+    "dev": "vite --host 127.0.0.1 --port 1421",
     "build": "vue-tsc --noEmit && vite build",
     "tauri": "tauri"
   },

@@ -585,6 +585,7 @@ const {
   setSearchViewportState,
   triggerSearchRevealByHotspot,
   hideSearchPanel: hideSearchPanelByState,
+  setSuppressGallerySearch,
   setSearchZhInput,
   openSearchZhSuggestionPanel,
   closeSearchZhSuggestionPanelDeferred,
@@ -1817,12 +1818,20 @@ const {
 
 const {
   tagManagerOpen,
+  tagManagerTab,
   isTagManagerLoading,
   tagManagerFolders,
   activeTagManagerFolderId,
   tagManagerUnclassifiedTags,
   newTagManagerFolderName,
   newTagManagerTagText,
+  dictGroupId,
+  dictQuery,
+  dictOnlyUsed,
+  dictSort,
+  dictGroupItems,
+  filteredDictTags,
+  visibleDictTags,
   openTagManager,
   closeTagManager,
   reloadTagManagementState,
@@ -1832,6 +1841,7 @@ const {
   assignTagToFolder,
   unassignTag,
   deleteTagManagerFolder,
+  loadMoreDictTags,
 } = useTagManagement({
   formatError,
   setErrorText(value) {
@@ -2391,6 +2401,8 @@ async function addFolderByPath(rawFolderPath: string) {
     })
     folderPathInput.value = ''
     updateStatus()
+    statusText.value = '已添加文件夹，正在后台扫描图片...'
+    await startScanAllFoldersCollectOnly()
   } catch (error) {
     errorText.value = formatError(error)
   } finally {
@@ -2490,7 +2502,7 @@ function handleGlobalKeydown(event: KeyboardEvent) {
     cancelReferenceBoardRename()
     closeReferenceBoardCanvasMenu()
     closeImportLibraryFolderPicker(null)
-    closeTagManager()
+    closeTagManagerPanel()
     endTagManagerTagDrag()
     closeTagManagerTagContextMenu()
     closeImageDetail()
@@ -3117,15 +3129,38 @@ function onWindowMouseOut(event: MouseEvent) {
 }
 
 function openSettings() {
-  closeTagManager()
-  closeTagManagerTagContextMenu()
-  viewMode.value = 'settings'
+    closeTagManagerPanel()
+    closeTagManagerTagContextMenu()
+    viewMode.value = 'settings'
   sidebarHoverOpen.value = false
 }
 
-function openTagManagerPanel() {
+function openTagManagerPanel(tab: 'custom' | 'dict' = 'custom') {
   viewMode.value = 'gallery'
-  void openTagManager()
+  setSuppressGallerySearch(true)
+  void openTagManager(tab)
+}
+
+function closeTagManagerPanel() {
+  closeTagManager()
+  setSuppressGallerySearch(false)
+}
+
+function isDictionaryTagInSearch(tagEn: string) {
+  return searchZhSelected.value.some((tag) => tag.tagEn === tagEn)
+}
+
+function addDictionaryTagToSearch(tag: { tagEn: string; tagZh?: string | null; imageCount: number }) {
+  if (isDictionaryTagInSearch(tag.tagEn)) {
+    removeSearchZhSuggestion(tag.tagEn)
+    return
+  }
+  selectSearchZhSuggestion({
+    tagEn: tag.tagEn,
+    tagZh: tag.tagZh ?? null,
+    imageCount: tag.imageCount,
+    isUserCustom: false,
+  })
 }
 
 function hideSearchPanel() {
@@ -4492,6 +4527,7 @@ console.info(
       :view-mode="viewMode"
       :active-user-folder-id="activeUserFolderId"
       :tag-manager-open="tagManagerOpen"
+      :tag-manager-tab="tagManagerTab"
       :folder-tree="folderTree"
       :image-drag-active="Boolean(dragState)"
       :folder-drag-over-id="folderDragOverId"
@@ -5047,19 +5083,19 @@ console.info(
       v-if="tagManagerOpen"
       class="tag-manager-layer"
       @click="
-        closeTagManager();
+        closeTagManagerPanel();
         endTagManagerTagDrag();
         closeTagManagerTagContextMenu();
       "
     >
       <article class="tag-manager-modal" @click.stop>
         <header class="tag-manager-modal__header">
-          <div class="tag-manager-modal__title">标签管理</div>
+          <div class="tag-manager-modal__title">{{ tagManagerTab === 'dict' ? '标签浏览' : '标签管理' }}</div>
           <button
             class="tag-manager-modal__close"
             type="button"
             @click="
-              closeTagManager();
+              closeTagManagerPanel();
               endTagManagerTagDrag();
               closeTagManagerTagContextMenu();
             "
@@ -5067,7 +5103,7 @@ console.info(
             ×
           </button>
         </header>
-        <div class="tag-manager-modal__content">
+        <div v-if="tagManagerTab === 'custom'" class="tag-manager-modal__content">
           <aside class="tag-manager-modal__folders">
             <div class="tag-manager-modal__section-title">标签文件夹</div>
             <div class="tag-manager-modal__folder-list">
@@ -5157,6 +5193,91 @@ console.info(
               <p v-if="activeTagManagerFolderTags.length === 0" class="tag-manager-modal__placeholder">当前文件夹还没有标签</p>
             </div>
             <div v-if="isTagManagerLoading" class="tag-manager-modal__placeholder">处理中...</div>
+          </section>
+        </div>
+        <div v-else class="tag-manager-modal__content">
+          <aside class="tag-manager-modal__folders">
+            <div class="tag-manager-modal__section-title">分类</div>
+            <div class="tag-manager-modal__folder-list">
+              <button
+                v-for="group in dictGroupItems"
+                :key="group.id"
+                type="button"
+                class="tag-manager-modal__folder-item"
+                :class="{ 'is-active': dictGroupId === group.id }"
+                @click="dictGroupId = group.id"
+              >
+                <span>{{ group.zh }}</span>
+                <small>{{ group.count }}</small>
+              </button>
+            </div>
+          </aside>
+          <section class="tag-manager-modal__dict">
+            <div class="tag-manager-modal__dict-toolbar">
+              <input
+                v-model="dictQuery"
+                class="tag-manager-modal__create-input"
+                type="text"
+                placeholder="搜索中文或英文"
+              />
+              <select v-model="dictSort" class="tag-manager-modal__dict-sort">
+                <option value="count">图库次数</option>
+                <option value="index">默认顺序</option>
+                <option value="zh">中文</option>
+                <option value="en">英文</option>
+              </select>
+              <label class="tag-manager-modal__dict-check">
+                <input v-model="dictOnlyUsed" type="checkbox" />
+                仅已出现
+              </label>
+            </div>
+            <div class="tag-manager-modal__dict-selected">
+              <div class="tag-manager-modal__section-title">已选择 {{ searchZhSelected.length }}</div>
+              <div class="tag-manager-modal__dict-selected-list">
+                <span
+                  v-for="tag in searchZhSelected"
+                  :key="`dict-selected:${tag.tagEn}`"
+                  class="gallery-search__chip"
+                >
+                  <span class="gallery-search__chip-text">{{ tag.tagZh || tag.tagEn }}</span>
+                  <button
+                    type="button"
+                    class="gallery-search__chip-remove"
+                    @click.stop="removeSearchZhSuggestion(tag.tagEn)"
+                  >
+                    ×
+                  </button>
+                </span>
+                <p v-if="searchZhSelected.length === 0" class="tag-manager-modal__placeholder">点击下方标签加入，再点或点 × 取消</p>
+              </div>
+            </div>
+            <div class="tag-manager-modal__dict-list">
+              <button
+                v-for="tag in visibleDictTags"
+                :key="tag.tagEn"
+                type="button"
+                class="tag-manager-modal__dict-row"
+                :class="{ 'is-selected': isDictionaryTagInSearch(tag.tagEn) }"
+                @click="addDictionaryTagToSearch(tag)"
+              >
+                <span class="tag-manager-modal__dict-zh">{{ tag.tagZh || tag.tagEn }}</span>
+                <span class="tag-manager-modal__dict-en">{{ tag.tagEn }}</span>
+                <small>{{ tag.imageCount }}</small>
+              </button>
+              <p v-if="visibleDictTags.length === 0" class="tag-manager-modal__placeholder">没有匹配的标签</p>
+            </div>
+            <div class="tag-manager-modal__dict-footer">
+              <span v-if="isTagManagerLoading">加载中...</span>
+              <span v-else>共 {{ filteredDictTags.length }} 条，点击加入搜索</span>
+              <button
+                v-if="visibleDictTags.length < filteredDictTags.length"
+                type="button"
+                class="secondary-button tag-manager-modal__action"
+                @click="loadMoreDictTags()"
+              >
+                显示更多
+              </button>
+            </div>
           </section>
         </div>
         <div

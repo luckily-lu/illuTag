@@ -22,6 +22,8 @@ type BackgroundScanProgress = {
   queuedImages: number
   taggedImages: number
   failedImages: number
+  scannedFiles?: number
+  currentFolder?: string
   lastError?: string | null
   recentErrors?: string[] | null
 }
@@ -56,7 +58,7 @@ const defaultAutoScanOnStartupStorageKey = 'illutag.autoScanOnStartup'
 export function useBackgroundScan(options: UseBackgroundScanOptions) {
   const autoScanOnStartupStorageKey =
     options.autoScanOnStartupStorageKey ?? defaultAutoScanOnStartupStorageKey
-  const pollIntervalMs = options.pollIntervalMs ?? 1200
+  const pollIntervalMs = options.pollIntervalMs ?? 500
 
   const autoScanOnStartup = ref(false)
   const isBackgroundScanRunning = ref(false)
@@ -75,7 +77,7 @@ export function useBackgroundScan(options: UseBackgroundScanOptions) {
   const scanLibraryRefreshInFlight = ref(false)
   const scanLibraryRefreshAt = ref(0)
   const startupCleanupObservedGeneration = ref(0)
-  const collectLiveRefreshIntervalMs = 900
+  const collectLiveRefreshIntervalMs = 12_000
   const taggingLiveRefreshIntervalMs = 25_000
 
   function initAutoScanOnStartupFromStorage() {
@@ -262,6 +264,8 @@ export function useBackgroundScan(options: UseBackgroundScanOptions) {
         progress.queuedImages,
         progress.taggedImages,
         progress.failedImages,
+        progress.scannedFiles ?? 0,
+        progress.currentFolder ?? '',
       ].join('|')
       const changed = signature !== scanProgressSignature.value
       scanProgressSignature.value = signature
@@ -275,7 +279,10 @@ export function useBackgroundScan(options: UseBackgroundScanOptions) {
             ? taggingLiveRefreshIntervalMs
             : 1200
       const shouldLiveRefresh =
-        progress.running && changed && now - scanLibraryRefreshAt.value >= refreshIntervalMs
+        progress.running &&
+        progress.phase !== 'collecting' &&
+        changed &&
+        now - scanLibraryRefreshAt.value >= refreshIntervalMs
       if ((becameIdle || shouldLiveRefresh) && !scanLibraryRefreshInFlight.value) {
         scanLibraryRefreshInFlight.value = true
         scanLibraryRefreshAt.value = now
@@ -413,7 +420,10 @@ export function useBackgroundScan(options: UseBackgroundScanOptions) {
     const phaseLabel = scanPhaseLabel(progress.phase)
     const folders = `${progress.scannedFolders}/${progress.totalFolders}`
     const tagged = `${progress.taggedImages}/${progress.queuedImages}`
-    const base = `${phaseLabel}｜文件夹 ${folders}｜新增 ${progress.newImages}｜更新 ${progress.updatedImages}｜跳过 ${progress.skippedImages}｜清理 ${progress.removedMissingImages}｜打标 ${tagged}｜失败 ${progress.failedImages}`
+    const folderName = (progress.currentFolder ?? '').replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? ''
+    const files = progress.scannedFiles ?? 0
+    const folderHint = folderName ? `｜当前 ${folderName}` : ''
+    const base = `${phaseLabel}｜文件夹 ${folders}｜已读 ${files} 张${folderHint}｜新增 ${progress.newImages}｜更新 ${progress.updatedImages}｜跳过 ${progress.skippedImages}｜清理 ${progress.removedMissingImages}｜打标 ${tagged}｜失败 ${progress.failedImages}`
     if (progress.lastError) {
       return `${base}｜错误：${progress.lastError}`
     }

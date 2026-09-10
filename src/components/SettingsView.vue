@@ -415,7 +415,18 @@ defineProps<{
         停止
       </button>
     </div>
-    <p v-if="scanProgressText" class="settings__progress">{{ scanProgressText }}</p>
+    <div v-if="isBackgroundScanRunning || scanProgressText" class="settings__progress-group">
+      <p class="settings__progress">{{ scanProgressText || '扫描进行中...' }}</p>
+      <div
+        v-if="isBackgroundScanRunning"
+        class="settings__progressbar settings__progressbar--busy"
+        role="progressbar"
+        aria-valuemin="0"
+        aria-valuemax="100"
+      >
+        <div class="settings__progressbar-fill" />
+      </div>
+    </div>
     <div v-if="scanRecentErrors.length > 0" class="settings__scan-errors">
       <p class="settings__scan-errors-title">最近扫描错误</p>
       <ul>

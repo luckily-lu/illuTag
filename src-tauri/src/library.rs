@@ -448,6 +448,30 @@ pub struct TagManagementState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TagDictionaryGroup {
+    pub id: String,
+    pub zh: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagDictionaryBrowserItem {
+    pub tag_en: String,
+    pub tag_zh: Option<String>,
+    pub group: String,
+    pub image_count: i64,
+    pub sort_index: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagDictionaryBrowserState {
+    pub groups: Vec<TagDictionaryGroup>,
+    pub tags: Vec<TagDictionaryBrowserItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UserFolderRuleCondition {
     pub logic: String,
     pub source: String,
@@ -623,6 +647,8 @@ pub struct BackgroundScanProgress {
     pub queued_images: i64,
     pub tagged_images: i64,
     pub failed_images: i64,
+    pub scanned_files: i64,
+    pub current_folder: String,
     pub last_error: Option<String>,
     pub recent_errors: Vec<String>,
 }
@@ -708,6 +734,8 @@ impl Default for BackgroundScanProgress {
             queued_images: 0,
             tagged_images: 0,
             failed_images: 0,
+            scanned_files: 0,
+            current_folder: String::new(),
             last_error: None,
             recent_errors: Vec::new(),
         }
@@ -1147,22 +1175,13 @@ pub fn add_gallery_folder(folder_path: String, state: &AppState) -> Result<Libra
     let tx = conn
         .transaction()
         .map_err(|error| format!("打开图库事务失败：{error}"))?;
-    let folder_id = upsert_folder(&tx, &folder_path, scanned_at)?;
-    let mut seen_paths = HashSet::new();
-    let existing_meta = load_existing_library_image_meta(&tx)?;
-    let found = scan_images(Path::new(&folder_path), scanned_at, &mut seen_paths, &existing_meta);
-
-    for image in &found {
-        upsert_image(&tx, folder_id, image)?;
-    }
-    sync_user_folder_tree_for_library_directory(&tx, &folder_path, &found, scanned_at)?;
-
+    upsert_folder(&tx, &folder_path, scanned_at)?;
+    ensure_library_root_user_folder(&tx, &folder_path, scanned_at)?;
     tx.commit()
         .map_err(|error| format!("保存图库索引失败：{error}"))?;
 
     let store = load_store(&conn)?;
     *library = Some(store.clone());
-    invalidate_all_similarity_caches(state);
     Ok(store)
 }
 
@@ -1406,6 +1425,15 @@ fn collect_directory_tree_paths(root_folder_path: &str) -> Result<HashSet<String
         paths.insert(root_folder_path.to_string());
     }
     Ok(paths)
+}
+
+fn ensure_library_root_user_folder(conn: &Connection, folder_path: &str, now: i64) -> Result<i64, String> {
+    let name = Path::new(folder_path)
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| folder_path.to_string());
+    upsert_synced_user_folder_for_path(conn, folder_path, None, &name, now)
 }
 
 fn path_depth_for_sort(path_text: &str) -> usize {
@@ -2386,9 +2414,6 @@ fn start_scan_all_folders_worker(state: &AppState, mode: BackgroundScanJobMode) 
         .lock()
         .map_err(|_| "Background scan state is locked".to_string())?;
     if *running {
-        if matches!(mode, BackgroundScanJobMode::CollectOnly) {
-            return Ok(false);
-        }
         if let Ok(mut pending) = state.background_scan_pending.lock() {
             *pending = true;
         }
@@ -2419,6 +2444,15 @@ fn start_scan_all_folders_worker(state: &AppState, mode: BackgroundScanJobMode) 
     let atmosphere_signature_cache = Arc::clone(&state.atmosphere_signature_cache);
     let color_signature_cache = Arc::clone(&state.color_signature_cache);
     thread::spawn(move || {
+        let mut mode = mode;
+        set_scan_progress(
+            &background_scan_progress,
+            BackgroundScanProgress {
+                running: true,
+                phase: "collecting".to_string(),
+                ..BackgroundScanProgress::default()
+            },
+        );
         wait_until_startup_cleanup_finished(&startup_cleanup_running);
         eprintln!("[wd-scan] worker started");
         loop {
@@ -2531,6 +2565,7 @@ fn start_scan_all_folders_worker(state: &AppState, mode: BackgroundScanJobMode) 
             };
             if rerun {
                 eprintln!("[wd-scan] pending rerun");
+                mode = BackgroundScanJobMode::CollectOnly;
                 continue;
             }
             break;
@@ -2568,6 +2603,31 @@ pub fn start_scan_all_folders_with_tagging(state: &AppState) -> Result<bool, Str
 
 pub fn start_scan_all_folders_collect_only(state: &AppState) -> Result<bool, String> {
     start_scan_all_folders_worker(state, BackgroundScanJobMode::CollectOnly)
+}
+
+pub fn resume_incomplete_library_scan(state: &AppState) -> Result<bool, String> {
+    let conn = open_database(&state.database_path)?;
+    let interrupted = read_app_meta_value(&conn, "library_scan_in_progress")?
+        .as_deref()
+        == Some("1");
+    let empty_roots = conn
+        .query_row(
+            "
+            SELECT COUNT(*)
+            FROM folders f
+            WHERE COALESCE(f.hidden, 0) = 0
+              AND NOT EXISTS (
+                SELECT 1 FROM images i WHERE i.folder_id = f.id LIMIT 1
+              )
+            ",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("Failed to check incomplete library folders: {error}"))?;
+    if !interrupted && empty_roots <= 0 {
+        return Ok(false);
+    }
+    start_scan_all_folders_collect_only(state)
 }
 
 pub fn start_tag_pending_images_only(state: &AppState) -> Result<bool, String> {
@@ -4760,6 +4820,198 @@ fn load_tag_management_state(conn: &Connection) -> Result<TagManagementState, St
 pub fn list_tag_management_state(state: &AppState) -> Result<TagManagementState, String> {
     let conn = open_database(&state.database_path)?;
     load_tag_management_state(&conn)
+}
+
+pub fn list_tag_dictionary_browser(state: &AppState) -> Result<TagDictionaryBrowserState, String> {
+    sync_tag_dictionary_from_source_if_changed(state)?;
+    let conn = open_database(&state.database_path)?;
+
+    let mut zh_map = HashMap::<String, String>::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT tag_en, tag_zh FROM tag_dictionary")
+            .map_err(|error| format!("Failed to prepare tag dictionary query: {error}"))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|error| format!("Failed to query tag dictionary: {error}"))?;
+        for row in rows {
+            let (tag_en, tag_zh) = row.map_err(|error| format!("Failed to read tag dictionary: {error}"))?;
+            if !tag_zh.is_empty() {
+                zh_map.insert(tag_en, tag_zh);
+            }
+        }
+    }
+
+    let mut count_map = HashMap::<String, i64>::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT tag_en, image_count
+                FROM known_image_tags
+                WHERE model_name = ?1
+                ",
+            )
+            .map_err(|error| format!("Failed to prepare library tag counts query: {error}"))?;
+        let rows = stmt
+            .query_map(params![WD_TAGGER_MODEL_NAME], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| format!("Failed to query library tag counts: {error}"))?;
+        for row in rows {
+            let (tag_en, image_count) =
+                row.map_err(|error| format!("Failed to read library tag counts: {error}"))?;
+            count_map.insert(tag_en, image_count);
+        }
+    }
+
+    let (groups, group_by_tag, sort_index) = load_tag_dictionary_browser_meta()?;
+    let mut tags = Vec::<TagDictionaryBrowserItem>::with_capacity(group_by_tag.len());
+    for (tag_en, group) in group_by_tag {
+        tags.push(TagDictionaryBrowserItem {
+            tag_zh: zh_map.get(&tag_en).cloned(),
+            image_count: count_map.get(&tag_en).copied().unwrap_or(0),
+            sort_index: sort_index.get(&tag_en).copied().unwrap_or(i64::MAX),
+            tag_en,
+            group,
+        });
+    }
+
+    Ok(TagDictionaryBrowserState { groups, tags })
+}
+
+#[derive(Debug, Deserialize)]
+struct TagGroupsFile {
+    #[serde(default)]
+    taxonomy: Vec<TagDictionaryGroup>,
+    #[serde(default)]
+    tags: HashMap<String, String>,
+}
+
+fn tagger_data_dir_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::<PathBuf>::new();
+    if let Ok(cwd) = env::current_dir() {
+        candidates.push(cwd.join("wd-swinv2-tagger-v3"));
+        candidates.push(cwd.join("..").join("wd-swinv2-tagger-v3"));
+    }
+    if let Ok(exe_path) = env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidates.push(exe_dir.join("wd-swinv2-tagger-v3"));
+            candidates.push(exe_dir.join("..").join("wd-swinv2-tagger-v3"));
+            candidates.push(exe_dir.join("..").join("..").join("wd-swinv2-tagger-v3"));
+        }
+    }
+    if let Ok(dictionary_path) = resolve_dictionary_source_path() {
+        if let Some(parent) = dictionary_path.parent() {
+            candidates.push(parent.to_path_buf());
+        }
+    }
+    candidates
+}
+
+fn find_tagger_data_file(file_name: &str) -> Option<PathBuf> {
+    for dir in tagger_data_dir_candidates() {
+        let path = dir.join(file_name);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn load_selected_tag_sort_index(path: &Path) -> Result<HashMap<String, i64>, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let mut sort_index = HashMap::<String, i64>::new();
+    let mut index: i64 = 0;
+    for (line_index, line) in content.lines().enumerate() {
+        let fields = parse_csv_line(line.trim());
+        let name = fields.get(1).map(|value| value.trim()).unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        if line_index == 0 && name.eq_ignore_ascii_case("name") {
+            continue;
+        }
+        sort_index.entry(name.to_string()).or_insert(index);
+        index += 1;
+    }
+    Ok(sort_index)
+}
+
+fn load_tag_groups_file(
+    path: &Path,
+) -> Result<(Vec<TagDictionaryGroup>, HashMap<String, String>), String> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let parsed: TagGroupsFile = serde_json::from_str(&content)
+        .map_err(|error| format!("Failed to parse tag_groups.json: {error}"))?;
+    let mut groups = parsed.taxonomy;
+    let mut seen = groups.iter().map(|item| item.id.clone()).collect::<HashSet<_>>();
+    for group in parsed.tags.values() {
+        if seen.insert(group.clone()) {
+            groups.push(TagDictionaryGroup {
+                id: group.clone(),
+                zh: group.clone(),
+            });
+        }
+    }
+    Ok((groups, parsed.tags))
+}
+
+fn load_fallback_groups_from_selected_tags(
+    path: &Path,
+) -> Result<(Vec<TagDictionaryGroup>, HashMap<String, String>), String> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let mut group_by_tag = HashMap::<String, String>::new();
+    for (line_index, line) in content.lines().enumerate() {
+        let fields = parse_csv_line(line.trim());
+        let name = fields.get(1).map(|value| value.trim()).unwrap_or("");
+        let category = fields.get(2).map(|value| value.trim()).unwrap_or("0");
+        if name.is_empty() {
+            continue;
+        }
+        if line_index == 0 && name.eq_ignore_ascii_case("name") {
+            continue;
+        }
+        let group = if category == "4" {
+            "character"
+        } else {
+            "general"
+        };
+        group_by_tag.insert(name.to_string(), group.to_string());
+    }
+    Ok((
+        vec![
+            TagDictionaryGroup {
+                id: "character".to_string(),
+                zh: "角色".to_string(),
+            },
+            TagDictionaryGroup {
+                id: "general".to_string(),
+                zh: "通用".to_string(),
+            },
+        ],
+        group_by_tag,
+    ))
+}
+
+fn load_tag_dictionary_browser_meta(
+) -> Result<(Vec<TagDictionaryGroup>, HashMap<String, String>, HashMap<String, i64>), String> {
+    let sort_index = match find_tagger_data_file("selected_tags.csv") {
+        Some(path) => load_selected_tag_sort_index(&path)?,
+        None => HashMap::new(),
+    };
+    if let Some(path) = find_tagger_data_file("tag_groups.json") {
+        let (groups, group_by_tag) = load_tag_groups_file(&path)?;
+        return Ok((groups, group_by_tag, sort_index));
+    }
+    if let Some(path) = find_tagger_data_file("selected_tags.csv") {
+        let (groups, group_by_tag) = load_fallback_groups_from_selected_tags(&path)?;
+        return Ok((groups, group_by_tag, sort_index));
+    }
+    Ok((Vec::new(), HashMap::new(), sort_index))
 }
 
 pub fn export_data_migration_backup(
@@ -8011,7 +8263,7 @@ fn open_database(database_path: &Path) -> Result<Connection, String> {
 
     let conn =
         Connection::open(database_path).map_err(|error| format!("打开图库数据库失败：{error}"))?;
-    conn.busy_timeout(std::time::Duration::from_millis(5000))
+    conn.busy_timeout(std::time::Duration::from_secs(30))
         .map_err(|error| format!("Failed to set SQLite busy_timeout: {error}"))?;
     migrate_database(&conn)?;
     Ok(conn)
@@ -8730,6 +8982,21 @@ fn ensure_user_folder_source_metadata(conn: &Connection) -> Result<(), String> {
             [],
         )
         .map_err(|error| format!("Failed to add user_folders.source_path: {error}"))?;
+    }
+    let has_source_index = conn
+        .prepare("PRAGMA index_list(user_folders)")
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .ok()
+                .map(|rows| {
+                    rows.filter_map(Result::ok)
+                        .any(|name| name == "idx_user_folders_source_path")
+                })
+        })
+        .unwrap_or(false);
+    if has_source_index {
+        return Ok(());
     }
     conn.execute_batch(
         "
@@ -9481,14 +9748,9 @@ fn scan_all_folders_and_collect_new_images(
     stop_requested: &Arc<Mutex<bool>>,
     collect_tag_queue: bool,
 ) -> Result<ScanCollectResult, String> {
-    let conn = open_database(database_path)?;
+    let mut conn = open_database(database_path)?;
     let scanned_at = now_ms();
     let mut seen_paths = HashSet::new();
-    let removed_missing_images = cleanup_missing_library_images_count(&conn)?;
-    set_scan_progress_removed_missing_images(progress, removed_missing_images);
-    let mut known_paths = load_known_paths(&conn)?;
-    let mut existing_meta = load_existing_library_image_meta(&conn)?;
-
     let folders = conn
         .prepare(
             "
@@ -9504,11 +9766,19 @@ fn scan_all_folders_and_collect_new_images(
         })
         .map_err(|error| format!("Failed to load folders for scan: {error}"))?;
     set_scan_progress_total_folders(progress, folders.len() as i64);
+    let _ = write_app_meta_value(&conn, "library_scan_in_progress", "1");
+    for (_, folder_path) in &folders {
+        let folder_path = normalize_existing_or_stored_folder_path(folder_path);
+        let _ = ensure_library_root_user_folder(&conn, &folder_path, scanned_at);
+    }
+    let mut known_paths = load_known_paths(&conn)?;
+    let mut existing_meta = load_existing_library_image_meta(&conn)?;
 
     let mut new_image_ids = Vec::<String>::new();
     let mut updated_images = 0i64;
     let mut skipped_images = 0i64;
     let mut scanned_folders = 0i64;
+    let mut scanned_files = 0i64;
 
     for (_, folder_path) in folders {
         if background_scan_stop_requested(stop_requested) {
@@ -9525,40 +9795,60 @@ fn scan_all_folders_and_collect_new_images(
             continue;
         }
         let folder_id = upsert_folder(&conn, &folder_path, scanned_at)?;
-        let found = scan_images(Path::new(&folder_path), scanned_at, &mut seen_paths, &existing_meta);
-        let found_count = found.len() as i64;
+        set_scan_progress_current_folder(progress, &folder_path);
+        let mut found = Vec::<ScannedImage>::new();
         let mut newly_found_images = Vec::<ScannedImage>::new();
-        for image in &found {
-            let previous = existing_meta.get(&image.path).copied();
-            let is_new = !known_paths.contains(&image.path);
-            upsert_image(&conn, folder_id, image)?;
-            existing_meta.insert(
-                image.path.clone(),
-                ExistingImageMeta {
-                    width: image.width,
-                    height: image.height,
-                    file_size: image.file_size,
-                    modified_at: image.modified_at,
-                },
-            );
-            if is_new {
-                known_paths.insert(image.path.clone());
-                new_image_ids.push(image.path.clone());
-                newly_found_images.push(image.clone());
-            } else if let Some(meta) = previous {
-                if meta.modified_at != image.modified_at
-                    || meta.file_size != image.file_size
-                    || meta.width != image.width
-                    || meta.height != image.height
-                {
-                    updated_images += 1;
-                } else {
-                    skipped_images += 1;
+        let mut pending_batch = Vec::<ScannedImage>::new();
+        scan_images(
+            Path::new(&folder_path),
+            scanned_at,
+            &mut seen_paths,
+            &existing_meta,
+            &mut |image| {
+                scanned_files += 1;
+                found.push(image.clone());
+                pending_batch.push(image);
+                let should_flush = pending_batch.len() >= 200;
+                if should_flush {
+                    if let Err(error) = flush_scanned_image_batch(
+                        &mut conn,
+                        folder_id,
+                        &pending_batch,
+                        &mut known_paths,
+                        &mut new_image_ids,
+                        &mut newly_found_images,
+                        &mut updated_images,
+                        &mut skipped_images,
+                    ) {
+                        eprintln!("[wd-scan] {error}");
+                    }
+                    pending_batch.clear();
+                    set_scan_progress_new_images(progress, new_image_ids.len() as i64);
+                    set_scan_progress_updated_images(progress, updated_images);
+                    set_scan_progress_skipped_images(progress, skipped_images);
                 }
-            } else {
-                updated_images += 1;
-            }
+                if scanned_files % 20 == 0 {
+                    set_scan_progress_scanned_files(progress, scanned_files);
+                    wait_for_background_scan_resume(progress, pause_requested, stop_requested, "collecting");
+                }
+                !background_scan_stop_requested(stop_requested)
+            },
+        );
+        if !pending_batch.is_empty() {
+            flush_scanned_image_batch(
+                &mut conn,
+                folder_id,
+                &pending_batch,
+                &mut known_paths,
+                &mut new_image_ids,
+                &mut newly_found_images,
+                &mut updated_images,
+                &mut skipped_images,
+            )?;
         }
+        set_scan_progress_scanned_files(progress, scanned_files);
+        let found_count = found.len() as i64;
+        sync_user_folder_tree_for_library_directory(&conn, &folder_path, &found, scanned_at)?;
         assign_scanned_images_to_nearest_synced_parent_folder(
             &conn,
             &folder_path,
@@ -9576,6 +9866,7 @@ fn scan_all_folders_and_collect_new_images(
     }
 
     if background_scan_stop_requested(stop_requested) {
+        let _ = write_app_meta_value(&conn, "library_scan_in_progress", "0");
         return Ok(ScanCollectResult {
             tag_queue_image_ids: Vec::new(),
         });
@@ -9583,6 +9874,7 @@ fn scan_all_folders_and_collect_new_images(
 
     if !collect_tag_queue {
         set_scan_progress_queued_images(progress, 0);
+        let _ = write_app_meta_value(&conn, "library_scan_in_progress", "0");
         return Ok(ScanCollectResult {
             tag_queue_image_ids: Vec::new(),
         });
@@ -12329,6 +12621,18 @@ fn set_scan_progress_scanned_folders(progress: &Arc<Mutex<BackgroundScanProgress
     });
 }
 
+fn set_scan_progress_scanned_files(progress: &Arc<Mutex<BackgroundScanProgress>>, scanned_files: i64) {
+    update_scan_progress(progress, |state| {
+        state.scanned_files = scanned_files.max(0);
+    });
+}
+
+fn set_scan_progress_current_folder(progress: &Arc<Mutex<BackgroundScanProgress>>, folder_path: &str) {
+    update_scan_progress(progress, |state| {
+        state.current_folder = folder_path.to_string();
+    });
+}
+
 fn set_scan_progress_new_images(progress: &Arc<Mutex<BackgroundScanProgress>>, new_images: i64) {
     update_scan_progress(progress, |state| {
         state.new_images = new_images.max(0);
@@ -12791,13 +13095,45 @@ fn mime_type_for_extension(ext: &str) -> &'static str {
     }
 }
 
+fn flush_scanned_image_batch(
+    conn: &mut Connection,
+    folder_id: i64,
+    batch: &[ScannedImage],
+    known_paths: &mut HashSet<String>,
+    new_image_ids: &mut Vec<String>,
+    newly_found_images: &mut Vec<ScannedImage>,
+    updated_images: &mut i64,
+    skipped_images: &mut i64,
+) -> Result<(), String> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("Failed to open scan upsert transaction: {error}"))?;
+    for image in batch {
+        let is_new = known_paths.insert(image.path.clone());
+        upsert_image(&tx, folder_id, image)?;
+        if is_new {
+            new_image_ids.push(image.path.clone());
+            newly_found_images.push(image.clone());
+        } else {
+            *skipped_images += 1;
+        }
+    }
+    tx.commit()
+        .map_err(|error| format!("Failed to commit scan upsert transaction: {error}"))?;
+    let _ = updated_images;
+    Ok(())
+}
+
 fn scan_images(
     folder_path: &Path,
     imported_at: i64,
     seen_paths: &mut HashSet<String>,
     existing_meta: &HashMap<String, ExistingImageMeta>,
-) -> Vec<ScannedImage> {
-    let mut images = Vec::new();
+    on_image: &mut dyn FnMut(ScannedImage) -> bool,
+) {
 
     for entry in WalkDir::new(folder_path)
         .follow_links(false)
@@ -12848,7 +13184,7 @@ fn scan_images(
             (width, height)
         };
 
-        images.push(ScannedImage {
+        let image = ScannedImage {
             path: path_text,
             file_name: path
                 .file_name()
@@ -12863,10 +13199,11 @@ fn scan_images(
             file_size,
             modified_at,
             imported_at,
-        });
+        };
+        if !on_image(image) {
+            break;
+        }
     }
-
-    images
 }
 
 fn normalize_folder_path(folder_path: &str) -> Result<String, String> {
