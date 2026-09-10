@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import FolderClose from '@icon-park/vue-next/es/icons/FolderClose'
@@ -8,10 +8,7 @@ import Pushpin from '@icon-park/vue-next/es/icons/Pushpin'
 import UpdateRotation from '@icon-park/vue-next/es/icons/UpdateRotation'
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import GalleryView from './components/GalleryView.vue'
-import AppOverlayLayer from './components/AppOverlayLayer.vue'
 import LeftSidebar from './components/LeftSidebar.vue'
-import RightSidebar from './components/RightSidebar.vue'
-import ReferenceBoardView from './components/ReferenceBoardView.vue'
 import SettingsView from './components/SettingsView.vue'
 import SlideshowOverlay from './components/SlideshowOverlay.vue'
 import { useAppSettings } from './composables/useAppSettings'
@@ -23,23 +20,11 @@ import { useFolderManagement } from './composables/useFolderManagement'
 import { useGalleryMasonry } from './composables/useGalleryMasonry'
 import { useGallerySearch } from './composables/useGallerySearch'
 import { useImageDragAndDrop } from './composables/useImageDragAndDrop'
-import { usePreviewBoardDrag } from './composables/usePreviewBoardDrag'
+import { copyImageToSystemClipboard, buildClipboardCopyErrorText } from './composables/useImageClipboard'
 import { useContextMenuState } from './composables/useContextMenuState'
-import { useReferenceBoardManagement } from './composables/useReferenceBoardManagement'
-import { useReferenceBoardInteraction } from './composables/useReferenceBoardInteraction'
-import { useReferenceBoardClipboard } from './composables/useReferenceBoardClipboard'
-import { useReferenceBoardHistory } from './composables/useReferenceBoardHistory'
-import { useReferenceBoardViewport } from './composables/useReferenceBoardViewport'
 import { useTagManagement } from './composables/useTagManagement'
 import type { GalleryImage, GalleryLayoutItem } from './types/gallery'
-import type {
-  BoardWorldBounds,
-  GalleryImagePage,
-  LibraryStore,
-  ReferenceBoard,
-  ReferenceBoardItem,
-  ViewMode,
-} from './types/app-state'
+import type { GalleryImagePage, LibraryStore, ViewMode } from './types/app-state'
 
 type GalleryBrowseMode = 'default' | 'sidebar-disabled' | 'carousel'
 type MigrationBackupInspection = {
@@ -102,36 +87,18 @@ const currentAppVersion = __APP_VERSION__
 const updateCheckDelayMs = 8000
 const githubRepoUrl = 'https://github.com/YazawaSunrise/illuTag'
 const githubLatestReleaseApiUrl = 'https://api.github.com/repos/YazawaSunrise/illuTag/releases/latest'
-const expandedReferenceBoardFolderIdsStorageKey = 'illutag.expandedReferenceBoardFolderIds'
-const previewReferenceBoardIdsStorageKey = 'illutag.previewReferenceBoardIds'
 const lastWorkspaceStateStorageKey = 'illutag.lastWorkspaceState'
-const referenceBoardMemoryStateStorageKey = 'illutag.referenceBoardMemoryState'
 const autoScanOnStartupStorageKey = 'illutag.autoScanOnStartup'
 const imageDragDelayMs = 120
 const startupAutoScanDelayMs = 3000
 
 type LastWorkspaceState = {
   viewMode: ViewMode
-  activeReferenceBoardId: number | null
-}
-
-type ReferenceBoardMemoryState = {
-  activeReferenceBoardId: number | null
-  referenceBoardScale?: number
-  referenceBoardPan?: { x: number; y: number }
-  selectedReferenceBoardItemId?: number | null
-  referenceBoardSidebarsDisabled?: boolean
 }
 
 const initialWorkspaceState = readStoredWorkspaceState()
-const initialReferenceBoardMemoryState = readStoredReferenceBoardMemoryState() ?? readLegacyReferenceBoardMemoryState()
-const initialReferenceBoardId =
-  initialWorkspaceState?.viewMode === 'board' && initialWorkspaceState.activeReferenceBoardId !== null
-    ? initialWorkspaceState.activeReferenceBoardId
-    : null
 const sidebarHoverOpen = ref(false)
-const rightSidebarHoverOpen = ref(false)
-const viewMode = ref<ViewMode>(initialReferenceBoardId !== null ? 'board' : 'gallery')
+const viewMode = ref<ViewMode>('gallery')
 
 const library = ref<LibraryStore>({
   folders: [],
@@ -171,35 +138,21 @@ const removeFromFolderConfirmState = ref<null | {
   message: string
 }>(null)
 const systemTrashMoveErrorMessage = ref<string | null>(null)
-const activeReferenceBoardId = ref<number | null>(initialReferenceBoardId)
 const isWindowMaximized = ref(false)
 const isWindowAlwaysOnTop = ref(false)
 const isTitlebarHovered = ref(false)
-const referenceBoardSidebarsDisabled = ref(
-  initialWorkspaceState?.viewMode === 'board' && initialReferenceBoardMemoryState?.activeReferenceBoardId === initialReferenceBoardId
-    ? Boolean(initialReferenceBoardMemoryState.referenceBoardSidebarsDisabled)
-    : false,
-)
 const galleryBrowseMode = ref<GalleryBrowseMode>('default')
 const galleryBrowseModeBeforeSlideshow = ref<GalleryBrowseMode>('default')
 const slideshowOpen = ref(false)
 const slideshowStartIndex = ref(0)
-const boardSpaceFocusMode = ref<'item' | 'canvas'>('item')
-const importLibraryFolderPickerItemId = ref<number | null>(null)
-const importLibraryFolderPickerResolve = ref<((folderId: number | null) => void) | null>(null)
 const sidebarHoverCloseTimer = ref<number | null>(null)
-const rightSidebarHoverCloseTimer = ref<number | null>(null)
-const boardPointerUseMaxAgeMs = 5000
 const sidebarPointerUseMaxAgeMs = 5000
 const sidebarPreheatZoneWidth = 220
 const sidebarTriggerZoneWidth = 30
-const referenceBoardSidebarHoverHoldMs = 250
 const sidebarHoverCloseHoldUntil = ref(0)
 const isLeftSidebarPreheatActive = ref(false)
-const isRightSidebarPreheatActive = ref(false)
 const lastPointerPosition = ref<{ x: number; y: number; at: number } | null>(null)
 const pendingWorkspaceRestore = ref<LastWorkspaceState | null>(initialWorkspaceState)
-const pendingReferenceBoardMemoryRestore = ref<ReferenceBoardMemoryState | null>(initialReferenceBoardMemoryState)
 const workspaceRestoreApplied = ref(false)
 const isSettingsView = computed(() => viewMode.value === 'settings')
 const dataDirectoryWarningText = computed(() => {
@@ -216,7 +169,6 @@ const gallerySidebarsDisabled = computed(
   () => viewMode.value === 'gallery' && (galleryBrowseMode.value === 'sidebar-disabled' || slideshowOpen.value),
 )
 const sidebarOpen = computed(() => sidebarPinnedEffective.value || sidebarHoverOpen.value)
-const rightSidebarOpen = computed(() => rightSidebarPinned.value || rightSidebarHoverOpen.value)
 const isTitlebarPinned = computed(() => {
   if (isWindowMaximized.value) {
     return isTitlebarHovered.value
@@ -232,39 +184,6 @@ const updateAvailable = computed(
 )
 const updateDisplayText = computed(() => updateErrorText.value || updateStatusText.value)
 
-const activeReferenceBoard = computed(() =>
-  library.value.referenceBoards.find((board) => board.id === activeReferenceBoardId.value) ?? null,
-)
-
-const {
-  activeBoardCanvasBounds,
-  boundsOfReferenceBoardItem,
-  mergeBoardBounds,
-  ensureBoardCanvasBoundsFor,
-  syncBoardCanvasBounds,
-} = useReferenceBoardViewport<LibraryStore>({
-  library,
-  activeReferenceBoardId,
-  activeReferenceBoard,
-})
-
-const activeReferenceBoardItems = computed(() => {
-  if (activeReferenceBoardId.value === null) return []
-  const imagesById = new Map(library.value.images.map((image) => [image.id, image]))
-  return library.value.referenceBoardItems
-    .filter((item) => item.boardId === activeReferenceBoardId.value)
-    .map((item) => ({ item, image: imagesById.get(item.imageId) }))
-    .filter((entry): entry is { item: ReferenceBoardItem; image: GalleryImage } => Boolean(entry.image))
-})
-
-const referenceBoardCanvasMenuStyle = computed(() => {
-  if (!referenceBoardCanvasMenu.value) return {}
-  return {
-    left: `${referenceBoardCanvasMenu.value.x}px`,
-    top: `${referenceBoardCanvasMenu.value.y}px`,
-  }
-})
-
 const searchPanelStyle = computed<Record<string, string>>(() => ({
   '--search-reveal': searchRevealProgress.value.toString(),
   '--search-opacity': searchRevealProgress.value.toString(),
@@ -274,117 +193,14 @@ const searchPanelStyle = computed<Record<string, string>>(() => ({
 const {
   sidebarPinned,
   autoHideTitlebarInWindowMode,
-  rightSidebarPinned,
-  autoFixRightSidebarOnPreview,
   themeMode,
   thumbnailCacheEnabled,
   initAppSettingsFromStorage,
   setSidebarPinned,
   setAutoHideTitlebarInWindowMode,
-  setRightSidebarPinned,
-  setAutoFixRightSidebarOnPreview,
   setThemeMode,
   setThumbnailCacheEnabled,
 } = useAppSettings()
-
-const {
-  expandedReferenceBoardFolderIds,
-  dragExpandedReferenceBoardFolderIds,
-  previewReferenceBoardIds,
-  boardContextMenu,
-  boardDraft,
-  newBoardName,
-  isComposingBoardName,
-  renamingReferenceBoardFolderId,
-  renamingReferenceBoardFolderName,
-  isComposingReferenceBoardFolderRename,
-  renamingReferenceBoardId,
-  renamingReferenceBoardName,
-  isComposingReferenceBoardRename,
-  draggedReferenceBoardId,
-  draggedReferenceBoardFolderId,
-  referenceBoardDragOverKind,
-  referenceBoardDragOverId,
-  isReferencePreviewActive,
-  referenceBoardPreviewBlocks,
-  referenceBoardRows,
-  boardContextMenuStyle,
-  boardDraftStyle,
-  toggleReferenceBoardFolderExpanded,
-  expandReferenceBoardFolder,
-  onReferenceBoardFolderRowClick,
-  showReferenceBoard: showReferenceBoardBase,
-  closeBoardContextMenu,
-  referenceBoardIdFromPoint,
-  referenceBoardFolderIdFromPoint,
-  isPointInsideRightSidebarArea,
-  clearDragReferenceBoardFolderCollapseTimer,
-  clearDragExpandedReferenceBoardFoldersNow,
-  scheduleClearDragExpandedReferenceBoardFolders,
-  keepDragExpandedReferenceBoardFolder,
-  clearReferenceBoardDragState,
-  startReferenceBoardFolderDrag,
-  startReferenceBoardDrag,
-  onReferenceBoardDragOverFolder,
-  onReferenceBoardDragOverBoard,
-  onReferenceBoardDragOverSpace,
-  dropOnReferenceBoardFolder,
-  dropOnReferenceBoard,
-  dropOnReferenceBoardSpace,
-  endReferenceBoardDrag,
-  openBoardSpaceMenu,
-  openReferenceBoardFolderMenu,
-  openReferenceBoardMenu,
-  toggleReferenceBoardPreview,
-  removeReferenceBoardPreview,
-  openBoardDraft,
-  closeBoardDraft,
-  setNewBoardName,
-  setComposingBoardName,
-  commitBoardDraft,
-  cancelReferenceBoardFolderRename,
-  startComposingReferenceBoardFolderRename,
-  endComposingReferenceBoardFolderRename,
-  setRenamingReferenceBoardFolderName,
-  startReferenceBoardFolderRename,
-  commitReferenceBoardFolderRename,
-  onReferenceBoardFolderRenameEnter,
-  deleteReferenceBoardFolder,
-  cancelReferenceBoardRename,
-  startComposingReferenceBoardRename,
-  endComposingReferenceBoardRename,
-  setRenamingReferenceBoardName,
-  startReferenceBoardRename,
-  commitReferenceBoardRename,
-  onReferenceBoardRenameEnter,
-  deleteReferenceBoard,
-} = useReferenceBoardManagement<LibraryStore>({
-  library,
-  viewMode,
-  activeReferenceBoardId,
-  rightSidebarPinned,
-  autoFixRightSidebarOnPreview,
-  ensureBoardCanvasBoundsFor,
-  convertFileSrc,
-  setErrorText(value) {
-    errorText.value = value
-  },
-  formatError,
-})
-
-function showReferenceBoard(boardId: number) {
-  if (viewMode.value === 'board' && activeReferenceBoardId.value !== null && activeReferenceBoardId.value !== boardId) {
-    saveReferenceBoardMemoryState()
-  }
-  clearSidebarHoverCloseTimer()
-  clearRightSidebarHoverCloseTimer()
-  sidebarHoverCloseHoldUntil.value = performance.now() + referenceBoardSidebarHoverHoldMs
-  showReferenceBoardBase(boardId)
-  restoreReferenceBoardMemoryStateFor(boardId)
-  void nextTick().then(() => {
-    recoverSidebarsFromPointerPosition()
-  })
-}
 
 const {
   activeUserFolderId,
@@ -440,13 +256,11 @@ const {
 } = useFolderManagement<LibraryStore>({
   library,
   viewMode,
-  activeReferenceBoardId,
   setErrorText(value) {
     errorText.value = value
   },
   formatError,
   updateStatus,
-  closeBoardContextMenu,
   clamp,
 })
 
@@ -466,16 +280,6 @@ const {
   folderHasChildren,
   expandedDropFolderIdsFor,
   assignImageToFolder,
-  referenceBoardIdFromPoint,
-  referenceBoardFolderIdFromPoint,
-  isPointInsideRightSidebarArea,
-  keepDragExpandedReferenceBoardFolder,
-  clearDragExpandedReferenceBoardFoldersNow,
-  clearDragReferenceBoardFolderCollapseTimer,
-  scheduleClearDragExpandedReferenceBoardFolders,
-  dragExpandedReferenceBoardFolderIds,
-  addImageToReferenceBoard,
-  expandReferenceBoardFolder,
   isPointInsideExternalImageSearchDropZone,
   setExternalImageSearchFromGalleryImage: setExternalImageSearchFromGalleryDrag,
   setErrorText(value) {
@@ -510,48 +314,6 @@ const {
   openGalleryImageMenu: openGalleryImageMenuState,
   openImageDetailMenu: openImageDetailMenuState,
 } = useContextMenuState()
-
-const {
-  boardScale,
-  boardPan,
-  selectedReferenceBoardItemId,
-  referenceBoardCanvasMenu,
-  lastBoardPointerWorld,
-  closeReferenceBoardCanvasMenu,
-  openReferenceBoardItemMenu,
-  openReferenceBoardCanvasMenu,
-  getReferenceBoardViewportMetrics,
-  trackBoardPointer,
-  zoomReferenceBoard,
-  startBoardPan,
-  moveBoardInteraction,
-  finishBoardInteraction,
-  startBoardItemMove,
-  startBoardItemResize,
-  startBoardItemRotate,
-  clearBoardInteraction,
-} = useReferenceBoardInteraction<LibraryStore>({
-  library,
-  activeReferenceBoard,
-  viewMode,
-  ensureBoardCanvasBoundsFor,
-  closeImageDetailContextMenu,
-  closeGalleryImageContextMenu,
-  setErrorText(value) {
-    errorText.value = value
-  },
-  formatError,
-  clamp,
-  onLayoutHistory(payload) {
-    pushBoardHistory({
-      kind: 'layout',
-      boardId: payload.boardId,
-      changes: [{ itemId: payload.itemId, before: payload.before, after: payload.after }],
-      selectionBefore: payload.selectionBefore,
-      selectionAfter: payload.selectionAfter,
-    })
-  },
-})
 
 const {
   searchZhInput,
@@ -1741,82 +1503,6 @@ const {
 })
 
 const {
-  copyReferenceBoardItemToClipboard,
-  pasteReferenceBoardContent,
-  copyImageToSystemClipboard,
-  buildClipboardCopyErrorText,
-  clearInternalBoardCopyRefForItem,
-  clearInternalBoardCopyRefForItems,
-} = useReferenceBoardClipboard<LibraryStore>({
-  library,
-  activeReferenceBoard,
-  selectedReferenceBoardItemId,
-  boardPan,
-  boardScale,
-  lastBoardPointerWorld,
-  boardPointerUseMaxAgeMs,
-  closeReferenceBoardCanvasMenu,
-  ensureBoardCanvasBoundsFor,
-  getReferenceBoardViewportMetrics,
-  setErrorText(value) {
-    errorText.value = value
-  },
-  formatError,
-})
-
-const {
-  pruneBoardHistory,
-  pushBoardHistory,
-  collectBoardLayoutMap,
-  buildBoardHistoryChanges,
-  undoReferenceBoardHistory,
-  redoReferenceBoardHistory,
-  removeReferenceBoardItem,
-  removeReferenceBoardItemsWithHistory,
-} = useReferenceBoardHistory<LibraryStore>({
-  library,
-  activeReferenceBoardId,
-  selectedReferenceBoardItemId,
-  ensureBoardCanvasBoundsFor,
-  clearInternalBoardCopyRefForItems,
-  closeReferenceBoardCanvasMenu,
-  setErrorText(value) {
-    errorText.value = value
-  },
-  formatError,
-})
-
-const {
-  previewDragOverDeleteZone,
-  previewBoardItemDrag,
-  previewBoardDragIconKind,
-  onPreviewReferenceThumbClick,
-  startPreviewBoardItemDrag,
-  startPreviewBoardItemPointerDrag,
-  movePreviewBoardItemPointerDrag,
-  finishPreviewBoardItemPointerDrag,
-  onPreviewBoardItemDragOverPreview,
-  onPreviewBoardItemDragOverBoard,
-  dropPreviewBoardItem,
-  endPreviewBoardItemDrag,
-  onGalleryPreviewBoardItemDragOver,
-  onGalleryPreviewBoardItemDrop,
-} = usePreviewBoardDrag<LibraryStore>({
-  library,
-  selectedReferenceBoardItemId,
-  closeBoardContextMenu,
-  clearReferenceBoardDragState,
-  ensureBoardCanvasBoundsFor,
-  removeReferenceBoardItemsWithHistory,
-  clearInternalBoardCopyRefForItem,
-  showReferenceBoard,
-  setErrorText(value) {
-    errorText.value = value
-  },
-  formatError,
-})
-
-const {
   tagManagerOpen,
   tagManagerTab,
   isTagManagerLoading,
@@ -1959,26 +1645,17 @@ onMounted(async () => {
   const mountedStart = performance.now()
   console.info(`[startup-prof] App.vue onMounted_start_ms=${mountedStart.toFixed(1)}`)
   initAppSettingsFromStorage()
-  expandedReferenceBoardFolderIds.value = readStoredIdSet(expandedReferenceBoardFolderIdsStorageKey)
-  previewReferenceBoardIds.value = readStoredIdSet(previewReferenceBoardIdsStorageKey)
   initAutoScanOnStartupFromStorage()
   void refreshDataDirectoryInfo()
   void loadLibrary()
   handleWindowResize()
   window.addEventListener('resize', handleWindowResize)
   window.addEventListener('pointermove', moveImageDrag)
-  window.addEventListener('pointermove', movePreviewBoardItemPointerDrag)
   window.addEventListener('pointermove', moveFolderPointer)
-  window.addEventListener('pointermove', moveBoardInteraction)
-  window.addEventListener('pointermove', trackBoardPointer)
   window.addEventListener('pointermove', trackGlobalPointerPosition, { passive: true })
   window.addEventListener('pointerup', finishImageDrag)
-  window.addEventListener('pointerup', finishPreviewBoardItemPointerDrag)
   window.addEventListener('pointerup', finishFolderPointer)
-  window.addEventListener('pointerup', finishBoardInteraction)
   window.addEventListener('click', closeFolderContextMenu)
-  window.addEventListener('click', closeBoardContextMenu)
-  window.addEventListener('click', closeReferenceBoardCanvasMenu)
   window.addEventListener('click', closeImageDetailContextMenu)
   window.addEventListener('click', closeGalleryImageContextMenu)
   window.addEventListener('click', closeTagManagerTagContextMenu)
@@ -2091,33 +1768,23 @@ onUnmounted(() => {
   clearStartupAutoScanTimer()
   clearTagManagerDragGhost()
   clearSidebarHoverCloseTimer()
-  clearRightSidebarHoverCloseTimer()
   closeFolderRuleDanbooruSuggestions()
   stopBackgroundScanPolling()
   stopThumbnailGenerationPolling()
   stopAtmosphereGenerationPolling()
   stopColorSignatureGenerationPolling()
-  clearDragReferenceBoardFolderCollapseTimer()
   window.removeEventListener('resize', handleWindowResize)
   window.removeEventListener('pointermove', moveImageDrag)
-  window.removeEventListener('pointermove', movePreviewBoardItemPointerDrag)
   window.removeEventListener('pointermove', moveFolderPointer)
-  window.removeEventListener('pointermove', moveBoardInteraction)
-  window.removeEventListener('pointermove', trackBoardPointer)
   window.removeEventListener('pointermove', trackGlobalPointerPosition)
   window.removeEventListener('pointerup', finishImageDrag)
-  window.removeEventListener('pointerup', finishPreviewBoardItemPointerDrag)
   window.removeEventListener('pointerup', finishFolderPointer)
-  window.removeEventListener('pointerup', finishBoardInteraction)
   window.removeEventListener('click', closeFolderContextMenu)
-  window.removeEventListener('click', closeBoardContextMenu)
-  window.removeEventListener('click', closeReferenceBoardCanvasMenu)
   window.removeEventListener('click', closeImageDetailContextMenu)
   window.removeEventListener('click', closeGalleryImageContextMenu)
   window.removeEventListener('click', closeTagManagerTagContextMenu)
   window.removeEventListener('mouseout', onWindowMouseOut)
   window.removeEventListener('keydown', handleGlobalKeydown)
-  closeImportLibraryFolderPicker(null)
   resetImageDetailUserTagEditor()
 })
 
@@ -2127,20 +1794,11 @@ watch(sidebarPinned, async (value) => {
   updateViewportSize()
 })
 
-watch(rightSidebarPinned, async (value) => {
-  if (value) rightSidebarHoverOpen.value = false
-  await nextTick()
-  updateViewportSize()
-})
-
 watch(gallerySidebarsDisabled, (disabled) => {
   if (!disabled) return
   sidebarHoverOpen.value = false
-  rightSidebarHoverOpen.value = false
   isLeftSidebarPreheatActive.value = false
-  isRightSidebarPreheatActive.value = false
   clearSidebarHoverCloseTimer()
-  clearRightSidebarHoverCloseTimer()
 })
 
 watch(
@@ -2164,64 +1822,10 @@ watch(
   },
 )
 
-watch(expandedReferenceBoardFolderIds, (value) => {
-  localStorage.setItem(
-    expandedReferenceBoardFolderIdsStorageKey,
-    JSON.stringify([...value].filter((id) => Number.isFinite(id))),
-  )
-})
-
-watch(previewReferenceBoardIds, (value) => {
-  localStorage.setItem(
-    previewReferenceBoardIdsStorageKey,
-    JSON.stringify([...value].filter((id) => Number.isFinite(id))),
-  )
-})
-
 watch(
-  [viewMode, activeReferenceBoardId],
+  viewMode,
   () => {
     saveLastWorkspaceState()
-  },
-)
-
-watch(
-  [
-    activeReferenceBoardId,
-    boardScale,
-    () => boardPan.value.x,
-    () => boardPan.value.y,
-    selectedReferenceBoardItemId,
-    referenceBoardSidebarsDisabled,
-  ],
-  () => {
-    if (viewMode.value === 'board') {
-      saveReferenceBoardMemoryState()
-    }
-  },
-)
-
-watch(activeReferenceBoardId, () => {
-  boardSpaceFocusMode.value = 'item'
-  if (activeReferenceBoardId.value !== null) {
-    ensureBoardCanvasBoundsFor(activeReferenceBoardId.value)
-  }
-})
-
-watch(selectedReferenceBoardItemId, () => {
-  boardSpaceFocusMode.value = 'item'
-})
-
-watch(
-  () => library.value.referenceBoards.map((board) => board.id).join(','),
-  () => {
-    const exists = new Set(library.value.referenceBoards.map((board) => board.id))
-    pruneBoardHistory(exists)
-    const next = new Set([...previewReferenceBoardIds.value].filter((id) => exists.has(id)))
-    if (next.size !== previewReferenceBoardIds.value.size) {
-      previewReferenceBoardIds.value = next
-    }
-    syncBoardCanvasBounds(exists)
   },
 )
 
@@ -2309,9 +1913,6 @@ async function loadLibrary(options?: { silent?: boolean }) {
     console.info(
       `[startup-prof] loadLibrary assigned_ms=${performance.now().toFixed(1)} silent=${silent} images=${library.value.images.length}`,
     )
-    for (const board of library.value.referenceBoards) {
-      ensureBoardCanvasBoundsFor(board.id)
-    }
     if (
       library.value.largeLibraryMode &&
       viewMode.value === 'gallery' &&
@@ -2496,12 +2097,6 @@ function handleGlobalKeydown(event: KeyboardEvent) {
     closeFolderContextMenu()
     closeCreateFolderDraft()
     cancelUserFolderRename()
-    closeBoardContextMenu()
-    closeBoardDraft()
-    cancelReferenceBoardFolderRename()
-    cancelReferenceBoardRename()
-    closeReferenceBoardCanvasMenu()
-    closeImportLibraryFolderPicker(null)
     closeTagManagerPanel()
     endTagManagerTagDrag()
     closeTagManagerTagContextMenu()
@@ -2514,7 +2109,6 @@ function handleGlobalKeydown(event: KeyboardEvent) {
     folderPointerState.value = null
     draggedFolderId.value = null
     folderDragOverId.value = null
-    clearBoardInteraction()
     return
   }
 
@@ -2526,105 +2120,6 @@ function handleGlobalKeydown(event: KeyboardEvent) {
       if (ok) void executeGallerySearch()
     })
     return
-  }
-
-  if (viewMode.value !== 'board' || !activeReferenceBoard.value) return
-
-  if ((event.ctrlKey || event.metaKey) && !event.altKey) {
-    const key = event.key.toLowerCase()
-    if (key === 'z') {
-      event.preventDefault()
-      if (event.shiftKey) {
-        void redoReferenceBoardHistory()
-      } else {
-        void undoReferenceBoardHistory()
-      }
-      return
-    }
-    if (key === 'y') {
-      event.preventDefault()
-      void redoReferenceBoardHistory()
-      return
-    }
-  }
-
-  if (event.code === 'Space' || event.key === ' ') {
-    event.preventDefault()
-    focusReferenceBoardBySpaceShortcut()
-    return
-  }
-
-  if (event.key === 'Delete' && selectedReferenceBoardItemId.value !== null) {
-    event.preventDefault()
-    void removeReferenceBoardItem(selectedReferenceBoardItemId.value)
-    return
-  }
-
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'c') {
-    if (selectedReferenceBoardItemId.value !== null) {
-      event.preventDefault()
-      void copyReferenceBoardItemToClipboard(selectedReferenceBoardItemId.value)
-    }
-    return
-  }
-
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'v') {
-    event.preventDefault()
-    void pasteReferenceBoardContent()
-  }
-}
-
-async function addImageToReferenceBoard(imageId: string, boardId: number) {
-  const { invoke } = await import('@tauri-apps/api/core')
-  library.value = await invoke<LibraryStore>('add_image_to_reference_board_command', {
-    imageId,
-    boardId,
-  })
-  ensureBoardCanvasBoundsFor(boardId)
-}
-
-function focusReferenceBoardBounds(bounds: BoardWorldBounds) {
-  const viewport = getReferenceBoardViewportMetrics()
-  if (!viewport) return false
-
-  const width = Math.max(1, bounds.maxX - bounds.minX)
-  const height = Math.max(1, bounds.maxY - bounds.minY)
-  const nextScale = clamp(Math.min(viewport.width / width, viewport.height / height), 0.2, 4)
-  const centerX = (bounds.minX + bounds.maxX) / 2
-  const centerY = (bounds.minY + bounds.maxY) / 2
-  boardScale.value = nextScale
-  boardPan.value = {
-    x: viewport.width / 2 - centerX * nextScale,
-    y: viewport.height / 2 - centerY * nextScale,
-  }
-  return true
-}
-
-function focusActiveReferenceBoardCanvas() {
-  if (!activeReferenceBoard.value) return false
-  const items = library.value.referenceBoardItems.filter((item) => item.boardId === activeReferenceBoard.value?.id)
-  if (items.length === 0) return false
-  const bounds = mergeBoardBounds(items.map(boundsOfReferenceBoardItem))
-  return focusReferenceBoardBounds(bounds)
-}
-
-function focusSelectedReferenceBoardItem() {
-  const selectedId = selectedReferenceBoardItemId.value
-  if (selectedId === null) return false
-  const item = library.value.referenceBoardItems.find((entry) => entry.id === selectedId)
-  if (!item) return false
-  return focusReferenceBoardBounds(boundsOfReferenceBoardItem(item))
-}
-
-function focusReferenceBoardBySpaceShortcut() {
-  if (boardSpaceFocusMode.value === 'item' && selectedReferenceBoardItemId.value !== null) {
-    if (focusSelectedReferenceBoardItem()) {
-      boardSpaceFocusMode.value = 'canvas'
-      return
-    }
-  }
-  if (focusActiveReferenceBoardCanvas()) {
-    boardSpaceFocusMode.value = 'item'
   }
 }
 
@@ -2644,215 +2139,6 @@ function guessImageMimeTypeFromName(fileName: string) {
 function isImageDragFile(file: File) {
   if (file.type.startsWith('image/')) return true
   return guessImageMimeTypeFromName(file.name).startsWith('image/')
-}
-
-function referenceBoardWorldPointFromClient(clientX: number, clientY: number, container: HTMLElement) {
-  const rect = container.getBoundingClientRect()
-  return {
-    x: (clientX - rect.left - boardPan.value.x) / boardScale.value,
-    y: (clientY - rect.top - boardPan.value.y) / boardScale.value,
-  }
-}
-
-function onReferenceBoardExternalImageDragOver(event: DragEvent) {
-  if (!activeReferenceBoard.value) return
-  const files = Array.from(event.dataTransfer?.files ?? [])
-  const hasImage = files.some((file) => isImageDragFile(file))
-  if (!hasImage) return
-  if (event.dataTransfer) {
-    event.dataTransfer.dropEffect = 'copy'
-  }
-}
-
-async function onReferenceBoardExternalImageDrop(event: DragEvent) {
-  if (!activeReferenceBoard.value) return
-  const container = event.currentTarget as HTMLElement | null
-  if (!container) return
-  const files = Array.from(event.dataTransfer?.files ?? [])
-  const imageFiles = files.filter((file) => isImageDragFile(file))
-  if (imageFiles.length === 0) return
-
-  try {
-    const world = referenceBoardWorldPointFromClient(event.clientX, event.clientY, container)
-    const { invoke } = await import('@tauri-apps/api/core')
-    const boardId = activeReferenceBoard.value.id
-    const stackOffset = 18
-    const images: Array<{ imageBytes: number[]; mimeType: string }> = []
-    for (const imageFile of imageFiles) {
-      const mimeType =
-        imageFile.type && imageFile.type.startsWith('image/')
-          ? imageFile.type
-          : guessImageMimeTypeFromName(imageFile.name)
-      if (!mimeType.startsWith('image/')) {
-        errorText.value = '仅支持拖入图片文件'
-        continue
-      }
-      const bytes = Array.from(new Uint8Array(await imageFile.arrayBuffer()))
-      images.push({
-        imageBytes: bytes,
-        mimeType,
-      })
-    }
-    if (images.length === 0) return
-    library.value = await invoke<LibraryStore>('paste_images_to_reference_board_command', {
-      boardId,
-      images,
-      x: world.x,
-      y: world.y,
-      stackOffset,
-    })
-    ensureBoardCanvasBoundsFor(boardId)
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-async function autoArrangeActiveReferenceBoard() {
-  if (!activeReferenceBoard.value) return
-  const boardId = activeReferenceBoard.value.id
-  const beforeMap = collectBoardLayoutMap(boardId)
-  const selectionBefore = selectedReferenceBoardItemId.value
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    library.value = await invoke<LibraryStore>('auto_arrange_reference_board_command', {
-      boardId,
-    })
-    ensureBoardCanvasBoundsFor(boardId)
-    const afterMap = collectBoardLayoutMap(boardId)
-    pushBoardHistory({
-      kind: 'layout',
-      boardId,
-      changes: buildBoardHistoryChanges(beforeMap, afterMap),
-      selectionBefore,
-      selectionAfter: selectedReferenceBoardItemId.value,
-    })
-  } catch (error) {
-    errorText.value = formatError(error)
-  } finally {
-    closeReferenceBoardCanvasMenu()
-  }
-}
-
-async function importSelectedReferenceItemToLibrary(itemId: number) {
-  if (!canImportReferenceBoardItemToLibrary(itemId)) {
-    closeReferenceBoardCanvasMenu()
-    return
-  }
-
-  closeReferenceBoardCanvasMenu()
-  const folderId = await pickImportedLibraryFolderIdForImport(itemId)
-  if (folderId === null) {
-    return
-  }
-
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    library.value = await invoke<LibraryStore>('import_reference_board_item_to_library_command', {
-      itemId,
-      folderId,
-    })
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-function canImportReferenceBoardItemToLibrary(itemId: number) {
-  const boardItem = library.value.referenceBoardItems.find((item) => item.id === itemId)
-  if (!boardItem) return false
-  const image = library.value.images.find((item) => item.id === boardItem.imageId)
-  if (!image) return false
-  return image.source === 'reference'
-}
-
-function closeImportLibraryFolderPicker(selectedFolderId: number | null) {
-  importLibraryFolderPickerItemId.value = null
-  const resolve = importLibraryFolderPickerResolve.value
-  importLibraryFolderPickerResolve.value = null
-  resolve?.(selectedFolderId)
-}
-
-function openImportLibraryFolderPicker(itemId: number) {
-  if (importLibraryFolderPickerResolve.value) {
-    importLibraryFolderPickerResolve.value(null)
-  }
-  importLibraryFolderPickerItemId.value = itemId
-  return new Promise<number | null>((resolve) => {
-    importLibraryFolderPickerResolve.value = resolve
-  })
-}
-
-async function pickImportedLibraryFolderIdForImport(itemId: number) {
-  const folders = library.value.folders
-  if (folders.length === 0) {
-    errorText.value = '请先在设置中导入至少一个本地图库文件夹。'
-    return null
-  }
-  return openImportLibraryFolderPicker(itemId)
-}
-
-async function exportReferenceBoardItem(itemId: number) {
-  const destination = await save({
-    title: '导出参考板图片',
-    defaultPath: `reference-item-${itemId}.png`,
-  })
-  if (!destination || Array.isArray(destination)) return
-
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    await invoke('export_reference_board_item_command', {
-      itemId,
-      destination,
-    })
-  } catch (error) {
-    errorText.value = formatError(error)
-  } finally {
-    closeReferenceBoardCanvasMenu()
-  }
-}
-
-async function flipReferenceBoardItemHorizontal(itemId: number) {
-  await flipReferenceBoardItem(itemId, 'horizontal')
-}
-
-async function flipReferenceBoardItemVertical(itemId: number) {
-  await flipReferenceBoardItem(itemId, 'vertical')
-}
-
-async function flipReferenceBoardItem(itemId: number, direction: 'horizontal' | 'vertical') {
-  const item = library.value.referenceBoardItems.find((entry) => entry.id === itemId)
-  if (!item) return
-  const boardId = item.boardId
-  const beforeMap = collectBoardLayoutMap(boardId)
-  const selectionBefore = selectedReferenceBoardItemId.value
-
-  const nextFlipX = direction === 'horizontal' ? !item.flipX : item.flipX
-  const nextFlipY = direction === 'vertical' ? !item.flipY : item.flipY
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    library.value = await invoke<LibraryStore>('update_reference_board_item_layout_command', {
-      itemId: item.id,
-      x: item.x,
-      y: item.y,
-      width: item.width,
-      height: item.height,
-      rotation: item.rotation,
-      flipX: nextFlipX,
-      flipY: nextFlipY,
-    })
-    ensureBoardCanvasBoundsFor(boardId)
-    const afterMap = collectBoardLayoutMap(boardId)
-    pushBoardHistory({
-      kind: 'layout',
-      boardId,
-      changes: buildBoardHistoryChanges(beforeMap, afterMap),
-      selectionBefore,
-      selectionAfter: selectedReferenceBoardItemId.value,
-    })
-  } catch (error) {
-    errorText.value = formatError(error)
-  } finally {
-    closeReferenceBoardCanvasMenu()
-  }
 }
 
 function updateStatus() {
@@ -2978,15 +2264,7 @@ function openSidebarByHover() {
   clearSidebarHoverCloseTimer()
   if (isSettingsView.value) return
   if (gallerySidebarsDisabled.value) return
-  if (viewMode.value === 'board' && referenceBoardSidebarsDisabled.value) return
   if (!sidebarPinned.value) sidebarHoverOpen.value = true
-}
-
-function openRightSidebarByHover() {
-  clearRightSidebarHoverCloseTimer()
-  if (gallerySidebarsDisabled.value) return
-  if (viewMode.value === 'board' && referenceBoardSidebarsDisabled.value) return
-  if (!rightSidebarPinned.value) rightSidebarHoverOpen.value = true
 }
 
 function trackGlobalPointerPosition(event: PointerEvent) {
@@ -3002,18 +2280,13 @@ function recoverSidebarsFromPointerPosition() {
   if (isSearchFocused.value || isSearchPointerInside.value) return
   if (gallerySidebarsDisabled.value) {
     isLeftSidebarPreheatActive.value = false
-    isRightSidebarPreheatActive.value = false
     return
   }
   const pointer = lastPointerPosition.value
   if (!pointer || performance.now() - pointer.at > sidebarPointerUseMaxAgeMs) return
   isLeftSidebarPreheatActive.value = isPointInsideLeftSidebarPreheatZone(pointer.x)
-  isRightSidebarPreheatActive.value = isPointInsideRightSidebarPreheatZone(pointer.x)
   if (isPointInsideLeftSidebarTriggerZone(pointer.x)) {
     openSidebarByHover()
-  }
-  if (isPointInsideRightSidebarTriggerZone(pointer.x)) {
-    openRightSidebarByHover()
   }
 }
 
@@ -3021,16 +2294,8 @@ function isPointInsideLeftSidebarPreheatZone(x: number) {
   return x >= 0 && x <= sidebarPreheatZoneWidth
 }
 
-function isPointInsideRightSidebarPreheatZone(x: number) {
-  return x >= window.innerWidth - sidebarPreheatZoneWidth && x <= window.innerWidth
-}
-
 function isPointInsideLeftSidebarTriggerZone(x: number) {
   return x >= 0 && x <= sidebarTriggerZoneWidth
-}
-
-function isPointInsideRightSidebarTriggerZone(x: number) {
-  return x >= window.innerWidth - sidebarTriggerZoneWidth && x <= window.innerWidth
 }
 
 function isPointInsideElement(selector: string, x: number, y: number) {
@@ -3081,51 +2346,11 @@ function isSidebarHoverSafeAreaActive() {
   )
 }
 
-function closeRightSidebarByHover() {
-  if (previewBoardItemDrag.value) return
-  clearRightSidebarHoverCloseTimer()
-  rightSidebarHoverCloseTimer.value = window.setTimeout(() => {
-    rightSidebarHoverCloseTimer.value = null
-    if (performance.now() < sidebarHoverCloseHoldUntil.value) return
-    if (
-      !rightSidebarPinned.value &&
-      !boardDraft.value &&
-      !isComposingBoardName.value &&
-      renamingReferenceBoardFolderId.value === null &&
-      renamingReferenceBoardId.value === null &&
-      !isComposingReferenceBoardFolderRename.value &&
-      !isComposingReferenceBoardRename.value &&
-      draggedReferenceBoardId.value === null &&
-      draggedReferenceBoardFolderId.value === null &&
-      !isRightSidebarHoverSafeAreaActive()
-    ) {
-      rightSidebarHoverOpen.value = false
-      closeBoardContextMenu()
-    }
-  }, 90)
-}
-
-function clearRightSidebarHoverCloseTimer() {
-  if (rightSidebarHoverCloseTimer.value === null) return
-  window.clearTimeout(rightSidebarHoverCloseTimer.value)
-  rightSidebarHoverCloseTimer.value = null
-}
-
-function isRightSidebarHoverSafeAreaActive() {
-  const pointer = lastPointerPosition.value
-  return (
-    Boolean(pointer && performance.now() - pointer.at <= sidebarPointerUseMaxAgeMs && isPointInsideRightSidebarPreheatZone(pointer.x)) ||
-    isPointerInsideAnyElement(['.right-sidebar', '.right-sidebar-hotspot'])
-  )
-}
-
 function onWindowMouseOut(event: MouseEvent) {
   if (event.relatedTarget) return
   lastPointerPosition.value = null
   isLeftSidebarPreheatActive.value = false
-  isRightSidebarPreheatActive.value = false
   closeSidebarByHover()
-  closeRightSidebarByHover()
 }
 
 function openSettings() {
@@ -3383,7 +2608,7 @@ async function deleteFolderRuleDraft() {
 }
 
 function openGalleryImageMenu(item: GalleryLayoutItem, event: MouseEvent) {
-  openGalleryImageMenuState(item, event, closeReferenceBoardCanvasMenu)
+  openGalleryImageMenuState(item, event)
 }
 
 function openGalleryImageDetailFromGallery(item: GalleryLayoutItem) {
@@ -3400,7 +2625,7 @@ function openGalleryBatchModeFromContextMenu(imageId: string) {
 }
 
 function openImageDetailMenu(event: MouseEvent) {
-  openImageDetailMenuState(event, Boolean(activeImageDetail.value), closeReferenceBoardCanvasMenu)
+  openImageDetailMenuState(event, Boolean(activeImageDetail.value))
 }
 
 function resetImageDetailMediaTransform() {
@@ -3848,16 +3073,6 @@ function closeSidebarByToggle() {
   sidebarHoverOpen.value = false
 }
 
-function toggleReferenceBoardSidebarsDisabled() {
-  referenceBoardSidebarsDisabled.value = !referenceBoardSidebarsDisabled.value
-  if (referenceBoardSidebarsDisabled.value) {
-    sidebarHoverOpen.value = false
-    rightSidebarHoverOpen.value = false
-  }
-  closeReferenceBoardCanvasMenu()
-  saveLastWorkspaceState()
-}
-
 function openGallerySlideshow() {
   if (visibleImages.value.length === 0) return
   galleryBrowseModeBeforeSlideshow.value =
@@ -3870,16 +3085,13 @@ function openGallerySlideshow() {
   slideshowOpen.value = true
   galleryBrowseMode.value = 'carousel'
   sidebarHoverOpen.value = false
-  rightSidebarHoverOpen.value = false
   isLeftSidebarPreheatActive.value = false
-  isRightSidebarPreheatActive.value = false
 }
 
 function closeGallerySlideshow() {
   slideshowOpen.value = false
   galleryBrowseMode.value = galleryBrowseModeBeforeSlideshow.value
   isLeftSidebarPreheatActive.value = false
-  isRightSidebarPreheatActive.value = false
 }
 
 function setGalleryBrowseMode(mode: GalleryBrowseMode) {
@@ -3890,9 +3102,7 @@ function setGalleryBrowseMode(mode: GalleryBrowseMode) {
   galleryBrowseMode.value = mode
   if (mode === 'sidebar-disabled') {
     sidebarHoverOpen.value = false
-    rightSidebarHoverOpen.value = false
     isLeftSidebarPreheatActive.value = false
-    isRightSidebarPreheatActive.value = false
   }
 }
 
@@ -3920,8 +3130,6 @@ function applyMigrationFrontendSettings(settings?: MigrationBackupInspection['fr
   }
   initAppSettingsFromStorage()
   initAutoScanOnStartupFromStorage()
-  expandedReferenceBoardFolderIds.value = readStoredIdSet(expandedReferenceBoardFolderIdsStorageKey)
-  previewReferenceBoardIds.value = readStoredIdSet(previewReferenceBoardIdsStorageKey)
 }
 
 async function exportMigrationBackup() {
@@ -3975,7 +3183,7 @@ async function importMigrationBackup() {
       pathMappings,
     })
     applyMigrationFrontendSettings(inspection.frontendSettings)
-    statusText.value = `已导入备份：${inspection.imageCount} 张图片，${inspection.referenceBoardCount} 个参考板`
+    statusText.value = `已导入备份：${inspection.imageCount} 张图片`
     errorText.value = ''
   } catch (error) {
     errorText.value = formatError(error)
@@ -4005,7 +3213,6 @@ const settingsViewHandlers = {
   setSidebarPinned,
   setAutoHideTitlebarInWindowMode,
   setThemeMode,
-  setAutoFixRightSidebarOnPreview,
   setThumbnailCacheEnabled,
   exportMigrationBackup,
   importMigrationBackup,
@@ -4081,81 +3288,12 @@ const leftSidebarHandlers = {
   setComposingFolderName,
 }
 
-const rightSidebarHandlers = {
-  closeHover: closeRightSidebarByHover,
-  setRightSidebarPinned,
-  toggleReferenceBoardPreview,
-  removeReferenceBoardPreview,
-  startPreviewBoardItemPointerDrag,
-  startPreviewBoardItemDrag,
-  onPreviewBoardItemDragOverPreview,
-  onPreviewBoardItemDragOverBoard,
-  dropPreviewBoardItem,
-  endPreviewBoardItemDrag,
-  startReferenceBoardFolderDrag,
-  startReferenceBoardDrag,
-  onReferenceBoardDragOverFolder,
-  onReferenceBoardDragOverBoard,
-  onReferenceBoardDragOverSpace,
-  dropOnReferenceBoardFolder,
-  dropOnReferenceBoard,
-  dropOnReferenceBoardSpace,
-  endReferenceBoardDrag,
-  openBoardSpaceMenu,
-  openReferenceBoardFolderMenu,
-  onReferenceBoardFolderRowClick,
-  toggleReferenceBoardFolderExpanded,
-  showReferenceBoard,
-  onPreviewReferenceThumbClick,
-  openReferenceBoardMenu,
-  openBoardDraft,
-  startReferenceBoardFolderRename,
-  setRenamingReferenceBoardFolderName,
-  onReferenceBoardFolderRenameEnter,
-  cancelReferenceBoardFolderRename,
-  commitReferenceBoardFolderRename,
-  startComposingReferenceBoardFolderRename,
-  endComposingReferenceBoardFolderRename,
-  renameReferenceBoardFolder: startReferenceBoardFolderRename,
-  deleteReferenceBoardFolder,
-  startReferenceBoardRename,
-  setRenamingReferenceBoardName,
-  onReferenceBoardRenameEnter,
-  cancelReferenceBoardRename,
-  commitReferenceBoardRename,
-  startComposingReferenceBoardRename,
-  endComposingReferenceBoardRename,
-  renameReferenceBoard: startReferenceBoardRename,
-  deleteReferenceBoard,
-  commitBoardDraft,
-  closeBoardDraft,
-  setNewBoardName,
-  setComposingBoardName,
-}
-
-const referenceBoardViewHandlers = {
-  zoomReferenceBoard,
-  startBoardPan,
-  startBoardItemMove,
-  startBoardItemResize,
-  startBoardItemRotate,
-  onReferenceBoardExternalImageDragOver,
-  onReferenceBoardExternalImageDrop,
-  removeReferenceBoardItem,
-  openReferenceBoardItemMenu,
-  openReferenceBoardCanvasMenu,
-  convertFileSrc,
-}
-
 const galleryViewHandlers = {
   setGalleryElement,
   onGalleryScroll,
   setSearchViewportState,
   triggerSearchRevealByHotspot,
   onGalleryWheel,
-  onGalleryPreviewBoardItemDragOver,
-  onGalleryPreviewBoardItemDrop,
-  endPreviewBoardItemDrag,
   setSearchPointerInside,
   setSearchFocus,
   hideSearchPanel,
@@ -4196,170 +3334,22 @@ const galleryViewHandlers = {
   loadMoreGalleryImages,
 }
 
-const overlayHandlers = {
-  toggleReferenceBoardSidebarsDisabled,
-  copyReferenceBoardItemToClipboard,
-  canImportReferenceBoardItemToLibrary,
-  importSelectedReferenceItemToLibrary,
-  exportReferenceBoardItem,
-  flipReferenceBoardItemHorizontal,
-  flipReferenceBoardItemVertical,
-  removeReferenceBoardItem,
-  pasteReferenceBoardContent,
-  autoArrangeActiveReferenceBoard,
-}
-
-function readStoredIdSet(key: string) {
-  const raw = localStorage.getItem(key)
-  if (!raw) return new Set<number>()
-  try {
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return new Set<number>()
-    return new Set(
-      parsed
-        .map((value) => Number(value))
-        .filter((value) => Number.isFinite(value) && value > 0),
-    )
-  } catch {
-    return new Set<number>()
-  }
-}
-
 function readStoredWorkspaceState(): LastWorkspaceState | null {
   const raw = localStorage.getItem(lastWorkspaceStateStorageKey)
   if (!raw) return null
   try {
     const parsed = JSON.parse(raw) as Partial<LastWorkspaceState>
-    const parsedViewMode = parsed.viewMode
-    if (parsedViewMode !== 'gallery' && parsedViewMode !== 'settings' && parsedViewMode !== 'board') {
+    if (parsed.viewMode !== 'gallery' && parsed.viewMode !== 'settings') {
       return null
     }
-    const parsedBoardId =
-      typeof parsed.activeReferenceBoardId === 'number' && Number.isFinite(parsed.activeReferenceBoardId)
-        ? parsed.activeReferenceBoardId
-        : null
-    return {
-      viewMode: parsedViewMode,
-      activeReferenceBoardId: parsedBoardId,
-    }
-  } catch {
-    return null
-  }
-}
-
-function normalizeReferenceBoardMemoryState(
-  parsed: Partial<ReferenceBoardMemoryState>,
-): ReferenceBoardMemoryState | null {
-  const parsedBoardId =
-    typeof parsed.activeReferenceBoardId === 'number' && Number.isFinite(parsed.activeReferenceBoardId)
-      ? parsed.activeReferenceBoardId
-      : null
-  const parsedPan = parsed.referenceBoardPan
-  return {
-    activeReferenceBoardId: parsedBoardId,
-    referenceBoardScale:
-      typeof parsed.referenceBoardScale === 'number' && Number.isFinite(parsed.referenceBoardScale)
-        ? parsed.referenceBoardScale
-        : undefined,
-    referenceBoardPan:
-      parsedPan &&
-      typeof parsedPan.x === 'number' &&
-      Number.isFinite(parsedPan.x) &&
-      typeof parsedPan.y === 'number' &&
-      Number.isFinite(parsedPan.y)
-        ? { x: parsedPan.x, y: parsedPan.y }
-        : undefined,
-    selectedReferenceBoardItemId:
-      typeof parsed.selectedReferenceBoardItemId === 'number' &&
-      Number.isFinite(parsed.selectedReferenceBoardItemId)
-        ? parsed.selectedReferenceBoardItemId
-        : null,
-    referenceBoardSidebarsDisabled: Boolean(parsed.referenceBoardSidebarsDisabled),
-  }
-}
-
-function readStoredReferenceBoardMemoryState(
-  fallbackWorkspaceState?: (LastWorkspaceState & Partial<ReferenceBoardMemoryState>) | null,
-): ReferenceBoardMemoryState | null {
-  const raw = localStorage.getItem(referenceBoardMemoryStateStorageKey)
-  if (raw) {
-    try {
-      return normalizeReferenceBoardMemoryState(JSON.parse(raw) as Partial<ReferenceBoardMemoryState>)
-    } catch {}
-  }
-
-  if (fallbackWorkspaceState?.viewMode === 'board' && fallbackWorkspaceState.activeReferenceBoardId !== null) {
-    return normalizeReferenceBoardMemoryState(fallbackWorkspaceState)
-  }
-
-  return null
-}
-
-function saveReferenceBoardMemoryState() {
-  if (activeReferenceBoardId.value === null) return
-  const state: ReferenceBoardMemoryState = {
-    activeReferenceBoardId: activeReferenceBoardId.value,
-    referenceBoardScale: boardScale.value,
-    referenceBoardPan: { ...boardPan.value },
-    selectedReferenceBoardItemId: selectedReferenceBoardItemId.value,
-    referenceBoardSidebarsDisabled: referenceBoardSidebarsDisabled.value,
-  }
-  localStorage.setItem(referenceBoardMemoryStateStorageKey, JSON.stringify(state))
-}
-
-function restoreReferenceBoardMemoryStateFor(boardId: number) {
-  const state = pendingReferenceBoardMemoryRestore.value ?? readStoredReferenceBoardMemoryState()
-  if (!state || state.activeReferenceBoardId !== boardId) return
-
-  referenceBoardSidebarsDisabled.value = Boolean(state.referenceBoardSidebarsDisabled)
-  if (referenceBoardSidebarsDisabled.value) {
-    sidebarHoverOpen.value = false
-    rightSidebarHoverOpen.value = false
-  }
-  if (typeof state.referenceBoardScale === 'number') {
-    boardScale.value = clamp(state.referenceBoardScale, 0.1, 20)
-  }
-  if (state.referenceBoardPan) {
-    boardPan.value = { ...state.referenceBoardPan }
-  }
-
-  const selectedItemId = state.selectedReferenceBoardItemId
-  const selectedItemExists =
-    typeof selectedItemId === 'number' &&
-    library.value.referenceBoardItems.some((item) => item.id === selectedItemId && item.boardId === boardId)
-  selectedReferenceBoardItemId.value = selectedItemExists ? selectedItemId : null
-}
-
-function clearPendingReferenceBoardMemoryRestoreIfApplied(boardId: number) {
-  if (pendingReferenceBoardMemoryRestore.value?.activeReferenceBoardId === boardId) {
-    pendingReferenceBoardMemoryRestore.value = null
-  }
-}
-
-function readLegacyReferenceBoardMemoryState(): ReferenceBoardMemoryState | null {
-  const raw = localStorage.getItem(lastWorkspaceStateStorageKey)
-  if (!raw) return null
-  try {
-    const parsed = JSON.parse(raw) as Partial<LastWorkspaceState & ReferenceBoardMemoryState>
-    if (parsed.viewMode !== 'board' || parsed.activeReferenceBoardId === null) return null
-    return normalizeReferenceBoardMemoryState(parsed)
+    return { viewMode: parsed.viewMode }
   } catch {
     return null
   }
 }
 
 function saveLastWorkspaceState() {
-  const state: LastWorkspaceState = {
-    viewMode: viewMode.value,
-    activeReferenceBoardId:
-      viewMode.value === 'board'
-        ? activeReferenceBoardId.value
-        : pendingReferenceBoardMemoryRestore.value?.activeReferenceBoardId ??
-          readStoredReferenceBoardMemoryState()?.activeReferenceBoardId ??
-          null,
-  }
-
-  localStorage.setItem(lastWorkspaceStateStorageKey, JSON.stringify(state))
+  localStorage.setItem(lastWorkspaceStateStorageKey, JSON.stringify({ viewMode: viewMode.value }))
 }
 
 function restorePendingWorkspaceState() {
@@ -4368,19 +3358,7 @@ function restorePendingWorkspaceState() {
   if (!state) return
   workspaceRestoreApplied.value = true
   pendingWorkspaceRestore.value = null
-
-  if (state.viewMode !== 'board' || state.activeReferenceBoardId === null) return
-  const boardExists = library.value.referenceBoards.some((board) => board.id === state.activeReferenceBoardId)
-  if (!boardExists) {
-    viewMode.value = 'gallery'
-    activeReferenceBoardId.value = null
-    saveLastWorkspaceState()
-    return
-  }
-
-  showReferenceBoard(state.activeReferenceBoardId)
-  restoreReferenceBoardMemoryStateFor(state.activeReferenceBoardId)
-  clearPendingReferenceBoardMemoryRestoreIfApplied(state.activeReferenceBoardId)
+  viewMode.value = state.viewMode
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -4427,11 +3405,9 @@ console.info(
       'is-gallery-view': viewMode === 'gallery',
       'is-settings-view': isSettingsView,
       'is-left-sidebar-preheat-active': isLeftSidebarPreheatActive && !sidebarOpen,
-      'is-right-sidebar-preheat-active': isRightSidebarPreheatActive && !rightSidebarOpen,
       'is-titlebar-pinned': isTitlebarPinned,
       'is-window-maximized': isWindowMaximized,
       'is-gallery-search-active': isSearchFocused || isSearchPointerInside,
-      'is-reference-board-sidebars-disabled': viewMode === 'board' && referenceBoardSidebarsDisabled,
       'is-gallery-sidebars-disabled': gallerySidebarsDisabled,
       'theme-light': themeMode === 'light',
       'theme-dark': themeMode === 'dark',
@@ -4449,7 +3425,7 @@ console.info(
       <div class="app-titlebar__left">
         <span class="app-titlebar__brand">illuTag</span>
         <span class="app-titlebar__view">
-          {{ viewMode === 'settings' ? '设置' : viewMode === 'board' ? '参考板' : '图库' }}
+          {{ viewMode === 'settings' ? '设置' : '图库' }}
         </span>
       </div>
       <div
@@ -4517,10 +3493,6 @@ console.info(
     <div v-if="!isSettingsView" class="sidebar-hotspot" @mouseenter="openSidebarByHover">
       <MoreApp class="sidebar-hotspot__icon" theme="outline" :size="15" :fill="['currentColor']" aria-hidden="true" />
     </div>
-    <div class="right-sidebar-hotspot" @mouseenter="openRightSidebarByHover">
-      <MoreApp class="sidebar-hotspot__icon" theme="outline" :size="15" :fill="['currentColor']" aria-hidden="true" />
-    </div>
-
     <LeftSidebar
       :visible="sidebarOpen"
       :sidebar-pinned="sidebarPinnedEffective"
@@ -4542,38 +3514,11 @@ console.info(
       :handlers="leftSidebarHandlers"
     />
 
-    <RightSidebar
-      :visible="rightSidebarOpen"
-      :right-sidebar-pinned="rightSidebarPinned"
-      :reference-board-rows="referenceBoardRows"
-      :active-reference-board-id="activeReferenceBoardId"
-      :preview-board-item-drag="previewBoardItemDrag"
-      :gallery-image-drag-state="dragState ? { overBoardId: dragState.overBoardId } : null"
-      :preview-reference-board-ids="[...previewReferenceBoardIds]"
-      :reference-board-preview-blocks="referenceBoardPreviewBlocks"
-      :dragged-reference-board-id="draggedReferenceBoardId"
-      :dragged-reference-board-folder-id="draggedReferenceBoardFolderId"
-      :reference-board-drag-over-kind="referenceBoardDragOverKind"
-      :reference-board-drag-over-id="referenceBoardDragOverId"
-      :board-context-menu="boardContextMenu"
-      :board-context-menu-style="boardContextMenuStyle"
-      :board-draft="boardDraft"
-      :board-draft-style="boardDraftStyle"
-      :new-board-name="newBoardName"
-      :renaming-reference-board-folder-id="renamingReferenceBoardFolderId"
-      :renaming-reference-board-folder-name="renamingReferenceBoardFolderName"
-      :renaming-reference-board-id="renamingReferenceBoardId"
-      :renaming-reference-board-name="renamingReferenceBoardName"
-      :handlers="rightSidebarHandlers"
-    />
-
     <main
       class="workspace"
       :class="{
         'is-titlebar-pinned': isTitlebarPinned,
         'is-settings-view': isSettingsView,
-        'is-reference-preview-active': isReferencePreviewActive && rightSidebarPinned,
-        'is-right-sidebar-fixed': rightSidebarPinned,
       }"
     >
       <Transition name="workspace-switch" mode="out-in">
@@ -4582,7 +3527,6 @@ console.info(
             v-if="viewMode === 'settings'"
             :sidebar-pinned="sidebarPinned"
             :auto-hide-titlebar-in-window-mode="autoHideTitlebarInWindowMode"
-            :auto-fix-right-sidebar-on-preview="autoFixRightSidebarOnPreview"
             :thumbnail-cache-enabled="thumbnailCacheEnabled"
             :is-thumbnail-generation-running="isThumbnailGenerationRunning"
             :is-thumbnail-generation-paused="isThumbnailGenerationPaused"
@@ -4628,20 +3572,8 @@ console.info(
             :handlers="settingsViewHandlers"
           />
 
-          <ReferenceBoardView
-            v-else-if="viewMode === 'board'"
-            :active-reference-board="activeReferenceBoard"
-            :active-reference-board-items="activeReferenceBoardItems"
-            :board-pan="boardPan"
-            :board-scale="boardScale"
-            :board-canvas-bounds="activeBoardCanvasBounds"
-            :selected-reference-board-item-id="selectedReferenceBoardItemId"
-            :handlers="referenceBoardViewHandlers"
-          />
-
           <GalleryView
             v-else
-            :preview-drag-over-delete-zone="previewDragOverDeleteZone"
             :visible-images="visibleImages"
             :search-panel-style="searchPanelStyle"
             :search-reveal-mode="searchRevealMode"
@@ -4694,14 +3626,6 @@ console.info(
       </div>
     </main>
 
-    <AppOverlayLayer
-      :reference-board-canvas-menu="referenceBoardCanvasMenu"
-      :reference-board-canvas-menu-style="referenceBoardCanvasMenuStyle"
-      :reference-board-sidebars-disabled="referenceBoardSidebarsDisabled"
-      :drag-state="dragState"
-      :handlers="overlayHandlers"
-    />
-
     <SlideshowOverlay
       v-if="slideshowOpen"
       :images="visibleImages"
@@ -4711,30 +3635,6 @@ console.info(
       @favorite-toggle="toggleGalleryImageFavorite"
     />
 
-    <div
-      v-if="importLibraryFolderPickerItemId !== null"
-      class="import-library-picker-layer"
-      @click="closeImportLibraryFolderPicker(null)"
-    >
-      <article class="import-library-picker" @click.stop>
-        <h3>加入图库</h3>
-        <p>选择要保存到的本地图库文件夹</p>
-        <div class="import-library-picker__list">
-          <button
-            v-for="folder in library.folders"
-            :key="folder.id"
-            type="button"
-            class="import-library-picker__option"
-            @click="closeImportLibraryFolderPicker(folder.id)"
-          >
-            {{ folder.path }}
-          </button>
-        </div>
-        <div class="import-library-picker__actions">
-          <button type="button" class="secondary-button" @click="closeImportLibraryFolderPicker(null)">取消</button>
-        </div>
-      </article>
-    </div>
 
     <div v-if="removeFolderConfirmPath" class="image-detail-modal__dialog-layer" @click="closeRemoveFolderConfirm()">
       <article class="image-detail-modal__dialog" @click.stop>
@@ -5662,28 +4562,5 @@ console.info(
       <button type="button" @click="exportGalleryImage(galleryImageContextMenu.imageId)">导出到本地</button>
     </div>
 
-    <div
-      v-if="previewBoardItemDrag"
-      class="image-drag-preview"
-      :style="{ left: `${previewBoardItemDrag.x}px`, top: `${previewBoardItemDrag.y}px` }"
-    >
-      <img :src="previewBoardItemDrag.thumbnailUrl" alt="" draggable="false" />
-      <span
-        v-if="previewBoardDragIconKind(previewBoardItemDrag) !== 'none'"
-        class="image-drag-preview__copy-icon"
-        :class="{
-          'is-move': previewBoardDragIconKind(previewBoardItemDrag) === 'move',
-          'is-delete': previewBoardDragIconKind(previewBoardItemDrag) === 'delete',
-        }"
-      >
-        {{
-          previewBoardDragIconKind(previewBoardItemDrag) === 'delete'
-            ? '🗑'
-            : previewBoardDragIconKind(previewBoardItemDrag) === 'move'
-              ? '→'
-              : '+'
-        }}
-      </span>
-    </div>
   </div>
 </template>

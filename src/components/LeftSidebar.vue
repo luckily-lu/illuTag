@@ -12,7 +12,7 @@ import BookOne from '@icon-park/vue-next/es/icons/BookOne'
 import Tag from '@icon-park/vue-next/es/icons/Tag'
 import WaterfallsV from '@icon-park/vue-next/es/icons/WaterfallsV'
 
-type ViewMode = 'gallery' | 'settings' | 'board'
+type ViewMode = 'gallery' | 'settings'
 
 type FolderTreeItem = {
   id: number

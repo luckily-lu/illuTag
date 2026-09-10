@@ -9,18 +9,9 @@ type DragState = {
   panelX: number
   panelY: number
   overFolderId: number | null
-  overBoardId: number | null
-  overRightSidebar: boolean
 }
 
-type ReferenceBoardLike = {
-  id: number
-  folderId?: number | null
-}
-
-type LibraryStoreLike = {
-  referenceBoards: ReferenceBoardLike[]
-}
+type LibraryStoreLike = Record<string, unknown>
 
 type UseImageDragAndDropOptions<TLibraryStore extends LibraryStoreLike> = {
   library: Ref<TLibraryStore>
@@ -30,16 +21,6 @@ type UseImageDragAndDropOptions<TLibraryStore extends LibraryStoreLike> = {
   folderHasChildren: (folderId: number) => boolean
   expandedDropFolderIdsFor: (folderId: number) => Set<number>
   assignImageToFolder: (imageId: string, folderId: number) => Promise<void>
-  referenceBoardIdFromPoint: (x: number, y: number) => number | null
-  referenceBoardFolderIdFromPoint: (x: number, y: number) => number | null
-  isPointInsideRightSidebarArea: (x: number, y: number) => boolean
-  keepDragExpandedReferenceBoardFolder: (folderId: number) => void
-  clearDragExpandedReferenceBoardFoldersNow: () => void
-  clearDragReferenceBoardFolderCollapseTimer: () => void
-  scheduleClearDragExpandedReferenceBoardFolders: (delayMs?: number) => void
-  dragExpandedReferenceBoardFolderIds: Ref<Set<number>>
-  addImageToReferenceBoard: (imageId: string, boardId: number) => Promise<void>
-  expandReferenceBoardFolder: (folderId: number) => void
   isPointInsideExternalImageSearchDropZone: (x: number, y: number) => boolean
   setExternalImageSearchFromGalleryImage: (imageId: string) => Promise<boolean>
   setErrorText: (value: string) => void
@@ -84,7 +65,6 @@ export function useImageDragAndDrop<TLibraryStore extends LibraryStoreLike>(
     pressCurrent.value = null
     dragState.value = null
     options.dragExpandedFolderIds.value = new Set()
-    options.clearDragExpandedReferenceBoardFoldersNow()
   }
 
   function startImagePress(item: GalleryLayoutItem, event: PointerEvent) {
@@ -107,11 +87,8 @@ export function useImageDragAndDrop<TLibraryStore extends LibraryStoreLike>(
         panelX: panelPosition.x,
         panelY: panelPosition.y,
         overFolderId: null,
-        overBoardId: null,
-        overRightSidebar: false,
       }
       options.dragExpandedFolderIds.value = new Set()
-      options.clearDragExpandedReferenceBoardFoldersNow()
     }, options.imageDragDelayMs)
   }
 
@@ -130,42 +107,14 @@ export function useImageDragAndDrop<TLibraryStore extends LibraryStoreLike>(
       overFolderCandidateId !== null && !options.folderHasChildren(overFolderCandidateId)
         ? overFolderCandidateId
         : null
-    const overBoardId = options.referenceBoardIdFromPoint(event.clientX, event.clientY)
-    const overBoardFolderId = options.referenceBoardFolderIdFromPoint(event.clientX, event.clientY)
-    const overRightSidebar = options.isPointInsideRightSidebarArea(event.clientX, event.clientY)
     const overLeftSidebar = isPointInsideLeftSidebarArea(event.clientX, event.clientY)
     dragState.value.overFolderId = overFolderId
-    dragState.value.overBoardId = overBoardId
-    dragState.value.overRightSidebar = overRightSidebar
 
     if (overFolderCandidateId !== null) {
       options.dragExpandedFolderIds.value = options.expandedDropFolderIdsFor(overFolderCandidateId)
     } else if (!overLeftSidebar) {
       options.dragExpandedFolderIds.value = new Set()
     }
-
-    if (overBoardFolderId !== null) {
-      options.keepDragExpandedReferenceBoardFolder(overBoardFolderId)
-      return
-    }
-
-    const tempExpandedFolderId = [...options.dragExpandedReferenceBoardFolderIds.value][0]
-    if (tempExpandedFolderId === undefined) return
-
-    if (!overRightSidebar) {
-      options.clearDragExpandedReferenceBoardFoldersNow()
-      return
-    }
-
-    if (overBoardId !== null) {
-      const board = options.library.value.referenceBoards.find((item) => item.id === overBoardId)
-      if (board?.folderId === tempExpandedFolderId) {
-        options.clearDragReferenceBoardFolderCollapseTimer()
-        return
-      }
-    }
-
-    options.scheduleClearDragExpandedReferenceBoardFolders()
   }
 
   async function finishImageDrag(event: PointerEvent) {
@@ -180,16 +129,6 @@ export function useImageDragAndDrop<TLibraryStore extends LibraryStoreLike>(
       if (options.isPointInsideExternalImageSearchDropZone(event.clientX, event.clientY)) {
         await options.setExternalImageSearchFromGalleryImage(dragState.value.imageId)
         return
-      }
-
-      const boardId =
-        dragState.value.overBoardId ?? options.referenceBoardIdFromPoint(event.clientX, event.clientY)
-      if (boardId !== null) {
-        await options.addImageToReferenceBoard(dragState.value.imageId, boardId)
-        const board = options.library.value.referenceBoards.find((item) => item.id === boardId)
-        if (board?.folderId != null) {
-          options.expandReferenceBoardFolder(board.folderId)
-        }
       }
 
       if (!dragState.value) return

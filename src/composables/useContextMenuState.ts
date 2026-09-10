@@ -32,14 +32,9 @@ export function useContextMenuState() {
     galleryImageContextMenu.value = null
   }
 
-  function openGalleryImageMenu(
-    item: GalleryLayoutItem,
-    event: MouseEvent,
-    closeReferenceBoardCanvasMenu?: () => void,
-  ) {
+  function openGalleryImageMenu(item: GalleryLayoutItem, event: MouseEvent) {
     event.preventDefault()
     event.stopPropagation()
-    closeReferenceBoardCanvasMenu?.()
     galleryImageContextMenu.value = {
       imageId: item.id,
       x: event.clientX,
@@ -48,15 +43,10 @@ export function useContextMenuState() {
     imageDetailContextMenu.value = null
   }
 
-  function openImageDetailMenu(
-    event: MouseEvent,
-    isDetailAvailable: boolean,
-    closeReferenceBoardCanvasMenu?: () => void,
-  ) {
+  function openImageDetailMenu(event: MouseEvent, isDetailAvailable: boolean) {
     if (!isDetailAvailable) return
     event.preventDefault()
     event.stopPropagation()
-    closeReferenceBoardCanvasMenu?.()
     closeGalleryImageContextMenu()
     imageDetailContextMenu.value = { x: event.clientX, y: event.clientY }
   }

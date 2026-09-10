@@ -38,7 +38,6 @@ type GalleryBatchActionItem = {
 type GalleryBrowseMode = 'default' | 'sidebar-disabled' | 'carousel'
 
 const props = defineProps<{
-  previewDragOverDeleteZone: boolean
   visibleImages: Array<{ id: string }>
   searchPanelStyle: Record<string, string>
   searchRevealMode: 'inline' | 'hidden' | 'floating'
@@ -626,15 +625,12 @@ function onSearchWheel(event: WheelEvent) {
   <section
     ref="gallerySectionEl"
     class="gallery-page"
-    :class="{ 'is-preview-delete-target': previewDragOverDeleteZone }"
     @pointerdown.capture="onGalleryPointerDownCapture($event)"
     @pointermove.capture="onGalleryPointerMoveCapture($event)"
     @pointerup.capture="onGalleryPointerUpCapture($event)"
     @pointercancel.capture="onGalleryPointerCancelCapture($event)"
     @click.capture="onGalleryClickCapture($event)"
     @wheel.capture="onGalleryWheelCapture($event)"
-    @dragover="handlers.onGalleryPreviewBoardItemDragOver($event)"
-    @drop="handlers.onGalleryPreviewBoardItemDrop($event)"
     @wheel.passive="handlers.onGalleryWheel($event as WheelEvent)"
     @scroll.passive="onGalleryScrollEvent($event)"
   >
@@ -828,9 +824,6 @@ function onSearchWheel(event: WheelEvent) {
       </button>
     </div>
 
-    <div v-if="previewDragOverDeleteZone" class="gallery-delete-overlay" aria-hidden="true">
-      <span class="gallery-delete-overlay__icon">🗑</span>
-    </div>
     <div v-if="visibleImages.length === 0" class="empty-panel">
       <h2>还没有图片</h2>
       <p>选择“所有”查看全部图片，或先在设置里添加本地图库文件夹。</p>

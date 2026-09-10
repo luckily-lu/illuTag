@@ -21,7 +21,6 @@ function closeExportDialog() {
 defineProps<{
   sidebarPinned: boolean
   autoHideTitlebarInWindowMode: boolean
-  autoFixRightSidebarOnPreview: boolean
   thumbnailCacheEnabled: boolean
   isThumbnailGenerationRunning: boolean
   isThumbnailGenerationPaused: boolean
@@ -103,15 +102,6 @@ defineProps<{
         @change="handlers.setThemeMode(($event.target as HTMLInputElement).checked ? 'dark' : 'light')"
       />
       <span>深色模式（实验）</span>
-    </label>
-
-    <label class="setting-toggle">
-      <input
-        :checked="autoFixRightSidebarOnPreview"
-        type="checkbox"
-        @change="handlers.setAutoFixRightSidebarOnPreview(($event.target as HTMLInputElement).checked)"
-      />
-      <span>开启预览参考板时自动固定右侧栏</span>
     </label>
 
     <label class="setting-toggle">

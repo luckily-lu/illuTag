@@ -74,7 +74,7 @@ export type GalleryImagePage = {
   limit: number
 }
 
-export type ViewMode = 'gallery' | 'settings' | 'board'
+export type ViewMode = 'gallery' | 'settings'
 
 export type BoardWorldBounds = {
   minX: number

@@ -48,12 +48,10 @@ type FolderPointerState = {
 
 type UseFolderManagementOptions<TLibraryStore extends LibraryStoreLike> = {
   library: Ref<TLibraryStore>
-  viewMode: Ref<'gallery' | 'settings' | 'board'>
-  activeReferenceBoardId: Ref<number | null>
+  viewMode: Ref<'gallery' | 'settings'>
   setErrorText: (value: string) => void
   formatError: (error: unknown) => string
   updateStatus: () => void
-  closeBoardContextMenu: () => void
   clamp: (value: number, min: number, max: number) => number
   folderDragDelayMs?: number
 }
@@ -442,7 +440,6 @@ export function useFolderManagement<TLibraryStore extends LibraryStoreLike>(
     event.preventDefault()
     event.stopPropagation()
     folderContextMenu.value = { kind: 'space', x: event.clientX, y: event.clientY }
-    options.closeBoardContextMenu()
     void adjustFolderContextMenuPosition()
   }
 
@@ -450,7 +447,6 @@ export function useFolderManagement<TLibraryStore extends LibraryStoreLike>(
     event.preventDefault()
     event.stopPropagation()
     folderContextMenu.value = { kind: 'folder', folderId, x: event.clientX, y: event.clientY }
-    options.closeBoardContextMenu()
     void adjustFolderContextMenuPosition()
   }
 
@@ -462,7 +458,6 @@ export function useFolderManagement<TLibraryStore extends LibraryStoreLike>(
     options.viewMode.value = 'gallery'
     activeUserFolderId.value = 'all'
     unclassifiedOnlyParentFolderId.value = null
-    options.activeReferenceBoardId.value = null
   }
 
   function showRandomImages() {
@@ -470,28 +465,24 @@ export function useFolderManagement<TLibraryStore extends LibraryStoreLike>(
     activeUserFolderId.value = 'random'
     randomGalleryVisitSerial.value += 1
     unclassifiedOnlyParentFolderId.value = null
-    options.activeReferenceBoardId.value = null
   }
 
   function showFavoriteImages() {
     options.viewMode.value = 'gallery'
     activeUserFolderId.value = 'favorites'
     unclassifiedOnlyParentFolderId.value = null
-    options.activeReferenceBoardId.value = null
   }
 
   function showUnclassifiedImages() {
     options.viewMode.value = 'gallery'
     activeUserFolderId.value = 'unclassified'
     unclassifiedOnlyParentFolderId.value = null
-    options.activeReferenceBoardId.value = null
   }
 
   function showTrashImages() {
     options.viewMode.value = 'gallery'
     activeUserFolderId.value = 'trash'
     unclassifiedOnlyParentFolderId.value = null
-    options.activeReferenceBoardId.value = null
   }
 
   function onUserFolderRowClick(folder: FolderTreeItem) {
@@ -509,7 +500,6 @@ export function useFolderManagement<TLibraryStore extends LibraryStoreLike>(
     options.viewMode.value = 'gallery'
     activeUserFolderId.value = folder.id
     unclassifiedOnlyParentFolderId.value = null
-    options.activeReferenceBoardId.value = null
   }
 
   function toggleFolderUnclassifiedOnly(folderId: number) {
@@ -522,7 +512,6 @@ export function useFolderManagement<TLibraryStore extends LibraryStoreLike>(
     }
     options.viewMode.value = 'gallery'
     activeUserFolderId.value = folderId
-    options.activeReferenceBoardId.value = null
     expandFolder(folderId)
     unclassifiedOnlyParentFolderId.value =
       unclassifiedOnlyParentFolderId.value === folderId ? null : folderId
