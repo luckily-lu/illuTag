@@ -108,16 +108,32 @@ struct DataDirectoryMigrationResult {
     message: String,
 }
 
+// Synchronous Tauri commands run on the main thread and freeze the window ("未响应")
+// while a query runs. Heavy DB work must go through this helper instead.
+async fn off_main<T, F>(app: tauri::AppHandle, work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(AppState) -> Result<T, String> + Send + 'static,
+{
+    let state = app.state::<AppState>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || work(state))
+        .await
+        .map_err(|error| format!("后台任务失败：{error}"))?
+}
+
 #[tauri::command]
-fn list_library(state: State<AppState>) -> Result<LibraryStore, String> {
-    let started = Instant::now();
-    eprintln!("[startup-prof] list_library_command begin");
-    let result = list_library_from_state(&state);
-    eprintln!(
-        "[startup-prof] list_library_command total_ms={}",
-        started.elapsed().as_millis()
-    );
-    result
+async fn list_library(app: tauri::AppHandle) -> Result<LibraryStore, String> {
+    off_main(app, |state| {
+        let started = Instant::now();
+        eprintln!("[startup-prof] list_library_command begin");
+        let result = list_library_from_state(&state);
+        eprintln!(
+            "[startup-prof] list_library_command total_ms={}",
+            started.elapsed().as_millis()
+        );
+        result
+    })
+    .await
 }
 
 #[tauri::command]
@@ -138,47 +154,56 @@ fn data_directory_info_command(state: State<AppState>) -> Result<DataDirectoryIn
 }
 
 #[tauri::command]
-fn list_gallery_images_page_command(
+async fn list_gallery_images_page_command(
+    app: tauri::AppHandle,
     scope: String,
     folder_id: Option<i64>,
     unclassified_only_parent_folder_id: Option<i64>,
     offset: i64,
     limit: i64,
-    state: State<AppState>,
 ) -> Result<GalleryImagePage, String> {
-    list_gallery_images_page(
-        scope,
-        folder_id,
-        unclassified_only_parent_folder_id,
-        offset,
-        limit,
-        &state,
-    )
+    off_main(app, move |state| {
+        list_gallery_images_page(
+            scope,
+            folder_id,
+            unclassified_only_parent_folder_id,
+            offset,
+            limit,
+            &state,
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-fn list_gallery_image_ids_for_scope_command(
+async fn list_gallery_image_ids_for_scope_command(
+    app: tauri::AppHandle,
     scope: String,
     folder_id: Option<i64>,
     unclassified_only_parent_folder_id: Option<i64>,
-    state: State<AppState>,
 ) -> Result<Vec<String>, String> {
-    list_gallery_image_ids_for_scope(
-        scope,
-        folder_id,
-        unclassified_only_parent_folder_id,
-        &state,
-    )
+    off_main(app, move |state| {
+        list_gallery_image_ids_for_scope(
+            scope,
+            folder_id,
+            unclassified_only_parent_folder_id,
+            &state,
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-fn list_gallery_images_by_ids_page_command(
+async fn list_gallery_images_by_ids_page_command(
+    app: tauri::AppHandle,
     image_ids: Vec<String>,
     offset: i64,
     limit: i64,
-    state: State<AppState>,
 ) -> Result<GalleryImagePage, String> {
-    list_gallery_images_by_ids_page(image_ids, offset, limit, &state)
+    off_main(app, move |state| {
+        list_gallery_images_by_ids_page(image_ids, offset, limit, &state)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -205,11 +230,11 @@ fn dev_cleanup_stress_test_data_command(
 }
 
 #[tauri::command]
-fn add_gallery_folder_command(
+async fn add_gallery_folder_command(
+    app: tauri::AppHandle,
     folder_path: String,
-    state: State<AppState>,
 ) -> Result<LibraryStore, String> {
-    add_gallery_folder(folder_path, &state)
+    off_main(app, move |state| add_gallery_folder(folder_path, &state)).await
 }
 
 #[tauri::command]
@@ -662,24 +687,28 @@ fn suggest_known_auto_tags_command(
 }
 
 #[tauri::command]
-fn search_gallery_image_ids_command(
+async fn search_gallery_image_ids_command(
+    app: tauri::AppHandle,
     filters: GallerySearchFilters,
-    state: State<AppState>,
 ) -> Result<Vec<String>, String> {
-    search_gallery_image_ids(filters, &state)
+    off_main(app, move |state| search_gallery_image_ids(filters, &state)).await
 }
 
 #[tauri::command]
-fn search_gallery_image_ids_by_natural_language_command(
+async fn search_gallery_image_ids_by_natural_language_command(
+    app: tauri::AppHandle,
     query: String,
     candidate_image_ids: Option<Vec<String>>,
-    state: State<AppState>,
 ) -> Result<Vec<String>, String> {
-    search_gallery_image_ids_by_natural_language(query, candidate_image_ids, &state)
+    off_main(app, move |state| {
+        search_gallery_image_ids_by_natural_language(query, candidate_image_ids, &state)
+    })
+    .await
 }
 
 #[tauri::command]
-fn search_gallery_image_ids_by_external_image_command(
+async fn search_gallery_image_ids_by_external_image_command(
+    app: tauri::AppHandle,
     image_path: Option<String>,
     image_url: Option<String>,
     image_bytes: Option<Vec<u8>>,
@@ -687,18 +716,20 @@ fn search_gallery_image_ids_by_external_image_command(
     search_type: Option<String>,
     candidate_image_ids: Option<Vec<String>>,
     limit: Option<usize>,
-    state: State<AppState>,
 ) -> Result<Vec<String>, String> {
-    search_gallery_image_ids_by_external_image(
-        image_path,
-        image_url,
-        image_bytes,
-        image_base64,
-        search_type,
-        candidate_image_ids,
-        limit,
-        &state,
-    )
+    off_main(app, move |state| {
+        search_gallery_image_ids_by_external_image(
+            image_path,
+            image_url,
+            image_bytes,
+            image_base64,
+            search_type,
+            candidate_image_ids,
+            limit,
+            &state,
+        )
+    })
+    .await
 }
 
 #[tauri::command]

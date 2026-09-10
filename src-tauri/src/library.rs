@@ -107,11 +107,14 @@ const CLIP_IMAGE_SERVICE_IDLE_CHECK_INTERVAL_MS: u64 = 30_000;
 const USER_FOLDER_SOURCE_KIND_LIBRARY_DIR: &str = "library_dir";
 const TAG_DICTIONARY_SOURCE_SCHEMA_VERSION: &str = "csv-col2-col5-v1";
 const BATCH_SQL_VARIABLE_LIMIT_SAFE: usize = 900;
+// Bump when migrate_database() changes; gates the one-time schema setup via PRAGMA user_version.
+const SCHEMA_USER_VERSION: i64 = 1;
 const LARGE_LIBRARY_IMAGE_THRESHOLD: i64 = 30_000;
 const LARGE_LIBRARY_INITIAL_IMAGE_LIMIT: i64 = 5_000;
 const ACTIVE_GALLERY_IMAGE_WHERE: &str =
     "COALESCE(i.source, '') <> 'reference' AND COALESCE(i.trashed, 0) = 0";
 
+#[derive(Clone)]
 pub struct AppState {
     pub database_path: PathBuf,
     pub data_dir: PathBuf,
@@ -8265,7 +8268,16 @@ fn open_database(database_path: &Path) -> Result<Connection, String> {
         Connection::open(database_path).map_err(|error| format!("打开图库数据库失败：{error}"))?;
     conn.busy_timeout(std::time::Duration::from_secs(30))
         .map_err(|error| format!("Failed to set SQLite busy_timeout: {error}"))?;
-    migrate_database(&conn)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .map_err(|error| format!("Failed to enable foreign keys: {error}"))?;
+    let schema_version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap_or(0);
+    if schema_version != SCHEMA_USER_VERSION {
+        migrate_database(&conn)?;
+        conn.pragma_update(None, "user_version", SCHEMA_USER_VERSION)
+            .map_err(|error| format!("Failed to set schema version: {error}"))?;
+    }
     Ok(conn)
 }
 
