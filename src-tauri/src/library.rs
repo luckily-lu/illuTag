@@ -972,22 +972,21 @@ fn gallery_scope_where_sql(
             Cow::Owned(format!(
                 "
                 {active_where}
-                AND EXISTS (
-                  SELECT 1
+                AND {alias}.id IN (
+                  SELECT direct.image_id
                   FROM image_user_folders direct
-                  WHERE direct.image_id = {alias}.id AND direct.folder_id = ?1
+                  WHERE direct.folder_id = ?1
                 )
-                AND NOT EXISTS (
+                AND {alias}.id NOT IN (
                   WITH RECURSIVE descendants(id) AS (
                     SELECT uf.id FROM user_folders uf WHERE uf.parent_id = ?1
                     UNION ALL
                     SELECT uf.id FROM user_folders uf
                     JOIN descendants d ON uf.parent_id = d.id
                   )
-                  SELECT 1
+                  SELECT child_assignment.image_id
                   FROM image_user_folders child_assignment
                   JOIN descendants d ON d.id = child_assignment.folder_id
-                  WHERE child_assignment.image_id = {alias}.id
                 )
                 "
             )),
@@ -999,17 +998,16 @@ fn gallery_scope_where_sql(
             Cow::Owned(format!(
                 "
                 {active_where}
-                AND EXISTS (
+                AND {alias}.id IN (
                   WITH RECURSIVE folder_scope(id) AS (
                     SELECT ?1
                     UNION ALL
                     SELECT uf.id FROM user_folders uf
                     JOIN folder_scope fs ON uf.parent_id = fs.id
                   )
-                  SELECT 1
+                  SELECT assignment.image_id
                   FROM image_user_folders assignment
                   JOIN folder_scope fs ON fs.id = assignment.folder_id
-                  WHERE assignment.image_id = {alias}.id
                 )
                 "
             )),
@@ -6553,23 +6551,20 @@ pub fn search_gallery_image_ids(
     for tag_en in zh_tags {
         sql.push_str(
             "
-            AND EXISTS (
-              SELECT 1
+            AND images.id IN (
+              SELECT t.image_id
               FROM image_auto_tags t
-              WHERE t.image_id = images.id
-                AND t.model_name = ?
+              WHERE t.model_name = ?
                 AND t.tag_en = ?
                 AND t.confidence BETWEEN ? AND ?
               UNION
-              SELECT 1
+              SELECT ust.image_id
               FROM image_user_supplement_tags ust
-              WHERE ust.image_id = images.id
-                AND ust.tag_en = ?
+              WHERE ust.tag_en = ?
               UNION
-              SELECT 1
+              SELECT uct.image_id
               FROM image_user_custom_tags uct
-              WHERE uct.image_id = images.id
-                AND uct.tag_text = ?
+              WHERE uct.tag_text = ?
             )
             ",
         );
@@ -6586,21 +6581,25 @@ pub fn search_gallery_image_ids(
     for token in english_tokens {
         sql.push_str(
             "
-            AND EXISTS (
-              SELECT 1
+            AND images.id IN (
+              SELECT t.image_id
               FROM image_auto_tags t
-              WHERE t.image_id = images.id
-                AND t.model_name = ?
-                AND LOWER(REPLACE(t.tag_en, '_', ' ')) LIKE ? ESCAPE '\\'
+              WHERE t.model_name = ?
+                AND t.tag_en IN (
+                  SELECT k.tag_en
+                  FROM known_image_tags k
+                  WHERE k.model_name = ?
+                    AND LOWER(REPLACE(k.tag_en, '_', ' ')) LIKE ? ESCAPE '\'
+                )
                 AND t.confidence BETWEEN ? AND ?
               UNION
-              SELECT 1
+              SELECT ust.image_id
               FROM image_user_supplement_tags ust
-              WHERE ust.image_id = images.id
-                AND LOWER(REPLACE(ust.tag_en, '_', ' ')) LIKE ? ESCAPE '\\'
+              WHERE LOWER(REPLACE(ust.tag_en, '_', ' ')) LIKE ? ESCAPE '\'
             )
             ",
         );
+        params_values.push(Value::Text(WD_TAGGER_MODEL_NAME.to_string()));
         params_values.push(Value::Text(WD_TAGGER_MODEL_NAME.to_string()));
         let token_like = format!("%{}%", escape_like_pattern(&token));
         params_values.push(Value::Text(token_like.clone()));
@@ -8270,6 +8269,14 @@ fn open_database(database_path: &Path) -> Result<Connection, String> {
         .map_err(|error| format!("Failed to set SQLite busy_timeout: {error}"))?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(|error| format!("Failed to enable foreign keys: {error}"))?;
+    conn.execute_batch(
+        "
+        PRAGMA temp_store = MEMORY;
+        PRAGMA cache_size = -262144;
+        PRAGMA mmap_size = 8589934592;
+        ",
+    )
+    .map_err(|error| format!("Failed to tune SQLite pragmas: {error}"))?;
     let schema_version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap_or(0);
@@ -8406,6 +8413,9 @@ fn migrate_database(conn: &Connection) -> Result<(), String> {
 
         CREATE INDEX IF NOT EXISTS idx_image_auto_tags_image_id
           ON image_auto_tags(image_id, category, confidence DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_image_auto_tags_tag_image
+          ON image_auto_tags(model_name, tag_en, image_id, confidence);
 
         CREATE TABLE IF NOT EXISTS known_image_tags (
           model_name TEXT NOT NULL,
