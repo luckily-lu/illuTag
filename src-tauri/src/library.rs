@@ -823,6 +823,8 @@ struct ScannedImage {
     file_size: i64,
     modified_at: i64,
     imported_at: i64,
+    /// false = 与数据库记录一致且未缺失，扫描时可跳过写库
+    unchanged: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -831,6 +833,7 @@ struct ExistingImageMeta {
     height: u32,
     file_size: i64,
     modified_at: i64,
+    missing: i64,
 }
 
 struct ScanCollectResult {
@@ -1269,6 +1272,11 @@ fn sync_user_folder_tree_for_library_directory(
             .then_with(|| a.cmp(b))
     });
 
+    // 单事务包裹全部 upsert/归属写入，避免每语句自动提交带来的 fsync 风暴
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("Failed to open folder sync transaction: {error}"))?;
+
     let mut folder_id_by_path = HashMap::<String, i64>::new();
     for dir_path in sorted_paths {
         let parent_id = if dir_path == root_path {
@@ -1284,32 +1292,33 @@ fn sync_user_folder_tree_for_library_directory(
             .map(|value| value.to_string_lossy().to_string())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| dir_path.clone());
-        let folder_id = upsert_synced_user_folder_for_path(conn, &dir_path, parent_id, &name, now)?;
+        let folder_id = upsert_synced_user_folder_for_path(&tx, &dir_path, parent_id, &name, now)?;
         folder_id_by_path.insert(dir_path, folder_id);
     }
 
-    if scanned_images.is_empty() {
-        return Ok(());
+    if !scanned_images.is_empty() {
+        for image in scanned_images {
+            remove_synced_folder_assignments_for_image(&tx, &image.path)?;
+            let parent_path = Path::new(&image.path)
+                .parent()
+                .map(|path| normalize_existing_or_stored_folder_path(&path.to_string_lossy()))
+                .unwrap_or_else(|| root_path.clone());
+            let Some(target_folder_id) = folder_id_by_path.get(&parent_path).copied() else {
+                continue;
+            };
+            tx.execute(
+                "
+                INSERT OR IGNORE INTO image_user_folders (image_id, folder_id, assigned_at)
+                VALUES (?1, ?2, ?3)
+                ",
+                params![image.path, target_folder_id, now],
+            )
+            .map_err(|error| format!("Failed to sync image folder assignment: {error}"))?;
+        }
     }
 
-    for image in scanned_images {
-        remove_synced_folder_assignments_for_image(conn, &image.path)?;
-        let parent_path = Path::new(&image.path)
-            .parent()
-            .map(|path| normalize_existing_or_stored_folder_path(&path.to_string_lossy()))
-            .unwrap_or_else(|| root_path.clone());
-        let Some(target_folder_id) = folder_id_by_path.get(&parent_path).copied() else {
-            continue;
-        };
-        conn.execute(
-            "
-            INSERT OR IGNORE INTO image_user_folders (image_id, folder_id, assigned_at)
-            VALUES (?1, ?2, ?3)
-            ",
-            params![image.path, target_folder_id, now],
-        )
-        .map_err(|error| format!("Failed to sync image folder assignment: {error}"))?;
-    }
+    tx.commit()
+        .map_err(|error| format!("Failed to commit folder sync transaction: {error}"))?;
 
     Ok(())
 }
@@ -1355,8 +1364,13 @@ fn assign_scanned_images_to_nearest_synced_parent_folder(
         folder_id_by_path.insert(normalize_existing_or_stored_folder_path(&path), id);
     }
 
+    // 单事务包裹全部归属写入，避免每语句自动提交带来的 fsync 风暴
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("Failed to open scan assignment transaction: {error}"))?;
+
     for image in scanned_images {
-        remove_synced_folder_assignments_for_image(conn, &image.path)?;
+        remove_synced_folder_assignments_for_image(&tx, &image.path)?;
 
         let mut current = Path::new(&image.path)
             .parent()
@@ -1383,7 +1397,7 @@ fn assign_scanned_images_to_nearest_synced_parent_folder(
             continue;
         };
 
-        conn.execute(
+        tx.execute(
             "
             INSERT OR IGNORE INTO image_user_folders (image_id, folder_id, assigned_at)
             VALUES (?1, ?2, ?3)
@@ -1392,6 +1406,9 @@ fn assign_scanned_images_to_nearest_synced_parent_folder(
         )
         .map_err(|error| format!("Failed to sync scanned image folder assignment: {error}"))?;
     }
+
+    tx.commit()
+        .map_err(|error| format!("Failed to commit scan assignment transaction: {error}"))?;
 
     Ok(())
 }
@@ -9830,7 +9847,7 @@ fn scan_all_folders_and_collect_new_images(
                 scanned_files += 1;
                 found.push(image.clone());
                 pending_batch.push(image);
-                let should_flush = pending_batch.len() >= 200;
+                let should_flush = pending_batch.len() >= 2000;
                 if should_flush {
                     if let Err(error) = flush_scanned_image_batch(
                         &mut conn,
@@ -9870,7 +9887,9 @@ fn scan_all_folders_and_collect_new_images(
         }
         set_scan_progress_scanned_files(progress, scanned_files);
         let found_count = found.len() as i64;
-        sync_user_folder_tree_for_library_directory(&conn, &folder_path, &found, scanned_at)?;
+        // 文件夹归属只需处理新增图片：路径未变的图片其所属目录与归属关系不可能变化，
+        // 跳过可避免全量 DELETE+INSERT 重写（原实现对每次扫描的全部图片逐条自动提交，是主要瓶颈）
+        sync_user_folder_tree_for_library_directory(&conn, &folder_path, &newly_found_images, scanned_at)?;
         assign_scanned_images_to_nearest_synced_parent_folder(
             &conn,
             &folder_path,
@@ -13021,7 +13040,7 @@ fn load_existing_library_image_meta(conn: &Connection) -> Result<HashMap<String,
     let mut stmt = conn
         .prepare(
             "
-            SELECT path, width, height, file_size, modified_at
+            SELECT path, width, height, file_size, modified_at, missing
             FROM images
             WHERE source = 'library'
             ",
@@ -13037,6 +13056,7 @@ fn load_existing_library_image_meta(conn: &Connection) -> Result<HashMap<String,
                     height: row.get::<_, u32>(2)?,
                     file_size: row.get::<_, i64>(3)?,
                     modified_at: row.get::<_, i64>(4)?,
+                    missing: row.get::<_, i64>(5)?,
                 },
             ))
         })
@@ -13135,17 +13155,19 @@ fn flush_scanned_image_batch(
         .map_err(|error| format!("Failed to open scan upsert transaction: {error}"))?;
     for image in batch {
         let is_new = known_paths.insert(image.path.clone());
-        upsert_image(&tx, folder_id, image)?;
         if is_new {
+            upsert_image(&tx, folder_id, image)?;
             new_image_ids.push(image.path.clone());
             newly_found_images.push(image.clone());
-        } else {
+        } else if image.unchanged {
             *skipped_images += 1;
+        } else {
+            upsert_image(&tx, folder_id, image)?;
+            *updated_images += 1;
         }
     }
     tx.commit()
         .map_err(|error| format!("Failed to commit scan upsert transaction: {error}"))?;
-    let _ = updated_images;
     Ok(())
 }
 
@@ -13184,9 +13206,10 @@ fn scan_images(
 
         let file_size = metadata.len() as i64;
         let cached = existing_meta.get(&path_text);
-        let (width, height) = if let Some(meta) = cached {
+        let (width, height, unchanged) = if let Some(meta) = cached {
             if meta.modified_at == modified_at && meta.file_size == file_size {
-                (meta.width, meta.height)
+                // 与索引一致：跳过尺寸读取；仅当之前被标记缺失时需要回写清除 missing
+                (meta.width, meta.height, meta.missing == 0)
             } else {
                 let Ok(reader) = ImageReader::open(path) else {
                     continue;
@@ -13194,7 +13217,7 @@ fn scan_images(
                 let Ok((width, height)) = reader.into_dimensions() else {
                     continue;
                 };
-                (width, height)
+                (width, height, false)
             }
         } else {
             let Ok(reader) = ImageReader::open(path) else {
@@ -13203,7 +13226,7 @@ fn scan_images(
             let Ok((width, height)) = reader.into_dimensions() else {
                 continue;
             };
-            (width, height)
+            (width, height, false)
         };
 
         let image = ScannedImage {
@@ -13221,6 +13244,7 @@ fn scan_images(
             file_size,
             modified_at,
             imported_at,
+            unchanged,
         };
         if !on_image(image) {
             break;
