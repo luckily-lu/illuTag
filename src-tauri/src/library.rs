@@ -111,6 +111,7 @@ const BATCH_SQL_VARIABLE_LIMIT_SAFE: usize = 900;
 const SCHEMA_USER_VERSION: i64 = 1;
 const LARGE_LIBRARY_IMAGE_THRESHOLD: i64 = 30_000;
 const LARGE_LIBRARY_INITIAL_IMAGE_LIMIT: i64 = 5_000;
+const TAG_SAVE_BATCH_SIZE: usize = 100;
 const ACTIVE_GALLERY_IMAGE_WHERE: &str =
     "COALESCE(i.source, '') <> 'reference' AND COALESCE(i.trashed, 0) = 0";
 
@@ -6962,13 +6963,14 @@ fn apply_matching_user_folder_rules_for_image(
     conn: &Connection,
     image_id: &str,
 ) -> Result<usize, String> {
-    let Some(context) = load_image_folder_rule_match_context(conn, image_id)? else {
-        return Ok(0);
-    };
+    // 先查规则：没有任何规则时不必为每张图片加载匹配上下文
     let rules = load_active_leaf_user_folder_rules(conn)?;
     if rules.is_empty() {
         return Ok(0);
     }
+    let Some(context) = load_image_folder_rule_match_context(conn, image_id)? else {
+        return Ok(0);
+    };
     let now = now_ms();
     let mut assigned = 0usize;
     for (folder_id, conditions) in rules {
@@ -9968,7 +9970,16 @@ fn tag_images_with_wd_model(
     )?;
 
     eprintln!("[wd-tag] queue size: {}", image_ids.len());
-    for image_id in image_ids {
+
+    // 流水线：发送下一张图片的请求后再等待当前响应，
+    // 让 Python 侧的预处理与 GPU 推理重叠；写库按批次单事务提交。
+    let total = image_ids.len();
+    let mut read_idx = 0usize; // 下一张等待响应的图片
+    let mut send_idx = 0usize; // 下一张待发送的图片
+    let mut retried_current = false;
+    let mut pending_saves: Vec<(String, WdTaggerTestResult)> = Vec::new();
+
+    while read_idx < total {
         if background_scan_stop_requested(stop_requested) {
             break;
         }
@@ -9976,37 +9987,96 @@ fn tag_images_with_wd_model(
         if background_scan_stop_requested(stop_requested) {
             break;
         }
-        if !Path::new(image_id).is_file() {
-            increment_scan_progress_failed(progress);
-            continue;
-        }
-        match run_wd_tagger_via_service_with_recovery(
-            &mut service_guard,
-            &model_path,
-            &tags_path,
-            &script_path,
-            image_id,
-            image_id,
-            0.35,
-            0.85,
-        ) {
-            Ok(result) => {
-                save_wd_tagger_result(&mut conn, image_id, &result, &dictionary)?;
-                increment_scan_progress_tagged(progress);
-            }
-            Err(error) => {
-                eprintln!("[wd-tag] {error}");
+
+        // 保持管道深度为 2（一张推理中、一张预处理中）
+        while send_idx < total && send_idx < read_idx + 2 {
+            let image_path = image_ids[send_idx].clone();
+            if !Path::new(&image_path).is_file() {
                 increment_scan_progress_failed(progress);
-                set_scan_progress_error(progress, &error);
-                push_scan_progress_recent_error(progress, &error);
+                send_idx += 1;
+                continue;
+            }
+            match wd_tagger_send_with_recovery(
+                &mut service_guard,
+                &model_path,
+                &tags_path,
+                &script_path,
+                &image_path,
+                &image_path,
+                0.35,
+                0.85,
+            ) {
+                Ok(()) => {
+                    send_idx += 1;
+                }
+                Err(error) => {
+                    eprintln!("[wd-tag] {error}");
+                    increment_scan_progress_failed(progress);
+                    set_scan_progress_error(progress, &error);
+                    push_scan_progress_recent_error(progress, &error);
+                    send_idx += 1;
+                }
             }
         }
+        if send_idx <= read_idx {
+            break;
+        }
+
+        let current_id = image_ids[read_idx].clone();
+        let read_result = {
+            let service = service_guard
+                .as_mut()
+                .ok_or_else(|| "WD tagger service unavailable".to_string())?;
+            wd_tagger_read_response(service)
+        };
+        match read_result {
+            Ok(result) => {
+                pending_saves.push((current_id, result));
+                read_idx += 1;
+                retried_current = false;
+                if pending_saves.len() >= TAG_SAVE_BATCH_SIZE {
+                    let saved = pending_saves.len() as i64;
+                    flush_wd_tag_saves(&mut conn, &pending_saves, &dictionary)?;
+                    pending_saves.clear();
+                    add_scan_progress_tagged(progress, saved);
+                }
+            }
+            Err(first_error) => {
+                // 服务可能已挂掉：重启后当前图片及已发送但未读的请求全部重发
+                eprintln!("[wd-tag] read failed, restarting service: {first_error}");
+                stop_python_child_service(&mut service_guard, |running| &mut running.child);
+                send_idx = read_idx;
+                if retried_current {
+                    let error = format!("WD tagger service failed twice: {first_error}");
+                    eprintln!("[wd-tag] {error}");
+                    increment_scan_progress_failed(progress);
+                    set_scan_progress_error(progress, &error);
+                    push_scan_progress_recent_error(progress, &error);
+                    read_idx += 1;
+                    retried_current = false;
+                } else {
+                    retried_current = true;
+                }
+            }
+        }
+    }
+
+    if !pending_saves.is_empty() {
+        let saved = pending_saves.len() as i64;
+        flush_wd_tag_saves(&mut conn, &pending_saves, &dictionary)?;
+        pending_saves.clear();
+        add_scan_progress_tagged(progress, saved);
+    }
+
+    // 若中途停止且管道中尚有未读响应，直接重启服务，避免下次读到错位的旧响应
+    if read_idx < total && send_idx > read_idx {
+        stop_python_child_service(&mut service_guard, |running| &mut running.child);
     }
 
     Ok(())
 }
 
-fn run_wd_tagger_via_service_with_recovery(
+fn wd_tagger_send_with_recovery(
     service: &mut Option<WdTaggerService>,
     model_path: &Path,
     tags_path: &Path,
@@ -10015,23 +10085,23 @@ fn run_wd_tagger_via_service_with_recovery(
     image_path: &str,
     general_threshold: f32,
     character_threshold: f32,
-) -> Result<WdTaggerTestResult, String> {
+) -> Result<(), String> {
     ensure_wd_tagger_service_started(service, model_path, tags_path, script_path)?;
     let primary = {
         let running = service
             .as_mut()
             .ok_or_else(|| "WD tagger service unavailable".to_string())?;
-        run_wd_tagger_via_service(running, image_id, image_path, general_threshold, character_threshold)
+        wd_tagger_send_request(running, image_id, image_path, general_threshold, character_threshold)
     };
     match primary {
-        Ok(result) => Ok(result),
+        Ok(()) => Ok(()),
         Err(first_error) => {
             stop_python_child_service(service, |running| &mut running.child);
             ensure_wd_tagger_service_started(service, model_path, tags_path, script_path)?;
             let running = service
                 .as_mut()
                 .ok_or_else(|| "WD tagger service unavailable after restart".to_string())?;
-            run_wd_tagger_via_service(
+            wd_tagger_send_request(
                 running,
                 image_id,
                 image_path,
@@ -10104,13 +10174,13 @@ fn spawn_wd_tagger_service(
     })
 }
 
-fn run_wd_tagger_via_service(
+fn wd_tagger_send_request(
     service: &mut WdTaggerService,
     image_id: &str,
     image_path: &str,
     general_threshold: f32,
     character_threshold: f32,
-) -> Result<WdTaggerTestResult, String> {
+) -> Result<(), String> {
     let request = serde_json::json!({
         "image_id": image_id,
         "image_path": image_path,
@@ -10123,7 +10193,10 @@ fn run_wd_tagger_via_service(
         .and_then(|_| service.stdin.write_all(b"\n"))
         .and_then(|_| service.stdin.flush())
         .map_err(|error| format!("Failed to write WD tagger service request: {error}"))?;
+    Ok(())
+}
 
+fn wd_tagger_read_response(service: &mut WdTaggerService) -> Result<WdTaggerTestResult, String> {
     let mut response_line = String::new();
     service
         .stdout
@@ -10141,55 +10214,62 @@ fn run_wd_tagger_via_service(
         .map_err(|error| format!("Failed to parse WD tagger service output: {error}"))
 }
 
-fn save_wd_tagger_result(
+fn flush_wd_tag_saves(
     conn: &mut Connection,
-    image_id: &str,
-    result: &WdTaggerTestResult,
+    batch: &[(String, WdTaggerTestResult)],
     dictionary: &HashMap<String, String>,
 ) -> Result<(), String> {
+    if batch.is_empty() {
+        return Ok(());
+    }
     let now = now_ms();
     let model_name = WD_TAGGER_MODEL_NAME;
+    // 整批一个事务：避免每张图片一次 fsync
     let tx = conn
         .transaction()
         .map_err(|error| format!("Failed to open tag save transaction: {error}"))?;
 
-    tx.execute(
-        "DELETE FROM image_auto_tags WHERE image_id = ?1 AND model_name = ?2",
-        params![image_id, model_name],
-    )
-    .map_err(|error| format!("Failed to clear old image tags: {error}"))?;
+    for (image_id, result) in batch {
+        tx.execute(
+            "DELETE FROM image_auto_tags WHERE image_id = ?1 AND model_name = ?2",
+            params![image_id, model_name],
+        )
+        .map_err(|error| format!("Failed to clear old image tags: {error}"))?;
 
-    for tag in &result.ratings {
-        upsert_image_auto_tag(&tx, image_id, "rating", &tag.tag, tag.score, dictionary, model_name, now)?;
-    }
-    for tag in &result.character_tags {
-        upsert_image_auto_tag(
-            &tx,
-            image_id,
-            "character",
-            &tag.tag,
-            tag.score,
-            dictionary,
-            model_name,
-            now,
-        )?;
-    }
-    for tag in &result.general_tags {
-        upsert_image_auto_tag(
-            &tx,
-            image_id,
-            "general",
-            &tag.tag,
-            tag.score,
-            dictionary,
-            model_name,
-            now,
-        )?;
+        for tag in &result.ratings {
+            upsert_image_auto_tag(&tx, image_id, "rating", &tag.tag, tag.score, dictionary, model_name, now)?;
+        }
+        for tag in &result.character_tags {
+            upsert_image_auto_tag(
+                &tx,
+                image_id,
+                "character",
+                &tag.tag,
+                tag.score,
+                dictionary,
+                model_name,
+                now,
+            )?;
+        }
+        for tag in &result.general_tags {
+            upsert_image_auto_tag(
+                &tx,
+                image_id,
+                "general",
+                &tag.tag,
+                tag.score,
+                dictionary,
+                model_name,
+                now,
+            )?;
+        }
     }
 
     tx.commit()
         .map_err(|error| format!("Failed to commit image tags: {error}"))?;
-    apply_matching_user_folder_rules_for_image(conn, image_id)?;
+    for (image_id, _) in batch {
+        apply_matching_user_folder_rules_for_image(conn, image_id)?;
+    }
     Ok(())
 }
 
@@ -10243,11 +10323,10 @@ fn collect_pending_tag_image_ids(conn: &Connection) -> Result<Vec<String>, Strin
         FROM images
         WHERE images.source = 'library'
           AND COALESCE(images.trashed, 0) = 0
-          AND NOT EXISTS (
-            SELECT 1
+          AND images.id NOT IN (
+            SELECT image_id
             FROM image_auto_tags
-            WHERE image_auto_tags.image_id = images.id
-              AND image_auto_tags.model_name = ?1
+            WHERE model_name = ?1
           )
         ORDER BY images.imported_at DESC, images.id ASC
         ",
@@ -12707,9 +12786,9 @@ fn set_scan_progress_queued_images(progress: &Arc<Mutex<BackgroundScanProgress>>
     });
 }
 
-fn increment_scan_progress_tagged(progress: &Arc<Mutex<BackgroundScanProgress>>) {
+fn add_scan_progress_tagged(progress: &Arc<Mutex<BackgroundScanProgress>>, count: i64) {
     update_scan_progress(progress, |state| {
-        state.tagged_images += 1;
+        state.tagged_images += count.max(0);
     });
 }
 
