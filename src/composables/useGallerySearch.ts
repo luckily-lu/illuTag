@@ -542,6 +542,15 @@ export function useGallerySearch<TLibraryStore extends LibraryStoreLike>(
     void options.onSearchResultImageIds?.(null)
   }
 
+  function removeSearchResultImageIds(imageIds: string[]) {
+    if (!searchResultImageIds.value || imageIds.length === 0) return
+    const next = new Set(searchResultImageIds.value)
+    for (const imageId of imageIds) {
+      next.delete(imageId)
+    }
+    searchResultImageIds.value = next
+  }
+
   function setExternalImageSearchType(value: 'default' | 'atmosphere' | 'color') {
     externalImageSearchType.value = value
     if (searchMode.value === 'image') {
@@ -1028,6 +1037,7 @@ export function useGallerySearch<TLibraryStore extends LibraryStoreLike>(
     setSuppressGallerySearch,
     clearExternalImageSearch,
     clearAllSearchInputs,
+    removeSearchResultImageIds,
     setExternalImageQueryUrl,
     pasteExternalImageSearchFromPasteEvent,
     setExternalImageSearchFromFile,

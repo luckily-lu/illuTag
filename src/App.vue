@@ -344,6 +344,7 @@ const {
   executeGallerySearch,
   clearExternalImageSearch,
   clearAllSearchInputs,
+  removeSearchResultImageIds,
   setExternalImageQueryUrl,
   pasteExternalImageSearchFromPasteEvent,
   setExternalImageSearchFromFile,
@@ -487,6 +488,18 @@ async function loadMoreGalleryImages() {
 
 async function resetGalleryImagePage() {
   largeLibrarySearchResultIds.value = null
+  await loadGalleryImagePage(0, 'replace')
+}
+
+async function refreshGalleryAfterImagesRemoved(imageIds: string[]) {
+  if (!library.value.largeLibraryMode) return
+  if (largeLibrarySearchResultIds.value) {
+    const removed = new Set(imageIds)
+    largeLibrarySearchResultIds.value = largeLibrarySearchResultIds.value.filter(
+      (imageId) => !removed.has(imageId),
+    )
+    removeSearchResultImageIds(imageIds)
+  }
   await loadGalleryImagePage(0, 'replace')
 }
 
@@ -834,20 +847,24 @@ async function runBatchRemoveFavorite() {
 
 async function runBatchMoveToTrash() {
   const { invoke } = await import('@tauri-apps/api/core')
-  await runBatchInvokeAction('移入回收站', async () => {
+  const imageIds = [...batchSelectedImageIds.value]
+  const ok = await runBatchInvokeAction('移入回收站', async () => {
     return invoke<LibraryStore>('remove_images_from_index_command', {
-      imageIds: batchSelectedImageIds.value,
+      imageIds,
     })
   })
+  if (ok) await refreshGalleryAfterImagesRemoved(imageIds)
 }
 
 async function runBatchRestoreFromTrash() {
   const { invoke } = await import('@tauri-apps/api/core')
-  await runBatchInvokeAction('还原', async () => {
+  const imageIds = [...batchSelectedImageIds.value]
+  const ok = await runBatchInvokeAction('还原', async () => {
     return invoke<LibraryStore>('restore_images_from_trash_command', {
-      imageIds: batchSelectedImageIds.value,
+      imageIds,
     })
   })
+  if (ok) await refreshGalleryAfterImagesRemoved(imageIds)
 }
 
 async function runBatchMoveToSystemTrash() {
@@ -881,6 +898,10 @@ async function runBatchMoveToSystemTrash() {
     if (moved > 0 || failed > 0) {
       clearGalleryBatchSelection()
       exitGalleryBatchMode()
+    }
+    if (moved > 0) {
+      const failedIds = new Set(result.failedImageIds ?? [])
+      await refreshGalleryAfterImagesRemoved(imageIds.filter((imageId) => !failedIds.has(imageId)))
     }
   } catch (error) {
     errorText.value = formatError(error)
@@ -1764,10 +1785,12 @@ watch(
       exitGalleryBatchMode()
     }
 
-    if (nextViewMode === 'gallery' && prevFolderId !== nextFolderId) {
-      clearAllSearchInputs()
+    const rerunSearchForScopeChange =
+      nextViewMode === 'gallery' && prevFolderId !== nextFolderId && hasAnyActiveSearch()
+    if (rerunSearchForScopeChange) {
+      executeGallerySearch()
     }
-    if (nextViewMode === 'gallery' && library.value.largeLibraryMode) {
+    if (nextViewMode === 'gallery' && library.value.largeLibraryMode && !rerunSearchForScopeChange) {
       await resetGalleryImagePage()
     }
 
@@ -2634,6 +2657,7 @@ async function removeGalleryImageFromIndex(imageId: string) {
     library.value = await invoke<LibraryStore>('remove_image_from_index_command', {
       imageId,
     })
+    await refreshGalleryAfterImagesRemoved([imageId])
     if (activeImageDetailId.value === imageId) {
       closeImageDetail()
     }
@@ -2651,6 +2675,7 @@ async function restoreGalleryImageFromTrash(imageId: string) {
     library.value = await invoke<LibraryStore>('restore_image_from_trash_command', {
       imageId,
     })
+    await refreshGalleryAfterImagesRemoved([imageId])
     if (activeImageDetailId.value === imageId) {
       closeImageDetail()
     }
@@ -2669,6 +2694,7 @@ async function moveGalleryImageToSystemTrash(imageId: string) {
     library.value = await invoke<LibraryStore>('move_image_to_system_trash_command', {
       imageId,
     })
+    await refreshGalleryAfterImagesRemoved([imageId])
     if (activeImageDetailId.value === imageId) {
       closeImageDetail()
     }
