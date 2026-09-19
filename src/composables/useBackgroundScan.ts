@@ -281,6 +281,9 @@ export function useBackgroundScan(options: UseBackgroundScanOptions) {
       const shouldLiveRefresh =
         progress.running &&
         progress.phase !== 'collecting' &&
+        // 打标阶段不改变图库数据（标签不在 LibraryStore 内），跳过一次 55MB 的全量重载，
+        // 避免每 25s 一次的主线程卡顿；完成时仍会通过 becameIdle 刷新
+        progress.phase !== 'tagging' &&
         changed &&
         now - scanLibraryRefreshAt.value >= refreshIntervalMs
       if ((becameIdle || shouldLiveRefresh) && !scanLibraryRefreshInFlight.value) {
