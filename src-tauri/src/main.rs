@@ -15,7 +15,6 @@ use illutag_core::library::{
     search_gallery_image_ids_by_natural_language,
     start_natural_language_scan,
     stop_natural_language_scan,
-    warmup_clip_vector_cache,
     copy_image_to_system_clipboard,
     start_thumbnail_generation,
     start_atmosphere_generation,
@@ -385,8 +384,9 @@ fn stop_background_scan_command(state: State<AppState>) -> Result<bool, String> 
 }
 
 #[tauri::command]
-fn start_natural_language_scan_command(state: State<AppState>) -> Result<bool, String> {
-    start_natural_language_scan(&state)
+async fn start_natural_language_scan_command(app: tauri::AppHandle) -> Result<bool, String> {
+    // 缓存改为惰性加载后，首次启动可能触发 1.66GB 全量读；放到后台线程避免主线程卡顿。
+    off_main(app, |state| start_natural_language_scan(&state)).await
 }
 
 #[tauri::command]
@@ -1869,6 +1869,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            let setup_started = Instant::now();
             let app_data_dir = app
                 .path()
                 .app_data_dir()
@@ -1888,6 +1889,10 @@ fn main() {
                     .show()
                     .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
             }
+            eprintln!(
+                "[startup-prof] setup_window_shown_ms={}",
+                setup_started.elapsed().as_millis()
+            );
 
             let database_file_name = if env::var("ILLUTAG_USE_TEST_DB")
                 .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -1941,11 +1946,22 @@ fn main() {
                 clip_image_encoder_release_worker_running: Arc::new(Mutex::new(false)),
                 wd_tagger_service: Arc::new(Mutex::new(None)),
             };
-            let _ = warmup_clip_vector_cache(&app_state);
+            // P0: 启动路径不再同步预热点 CLIP 向量缓存（809K×512 f32 ≈ 1.66GB）。
+            // 首次语义/自然语言/以图搜图时由 ensure_clip_vector_cache_loaded 惰性加载，
+            // 避免该全量读压在首帧与 list_library 之前。回滚：恢复此处的 warmup_clip_vector_cache 调用。
+            let resume_scan_started = Instant::now();
             if let Err(error) = resume_incomplete_library_scan(&app_state) {
                 eprintln!("[wd-scan] resume incomplete scan failed: {error}");
             }
+            eprintln!(
+                "[startup-prof] resume_incomplete_scan_ms={}",
+                resume_scan_started.elapsed().as_millis()
+            );
             app.manage(app_state);
+            eprintln!(
+                "[startup-prof] setup_total_ms={}",
+                setup_started.elapsed().as_millis()
+            );
 
             Ok(())
         })
