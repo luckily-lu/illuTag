@@ -2,7 +2,7 @@
 
 illuTag 是一个面向二次元创作者、插画师、原型师、插画囤积癖等用户的参考图整理和本地图像管理工具。
 
-它基于 Tauri、Vue 3、Rust、SQLite 和本地 ONNX 推理构建，重点是快速浏览本地图像、整理参考图、维护参考板、使用 Danbooru 风格标签管理图片，并通过本地模型提供自然语言搜图和以图搜图能力。用户图片不会上传到远程服务，主要功能都在本地运行。
+它基于 Tauri、Vue 3、Rust、SQLite 和本地 ONNX 推理构建，重点是快速浏览本地图像、整理参考图、使用 Danbooru 风格标签管理图片，并通过本地模型提供自然语言搜图和以图搜图能力。用户图片不会上传到远程服务，主要功能都在本地运行。
 
 > 演示视频：待补充
 ## 下载
@@ -21,7 +21,7 @@ illuTag 可以管理你辛辛苦苦从x、pixiv、小红书等等地方存下来
 
 内置模型主要是成熟的开源模型，不一定认识最新角色。对于没有角色标签的图片，可以先用以图搜图找到相似图片，再批量添加自定义标签。自然语言搜索建议使用指向明确的描述，避免过于含糊或多义的句子。
 
-如果想把图片当作参考，可以把图片拖到右侧栏的参考板中。参考板支持窗口置顶，适合与ps、csp、zb等软件一起使用。也可以从其他网站直接拖入图片，并进一步保存到本地图库。
+如果想把图片当作参考，可以在大图模式下单击放大细品，配合窗口置顶与 ps、csp、zb 等软件一起使用。也可以从其他网站直接拖入图片，并进一步保存到本地图库。
 
 如果你只想舔图，右上角点击“最大化”，然后滚动滚轮。我用了效率不是很高的瀑布流算法，但很好看。
 
@@ -66,16 +66,6 @@ illuTag 可以管理你辛辛苦苦从x、pixiv、小红书等等地方存下来
 
 ![文件夹规则](./img/003.png)
 
-### 参考板
-
-参考板支持拖拽、粘贴、复制、导出、缩放、旋转和自动排列。
-
-![参考板](./img/006.png)
-
-可以将图片自由拖入右侧参考板。
-
-![参考板视图](./img/007.png)
-
 ### 批量操作
 
 支持喜爱图片、批量移动、批量添加标签等操作。
@@ -94,21 +84,34 @@ illuTag 可以管理你辛辛苦苦从x、pixiv、小红书等等地方存下来
 
 ## 功能概览
 
-- 本地图像图库索引
+- 本地图像图库索引（实测 80 万张图规模可用）
 - 虚拟化瀑布流浏览
 - 用户文件夹与文件夹规则
-- 参考板：拖拽、粘贴、复制、导出、缩放、旋转、自动排列
 - 软件内回收站与本地删除
 - 喜爱图片与批量操作
 - Danbooru 标签搜索与中文标签联想
-- 基于 WD tagger 的自动打标
+- 基于 DanbooruTagQuery 的自动打标
 - 基于 Chinese-CLIP 的自然语言搜图与以图搜图
 - 配色相似、氛围相似等辅助搜索
 - 分发版支持内置 Python runtime，解压即用
 
 ## 当前状态
 
-项目仍在活跃开发中。图库、文件夹、参考板、标签、搜索和基础分发流程已经可用，但数据结构、打包方式和部分交互仍可能继续调整。（大概吧）
+项目仍在活跃开发中。图库、文件夹、标签、搜索和基础分发流程已经可用，但数据结构、打包方式和部分交互仍可能继续调整。（大概吧）
+
+## 本分支与上游的差异
+
+本仓库（luckily-lu/illuTag）在上游基础上做了以下主要改动：
+
+- 打标模型更换为 [DanbooruTagQuery](https://github.com/realphongha/danbooru-tag-query)（L16/448，官方推荐阈值 0.2，copyright 标签并入通用标签），目录名仍沿用 `wd-swinv2-tagger-v3` 以保持兼容
+- 移除了参考板与右侧栏功能、移除启动时的更新检查
+- 大规模图库性能优化（实测 80 万+ 张图）：
+  - 标签筛选与文件夹 scope 查询改写为 IN 子查询并新增覆盖索引
+  - 扫描写入批量化、打标流水线化（推理与预处理重叠）
+  - 启动路径移除 CLIP 向量缓存同步预热（809K×512 向量约 1.66GB），改为惰性加载，热启动到可交互 5.4s → 1.8s
+  - 重命令全部移出主线程
+  - 详见 [启动性能诊断报告](./docs/startup-perf/2026-09-25-startup-perf.md)
+- 修复标签浏览下回收站/还原操作后视图被清空、切换"全部/随机/文件夹"丢失搜索条件的问题
 
 ## 仓库内容
 
@@ -117,10 +120,11 @@ illuTag 可以管理你辛辛苦苦从x、pixiv、小红书等等地方存下来
 仓库包含：
 
 - Tauri / Vue / Rust 源码
-- 本地 ONNX 推理所需的 Python 服务脚本
+- 本地 ONNX 推理所需的 Python 服务脚本（`src-tauri/scripts/`）
 - `wd-swinv2-tagger-v3/selected_tags.csv`
 - `wd-swinv2-tagger-v3/selected_tags_full_translation.csv`
-- 便携版打包脚本
+- 便携版打包脚本（`scripts/package-portable.ps1`）
+- 启动性能基线采集工具（`scripts/startup-perf/`）
 
 仓库不包含：
 
@@ -176,7 +180,7 @@ illutag.sqlite
 
 ## OnnxRuntime 与模型
 
-打标功能需要本地模型和运行环境，这些文件不会随源码仓库提供。
+打标功能需要本地模型和运行环境，这些文件不会随源码仓库提供。打标模型使用 DanbooruTagQuery（目录名沿用 `wd-swinv2-tagger-v3`，由 `tagger_config.json` 描述预处理与阈值）。
 
 推荐的便携版目录结构：
 
@@ -196,6 +200,7 @@ illuTag/
     model.onnx
     selected_tags.csv
     selected_tags_full_translation.csv
+    tagger_config.json
   model/
     chinese-clip-vit-base-patch16/
       vocab.txt
@@ -237,7 +242,7 @@ release/portable/
 illuTag 可以使用以下开源模型：
 
 - [OFA-Sys/Chinese-CLIP](https://github.com/OFA-Sys/Chinese-CLIP)，许可证为 MIT License。
-- [SmilingWolf/wd-swinv2-tagger-v3](https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3)，许可证为 Apache-2.0。
+- [realphongha/danbooru-tag-query](https://github.com/realphongha/danbooru-tag-query)（DanbooruTagQuery_l16_448x448），许可证请以模型仓库说明为准。
 
 这些项目不属于 illuTag。下载、使用或再分发相关模型文件时，请遵守它们各自的许可证和模型说明。
 
