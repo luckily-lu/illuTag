@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import AppIcon from "../../shared/ui/AppIcon.vue";
+import ActionMenu from "../../shared/ui/ActionMenu.vue";
 import type { IconName } from "../../shared/ui/AppIcon.vue";
 import type { UserFolder } from "../../shared/contracts/UserFolder";
 const navigation: Array<[string, string, IconName]> = [
@@ -35,6 +36,13 @@ const emit = defineEmits<{
   unclassified: [id: number];
   reorder: [id: number, targetId: number];
 }>();
+function action(id: string, folder: UserFolder) {
+  if (id === "create") emit("create", folder.id);
+  else if (id === "rename") emit("rename", folder);
+  else if (id === "rule") emit("rule", folder.id);
+  else if (id === "unclassified") emit("unclassified", folder.id);
+  else if (id === "remove") emit("remove", folder.id);
+}
 </script>
 <template>
   <nav class="sidebar" aria-label="图库导航">
@@ -113,18 +121,17 @@ const emit = defineEmits<{
         >
           {{ f.name }}
         </button>
-        <details class="folder-menu">
-          <summary aria-label="文件夹操作">
-            <AppIcon name="more" :size="18" />
-          </summary>
-          <div class="menu-popover">
-            <button @click="emit('create', f.id)">新建子文件夹</button
-            ><button @click="emit('rename', f)">重命名</button
-            ><button @click="emit('rule', f.id)">自动分类规则</button
-            ><button @click="emit('unclassified', f.id)">仅本级待分类</button
-            ><button @click="emit('remove', f.id)">删除文件夹</button>
-          </div>
-        </details>
+        <ActionMenu
+          :label="'文件夹操作：' + f.name"
+          :actions="[
+            { id: 'create', label: '新建子文件夹' },
+            { id: 'rename', label: '重命名' },
+            { id: 'rule', label: '自动分类规则' },
+            { id: 'unclassified', label: '仅本级待分类' },
+            { id: 'remove', label: '删除文件夹', danger: true },
+          ]"
+          @choose="action($event, f)"
+        />
       </div>
     </div>
     <div class="sidebar-bottom">

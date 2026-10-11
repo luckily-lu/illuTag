@@ -225,6 +225,7 @@ small {
 }
 .sidebar {
   background: var(--bg);
+  overflow-y: auto;
   width: 224px;
   flex-shrink: 0;
   display: flex;
@@ -242,6 +243,7 @@ small {
   gap: 8px;
   padding: 0 8px;
   margin-bottom: 12px;
+  flex-shrink: 0;
 }
 .folder-heading {
   margin-top: 26px;
@@ -281,7 +283,7 @@ small {
 .folder-tree {
   overflow: auto;
   flex: 1;
-  min-height: 0;
+  min-height: 80px;
 }
 .folder-row {
   display: flex;
@@ -291,6 +293,7 @@ small {
   position: relative;
 }
 .folder-row.active {
+  box-shadow: var(--focus-inset);
   color: var(--purple);
   background: var(--surface);
 }
@@ -299,6 +302,7 @@ small {
   background: var(--surface);
 }
 .folder-toggle {
+  border-radius: 10px;
   width: 26px;
   flex-shrink: 0;
   padding: 8px 3px;
@@ -306,22 +310,15 @@ small {
   font-size: 18px;
 }
 .folder-name {
+  border-radius: 10px;
   flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   text-align: left;
-  padding: 8px 2px;
+  padding: 8px 6px;
   background: transparent;
-}
-.folder-menu {
-  flex-shrink: 0;
-}
-.folder-menu summary {
-  list-style: none;
-  cursor: pointer;
-  padding: 6px;
 }
 .menu-popover {
   position: fixed;
@@ -1200,17 +1197,6 @@ progress::-webkit-progress-value {
   height: 32px;
   flex-shrink: 0;
 }
-.folder-menu summary {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 32px;
-  list-style: none;
-}
-.folder-menu summary::-webkit-details-marker {
-  display: none;
-}
 .sidebar {
   box-shadow:
     5px 5px 12px #b8bcc266,
@@ -1461,6 +1447,28 @@ progress::-webkit-progress-value {
 }
 .menu-popover {
   background: var(--bg);
+}
+.action-menu {
+  z-index: 70;
+  min-width: 184px;
+  overflow: auto;
+}
+.folder-menu-trigger {
+  flex-shrink: 0;
+  box-shadow: none;
+  background: transparent;
+}
+.folder-menu-trigger:hover,
+.folder-menu-trigger[aria-expanded="true"] {
+  box-shadow: var(--focus-inset);
+  color: var(--purple);
+}
+.action-menu button {
+  min-height: 40px;
+}
+.action-menu button:focus-visible {
+  outline-offset: -2px;
+  box-shadow: var(--focus-inset);
 }
 .tag-manager form {
   display: flex;

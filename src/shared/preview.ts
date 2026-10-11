@@ -152,7 +152,8 @@ export async function previewInvoke<T>(
       failures: [],
       revision,
     };
-  } else if (command === "list_jobs") result = records;
+  } else if (command === "get_user_folder_rule_command") result = null;
+  else if (command === "list_jobs") result = records;
   else if (command === "start_job") {
     const r: JobRecord = {
       id: String(Date.now()),
