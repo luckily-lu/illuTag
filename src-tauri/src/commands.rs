@@ -1111,6 +1111,14 @@ pub(super) fn window_is_always_on_top_command(window: tauri::Window) -> Result<b
 }
 
 #[tauri::command]
+pub(super) async fn get_navigation(
+    app: tauri::AppHandle,
+) -> Result<illutag_core::library::NavigationMetadata, illutag_core::library::AppError> {
+    off_main(app, |state| illutag_core::library::get_navigation(&state))
+        .await
+        .map_err(Into::into)
+}
+#[tauri::command]
 pub(super) async fn get_bootstrap(
     app: tauri::AppHandle,
 ) -> Result<illutag_core::library::Bootstrap, illutag_core::library::AppError> {

@@ -35,6 +35,7 @@ const page = ref("gallery"),
   notice = ref(""),
   pinned = ref(false);
 const jobs = useJobs(() => {
+  void refresh();
   if (page.value === "gallery") void gallery.search();
 });
 const scopeName = computed(() =>
@@ -68,7 +69,7 @@ const dialog = ref<null | {
   busy = ref(false);
 async function refresh() {
   try {
-    const b = await api.bootstrap();
+    const b = await api.navigation();
     folders.folders.value = b.userFolders;
     sources.value = b.folders;
     return b;
@@ -275,9 +276,15 @@ onMounted(async () => {
   window.addEventListener("pointermove", dragMove);
   window.addEventListener("pointerup", dragEnd);
   window.addEventListener("pointercancel", dragEnd);
-  const b = await refresh();
-  if (b) gallery.adopt(b.page);
-  else await gallery.search();
+  try {
+    const b = await api.bootstrap();
+    folders.folders.value = b.userFolders;
+    sources.value = b.folders;
+    gallery.adopt(b.page);
+  } catch (e) {
+    error.value = errorMessage(e);
+    await gallery.search();
+  }
   console.info(
     `[startup-prof] first_screen_ms=${performance.now().toFixed(1)}`,
   );

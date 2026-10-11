@@ -217,11 +217,14 @@ small {
   color: #9e3434;
 }
 .workspace {
+  position: relative;
+  isolation: isolate;
   display: flex;
   flex: 1;
   min-height: 0;
 }
 .sidebar {
+  background: var(--bg);
   width: 224px;
   flex-shrink: 0;
   display: flex;
@@ -349,6 +352,7 @@ small {
   font-size: 10px;
 }
 .main-workspace {
+  z-index: 0;
   display: flex;
   flex: 1;
   flex-direction: column;
@@ -870,7 +874,7 @@ progress::-webkit-progress-value {
 }
 .drawer-scrim {
   position: absolute;
-  inset: 44px 0 0;
+  inset: 0;
   z-index: 5;
   background: #aeb8c880;
 }
@@ -1082,7 +1086,7 @@ progress::-webkit-progress-value {
   display: flex;
   position: absolute;
   left: 0;
-  top: 44px;
+  top: 0;
   bottom: 0;
   width: 260px;
   z-index: 6;

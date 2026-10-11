@@ -97,6 +97,12 @@ pub struct Bootstrap {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+pub struct NavigationMetadata {
+    pub folders: Vec<LibraryFolder>,
+    pub user_folders: Vec<UserFolder>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
 pub struct ImageDetail {
     pub image: GalleryImage,
     pub folder_ids: Vec<i64>,
@@ -134,6 +140,13 @@ pub fn get_bootstrap(state: &AppState) -> Result<Bootstrap, String> {
         folders: load_folders(&conn)?,
         user_folders: load_user_folders(&conn)?,
         page: query_gallery(GalleryQuery::default(), state)?,
+    })
+}
+pub fn get_navigation(state: &AppState) -> Result<NavigationMetadata, String> {
+    let conn = open_database(&state.database_path)?;
+    Ok(NavigationMetadata {
+        folders: load_folders(&conn)?,
+        user_folders: load_user_folders(&conn)?,
     })
 }
 

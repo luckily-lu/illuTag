@@ -721,6 +721,7 @@ fn main() {
             open_external_url_command,
             window_close_command,
             commands::get_bootstrap,
+            commands::get_navigation,
             commands::query_gallery,
             commands::get_image_detail,
             commands::mutate_images,

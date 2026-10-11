@@ -6,6 +6,7 @@ fn main() {
     OrganizedExportReport::export_all(&config).unwrap();
     BackupPathMapping::export_all(&config).unwrap();
     Bootstrap::export_all(&config).unwrap();
+    NavigationMetadata::export_all(&config).unwrap();
     TagLabel::export_all(&config).unwrap();
     QueryPage::export_all(&config).unwrap();
     GalleryQuery::export_all(&config).unwrap();

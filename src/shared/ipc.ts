@@ -4,6 +4,7 @@ import {
   convertFileSrc,
 } from "@tauri-apps/api/core";
 import type { Bootstrap } from "./contracts/Bootstrap";
+import type { NavigationMetadata } from "./contracts/NavigationMetadata";
 import type { GalleryQuery } from "./contracts/GalleryQuery";
 import type { QueryPage } from "./contracts/QueryPage";
 import type { ImageDetail } from "./contracts/ImageDetail";
@@ -38,6 +39,7 @@ export const imageUrl = (path: string) =>
   /^(data:|https?:|\/)/.test(path) ? path : convertFileSrc(path);
 export const api = {
   bootstrap: () => invoke<Bootstrap>("get_bootstrap"),
+  navigation: () => invoke<NavigationMetadata>("get_navigation"),
   query: (query: GalleryQuery) => invoke<QueryPage>("query_gallery", { query }),
   detail: (imageId: string) =>
     invoke<ImageDetail>("get_image_detail", { imageId }),

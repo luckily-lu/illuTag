@@ -85,6 +85,8 @@ export async function previewInvoke<T>(
       userFolders: folders,
       page: query({ scope: "all", offset: 0, limit: 5000 } as GalleryQuery),
     };
+  else if (command === "get_navigation")
+    result = { folders: [], userFolders: folders };
   else if (command === "resolve_tag_labels_command")
     result = (args.tags as string[]).map((tagEn) => ({
       tagEn,
