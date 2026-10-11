@@ -12,6 +12,9 @@ except ModuleNotFoundError as e:
     print(json.dumps({"error": f"Missing Python module: {missing}. Install with: pip install onnxruntime numpy"}), flush=True)
     sys.exit(2)
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ort_runtime import create_session
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Chinese-CLIP text encoder service")
@@ -19,13 +22,6 @@ def parse_args():
     parser.add_argument("--provider", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--max-text-length", type=int, default=52)
     return parser.parse_args()
-
-
-def pick_providers(provider: str):
-    available = ort.get_available_providers()
-    if provider == "cuda" and "CUDAExecutionProvider" in available:
-        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    return ["CPUExecutionProvider"]
 
 
 def l2_normalize(x: np.ndarray) -> np.ndarray:
@@ -212,8 +208,7 @@ def main():
         raise RuntimeError(f"vocab.txt not found: {vocab_path}")
 
     vocab = load_vocab(vocab_path)
-    providers = pick_providers(args.provider)
-    session = ort.InferenceSession(text_onnx, providers=providers)
+    session = create_session(text_onnx, args.provider, "clip-text")
 
     for line in sys.stdin:
         line = line.strip()

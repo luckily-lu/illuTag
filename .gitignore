@@ -36,3 +36,7 @@ wd-swinv2-tagger-v3/**
 !wd-swinv2-tagger-v3/
 !wd-swinv2-tagger-v3/selected_tags.csv
 !wd-swinv2-tagger-v3/selected_tags_full_translation.csv
+
+# Isolated QA artifacts
+.playwright-cli/
+output/

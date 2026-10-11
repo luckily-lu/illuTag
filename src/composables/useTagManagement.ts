@@ -1,4 +1,5 @@
 import { computed, ref, watch } from 'vue'
+import { invoke } from '../shared/ipc'
 
 type TagManagementFolder = {
   id: number
@@ -90,7 +91,6 @@ export function useTagManagement(options: UseTagManagementOptions) {
   async function reloadTagManagementState() {
     try {
       isTagManagerLoading.value = true
-      const { invoke } = await import('@tauri-apps/api/core')
       const raw = await invoke<Record<string, unknown>>('list_tag_management_state_command')
       applyState(normalizeState(raw))
     } catch (error) {
@@ -104,7 +104,6 @@ export function useTagManagement(options: UseTagManagementOptions) {
     if (dictLoaded.value && !force) return
     try {
       isTagManagerLoading.value = true
-      const { invoke } = await import('@tauri-apps/api/core')
       const raw = await invoke<{
         groups?: TagDictionaryGroup[]
         tags?: Array<{
@@ -157,7 +156,6 @@ export function useTagManagement(options: UseTagManagementOptions) {
     if (!name) return
     try {
       isTagManagerLoading.value = true
-      const { invoke } = await import('@tauri-apps/api/core')
       const raw = await invoke<Record<string, unknown>>('create_user_tag_folder_command', { name })
       newTagManagerFolderName.value = ''
       applyState(normalizeState(raw))
@@ -173,7 +171,6 @@ export function useTagManagement(options: UseTagManagementOptions) {
     if (!tagText) return
     try {
       isTagManagerLoading.value = true
-      const { invoke } = await import('@tauri-apps/api/core')
       const raw = await invoke<Record<string, unknown>>('create_user_custom_tag_command', { tagText })
       newTagManagerTagText.value = ''
       applyState(normalizeState(raw))
@@ -189,7 +186,6 @@ export function useTagManagement(options: UseTagManagementOptions) {
     if (!normalized) return
     try {
       isTagManagerLoading.value = true
-      const { invoke } = await import('@tauri-apps/api/core')
       const raw = await invoke<Record<string, unknown>>('delete_user_custom_tag_command', { tagText: normalized })
       applyState(normalizeState(raw))
     } catch (error) {
@@ -205,7 +201,6 @@ export function useTagManagement(options: UseTagManagementOptions) {
     if (!normalized) return
     try {
       isTagManagerLoading.value = true
-      const { invoke } = await import('@tauri-apps/api/core')
       const raw = await invoke<Record<string, unknown>>('assign_user_tag_to_folder_command', {
         folderId,
         tagText: normalized,
@@ -223,7 +218,6 @@ export function useTagManagement(options: UseTagManagementOptions) {
     if (!normalized) return
     try {
       isTagManagerLoading.value = true
-      const { invoke } = await import('@tauri-apps/api/core')
       const raw = await invoke<Record<string, unknown>>('unassign_user_tag_from_folder_command', {
         tagText: normalized,
       })
@@ -238,7 +232,6 @@ export function useTagManagement(options: UseTagManagementOptions) {
   async function deleteTagManagerFolder(folderId: number) {
     try {
       isTagManagerLoading.value = true
-      const { invoke } = await import('@tauri-apps/api/core')
       const raw = await invoke<Record<string, unknown>>('delete_user_tag_folder_command', {
         folderId,
       })
@@ -332,5 +325,8 @@ export function useTagManagement(options: UseTagManagementOptions) {
     unassignTag,
     deleteTagManagerFolder,
     loadMoreDictTags,
+    dictGroups,
+    dictHasMore: computed(() => visibleDictTags.value.length < filteredDictTags.value.length),
+    loadDictionaryBrowser,
   }
 }

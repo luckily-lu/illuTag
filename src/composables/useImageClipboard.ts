@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from '../shared/ipc'
 
 export async function copyImageToSystemClipboard(imageId: string) {
   let backendError: unknown = null

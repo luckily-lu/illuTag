@@ -19,19 +19,15 @@ except ModuleNotFoundError as e:
     )
     sys.exit(2)
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ort_runtime import create_session
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Chinese-CLIP image encoder service")
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--provider", choices=["cpu", "cuda"], default="cpu")
     return parser.parse_args()
-
-
-def pick_providers(provider: str):
-    available = ort.get_available_providers()
-    if provider == "cuda" and "CUDAExecutionProvider" in available:
-        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    return ["CPUExecutionProvider"]
 
 
 def l2_normalize(x: np.ndarray) -> np.ndarray:
@@ -82,9 +78,8 @@ def main():
     if not os.path.isfile(image_onnx):
         raise RuntimeError(f"Image ONNX not found: {image_onnx}")
 
-    providers = pick_providers(args.provider)
     pre_cfg = load_image_preprocessor_config(model_dir)
-    session = ort.InferenceSession(image_onnx, providers=providers)
+    session = create_session(image_onnx, args.provider, "clip-image")
 
     for line in sys.stdin:
         line = line.strip()

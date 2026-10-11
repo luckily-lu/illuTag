@@ -1,4485 +1,580 @@
 <script setup lang="ts">
-import { convertFileSrc } from '@tauri-apps/api/core'
-import { open, save } from '@tauri-apps/plugin-dialog'
-import FolderClose from '@icon-park/vue-next/es/icons/FolderClose'
-import FolderOpen from '@icon-park/vue-next/es/icons/FolderOpen'
-import MoreApp from '@icon-park/vue-next/es/icons/MoreApp'
-import Pushpin from '@icon-park/vue-next/es/icons/Pushpin'
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import GalleryView from './components/GalleryView.vue'
-import LeftSidebar from './components/LeftSidebar.vue'
-import SettingsView from './components/SettingsView.vue'
-import SlideshowOverlay from './components/SlideshowOverlay.vue'
-import { useAppSettings } from './composables/useAppSettings'
-import { useBackgroundScan } from './composables/useBackgroundScan'
-import { useThumbnailGeneration } from './composables/useThumbnailGeneration'
-import { useAtmosphereGeneration } from './composables/useAtmosphereGeneration'
-import { useColorSignatureGeneration } from './composables/useColorSignatureGeneration'
-import { useFolderManagement } from './composables/useFolderManagement'
-import { useGalleryMasonry } from './composables/useGalleryMasonry'
-import { useGallerySearch } from './composables/useGallerySearch'
-import { useImageDragAndDrop } from './composables/useImageDragAndDrop'
-import { copyImageToSystemClipboard, buildClipboardCopyErrorText } from './composables/useImageClipboard'
-import { useContextMenuState } from './composables/useContextMenuState'
-import { useTagManagement } from './composables/useTagManagement'
-import type { GalleryImage, GalleryLayoutItem } from './types/gallery'
-import type { GalleryImagePage, LibraryStore, ViewMode } from './types/app-state'
-
-type GalleryBrowseMode = 'default' | 'sidebar-disabled' | 'carousel'
-type MigrationBackupInspection = {
-  schemaVersion: number
-  exportedAt: number
-  appVersion: string
-  folderCount: number
-  imageCount: number
-  userFolderCount: number
-  referenceBoardCount: number
-  pathStatuses: Array<{ path: string; exists: boolean }>
-  frontendSettings?: {
-    localStorage?: Record<string, string>
-  }
-}
-
-type MigrationBackupPathMapping = {
-  from: string
-  to: string
-}
-
-type OrganizedExportManifest = {
-  entries: Array<{
-    imageId: string
-    originalPath: string
-    folderId: number
-    folderPath: string
-    exportedPath: string
-  }>
-}
-
-type DataDirectoryInfo = {
-  dataDir: string
-  usingFallback: boolean
-  fallbackMessage?: string | null
-  legacyDataDir?: string | null
-  legacyDatabaseDetected: boolean
-}
-
-type DataDirectoryMigrationResult = {
-  sourceDir: string
-  targetDir: string
-  configPath: string
-  copiedFiles: number
-  copiedBytes: number
-  restartRequired: boolean
-  message: string
-}
-
-const appSetupStartMs = performance.now()
-console.info(`[startup-prof] App.vue setup_start_ms=${appSetupStartMs.toFixed(1)}`)
-
-const currentAppVersion = __APP_VERSION__
-const lastWorkspaceStateStorageKey = 'illutag.lastWorkspaceState'
-const autoScanOnStartupStorageKey = 'illutag.autoScanOnStartup'
-const imageDragDelayMs = 120
-const startupAutoScanDelayMs = 3000
-
-type LastWorkspaceState = {
-  viewMode: ViewMode
-}
-
-const initialWorkspaceState = readStoredWorkspaceState()
-const sidebarHoverOpen = ref(false)
-const viewMode = ref<ViewMode>('gallery')
-
-const library = ref<LibraryStore>({
-  folders: [],
-  images: [],
-  totalImageCount: 0,
-  largeLibraryMode: false,
-  imageOffset: 0,
-  imageLimit: 5000,
-  userFolders: [],
-  imageFolders: [],
-  referenceBoardFolders: [],
-  referenceBoards: [],
-  referenceBoardItems: [],
-})
-const isLoading = ref(false)
-const isPickingFolder = ref(false)
-const isAddingFolder = ref(false)
-const statusText = ref('还没有添加图库文件夹')
-const errorText = ref('')
-const galleryPageSize = 5000
-const isGalleryPageLoading = ref(false)
-const galleryCurrentQueryTotalCount = ref(0)
-const largeLibrarySearchResultIds = ref<string[] | null>(null)
-const dataDirectoryInfo = ref<DataDirectoryInfo | null>(null)
-const isMigratingDataDirectory = ref(false)
-const dataDirectoryRestartRequired = ref(false)
-const folderPathInput = ref('')
-const removeFolderConfirmPath = ref<string | null>(null)
-const removeFromFolderConfirmState = ref<null | {
-  imageId: string
-  targetFolderIds: number[]
-  message: string
-}>(null)
-const systemTrashMoveErrorMessage = ref<string | null>(null)
-const isWindowMaximized = ref(false)
-const isWindowAlwaysOnTop = ref(false)
-const isTitlebarHovered = ref(false)
-const galleryBrowseMode = ref<GalleryBrowseMode>('default')
-const galleryBrowseModeBeforeSlideshow = ref<GalleryBrowseMode>('default')
-const slideshowOpen = ref(false)
-const slideshowStartIndex = ref(0)
-const sidebarHoverCloseTimer = ref<number | null>(null)
-const sidebarPointerUseMaxAgeMs = 5000
-const sidebarPreheatZoneWidth = 220
-const sidebarTriggerZoneWidth = 30
-const sidebarHoverCloseHoldUntil = ref(0)
-const isLeftSidebarPreheatActive = ref(false)
-const lastPointerPosition = ref<{ x: number; y: number; at: number } | null>(null)
-const pendingWorkspaceRestore = ref<LastWorkspaceState | null>(initialWorkspaceState)
-const workspaceRestoreApplied = ref(false)
-const isSettingsView = computed(() => viewMode.value === 'settings')
-const dataDirectoryWarningText = computed(() => {
-  const info = dataDirectoryInfo.value
-  if (!info) return ''
-  if (info.fallbackMessage) return info.fallbackMessage
-  if (info.legacyDatabaseDetected && info.legacyDataDir && info.legacyDataDir !== info.dataDir) {
-    return `检测到旧版 AppData 数据：${info.legacyDataDir}。旧数据不会自动迁移，可通过迁移工具手动处理。`
-  }
-  return ''
-})
-const sidebarPinnedEffective = computed(() => isSettingsView.value || sidebarPinned.value)
-const gallerySidebarsDisabled = computed(
-  () => viewMode.value === 'gallery' && (galleryBrowseMode.value === 'sidebar-disabled' || slideshowOpen.value),
-)
-const sidebarOpen = computed(() => sidebarPinnedEffective.value || sidebarHoverOpen.value)
-const isTitlebarPinned = computed(() => {
-  if (isWindowMaximized.value) {
-    return isTitlebarHovered.value
-  }
-  return autoHideTitlebarInWindowMode.value ? isTitlebarHovered.value : true
-})
-const galleryScopeTransitionKey = computed(() => `gallery:${galleryScrollScopeKeyOf(activeUserFolderId.value)}`)
-const workspaceTransitionKey = computed(() =>
-  viewMode.value === 'gallery' ? galleryScopeTransitionKey.value : viewMode.value,
-)
-
-const searchPanelStyle = computed<Record<string, string>>(() => ({
-  '--search-reveal': searchRevealProgress.value.toString(),
-  '--search-opacity': searchRevealProgress.value.toString(),
-  '--search-translate-y': `${(1 - searchRevealProgress.value) * -10}%`,
-}))
-
-const {
-  sidebarPinned,
-  autoHideTitlebarInWindowMode,
-  themeMode,
-  thumbnailCacheEnabled,
-  initAppSettingsFromStorage,
-  setSidebarPinned,
-  setAutoHideTitlebarInWindowMode,
-  setThemeMode,
-  setThumbnailCacheEnabled,
-} = useAppSettings()
-
-const {
-  activeUserFolderId,
-  randomGalleryVisitSerial,
-  unclassifiedOnlyParentFolderId,
-  newFolderName,
-  folderDraft,
-  isComposingFolderName,
-  dragExpandedFolderIds,
-  folderContextMenu,
-  renamingUserFolderId,
-  renamingUserFolderName,
-  isComposingUserFolderRename,
-  folderPointerState,
-  draggedFolderId,
-  folderDragOverId,
-  folderTree,
-  contextMenuStyle,
-  folderDraftStyle,
-  folderScopedImages,
-  parentFoldersWithUnclassifiedImages,
-  deleteUserFolder,
-  openCreateFolderDraft,
-  closeCreateFolderDraft,
-  commitFolderDraft,
-  toggleFolderExpanded,
-  expandFolder,
-  openFolderSectionMenu,
-  openFolderMenu,
-  closeFolderContextMenu,
-  showAllImages,
-  showRandomImages,
-  showFavoriteImages,
-  showUnclassifiedImages,
-  showTrashImages,
-  onUserFolderRowClick,
-  toggleFolderUnclassifiedOnly,
-  startUserFolderRename,
-  setRenamingUserFolderName,
-  startComposingUserFolderRename,
-  endComposingUserFolderRename,
-  cancelUserFolderRename,
-  commitUserFolderRename,
-  onUserFolderRenameEnter,
-  clearFolderPress,
-  startFolderPointer,
-  moveFolderPointer,
-  finishFolderPointer,
-  folderIdFromPoint,
-  folderHasChildren,
-  expandedDropFolderIdsFor,
-  assignImageToFolder,
-} = useFolderManagement<LibraryStore>({
-  library,
-  viewMode,
-  setErrorText(value) {
-    errorText.value = value
-  },
-  formatError,
-  updateStatus,
-  clamp,
-})
-
-const {
-  dragState,
-  lastImageDragEndedAt,
-  clearImagePress,
-  cancelImageDrag,
-  startImagePress,
-  moveImageDrag,
-  finishImageDrag,
-} = useImageDragAndDrop<LibraryStore>({
-  library,
-  imageDragDelayMs,
-  dragExpandedFolderIds,
-  folderIdFromPoint,
-  folderHasChildren,
-  expandedDropFolderIdsFor,
-  assignImageToFolder,
-  isPointInsideExternalImageSearchDropZone,
-  setExternalImageSearchFromGalleryImage: setExternalImageSearchFromGalleryDrag,
-  setErrorText(value) {
-    errorText.value = value
-  },
-  formatError,
-})
-
-const showGalleryUnclassifiedToggle = computed(() => {
-  if (typeof activeUserFolderId.value !== 'number') return false
-  if (!folderHasChildren(activeUserFolderId.value)) return false
-  return parentFoldersWithUnclassifiedImages.value.has(activeUserFolderId.value)
-})
-
-const isGalleryUnclassifiedOnly = computed(() => {
-  if (typeof activeUserFolderId.value !== 'number') return false
-  return unclassifiedOnlyParentFolderId.value === activeUserFolderId.value
-})
-
-function toggleActiveFolderUnclassifiedOnly() {
-  if (typeof activeUserFolderId.value !== 'number') return
-  toggleFolderUnclassifiedOnly(activeUserFolderId.value)
-}
-
-const {
-  imageDetailContextMenu,
-  galleryImageContextMenu,
-  imageDetailContextMenuStyle,
-  galleryImageContextMenuStyle,
-  closeImageDetailContextMenu,
-  closeGalleryImageContextMenu,
-  openGalleryImageMenu: openGalleryImageMenuState,
-  openImageDetailMenu: openImageDetailMenuState,
-} = useContextMenuState()
-
-const {
-  searchZhInput,
-  searchZhSelected,
-  searchZhSuggestions,
-  searchZhOpen,
-  searchEnQuery,
-  searchFileNameQuery,
-  searchNaturalLanguageQuery,
-  searchMode,
-  externalImageSearchType,
-  externalImageQueryUrl,
-  externalImageQueryPreviewUrl,
-  externalImageQueryLabel,
-  searchConfidenceMin,
-  searchConfidenceMax,
-  searchRunning,
-  searchError,
-  isSearchFocused,
-  isSearchPointerInside,
-  searchRevealMode,
-  searchRevealProgress,
-  visibleImages,
-  activeImageDetailId,
-  activeImageDetail,
-  groupedImageTags,
-  activeImageCustomTags,
-  activeImageSupplementTags,
-  setSearchPointerInside,
-  setSearchFocus,
-  setSearchViewportState,
-  triggerSearchRevealByHotspot,
-  hideSearchPanel: hideSearchPanelByState,
-  setSuppressGallerySearch,
-  setSearchZhInput,
-  openSearchZhSuggestionPanel,
-  closeSearchZhSuggestionPanelDeferred,
-  selectSearchZhSuggestion,
-  removeSearchZhSuggestion,
-  setSearchEnQuery,
-  setSearchFileNameQuery,
-  setSearchNaturalLanguageQuery,
-  setSearchMode,
-  setExternalImageSearchType,
-  setSearchConfidenceMin,
-  setSearchConfidenceMax,
-  executeGallerySearch,
-  clearExternalImageSearch,
-  clearAllSearchInputs,
-  removeSearchResultImageIds,
-  setExternalImageQueryUrl,
-  pasteExternalImageSearchFromPasteEvent,
-  setExternalImageSearchFromFile,
-  setExternalImageSearchFromGalleryImage,
-  selectExternalImageSearchFile,
-  pasteExternalImageSearchFromClipboard,
-  searchBySingleTag,
-  addImageUserCustomTag,
-  removeImageUserCustomTag,
-  addImageUserSupplementTag,
-  removeImageUserSupplementTag,
-  suggestKnownAutoTagsForInput,
-  findExactKnownAutoTag,
-  closeImageDetail,
-  openGalleryImageDetail,
-} = useGallerySearch<LibraryStore>({
-  library,
-  folderScopedImages,
-  activeUserFolderId,
-  randomGalleryVisitSerial,
-  lastImageDragEndedAt,
-  formatError,
-  clamp,
-  toFileSrc: convertFileSrc,
-  pickExternalImagePath: pickExternalImageSearchFilePath,
-  getSearchScope: currentGallerySearchScopeFilter,
-  getSearchCandidateImageIds: getGallerySearchScopeCandidateImageIds,
-  onSearchResultImageIds: applyLargeLibrarySearchResultImageIds,
-  onBeforeRunSearch() {
-    scrollGalleryToTop(galleryScrollScopeKeyOf(activeUserFolderId.value))
-    if (library.value.largeLibraryMode && library.value.images.length > galleryPageSize) {
-      void resetGalleryImagePage()
-    }
-  },
-  onOpenImageDetail() {
-    imageDetailContextMenu.value = null
-    resetImageDetailMediaTransform()
-  },
-  onCloseImageDetail() {
-    imageDetailContextMenu.value = null
-    resetImageDetailMediaTransform()
-  },
-})
-
-const galleryLoadedImageCount = computed(() => library.value.images.length)
-const galleryTotalImageCount = computed(() => {
-  if (!library.value.largeLibraryMode) return visibleImages.value.length
-  if (largeLibrarySearchResultIds.value) return largeLibrarySearchResultIds.value.length
-  return galleryCurrentQueryTotalCount.value || library.value.totalImageCount || library.value.images.length
-})
-const canLoadMoreGalleryImages = computed(
-  () =>
-    library.value.largeLibraryMode &&
-    !isGalleryPageLoading.value &&
-    library.value.images.length < galleryTotalImageCount.value,
-)
-
-function currentGalleryPageQuery() {
-  const scope = activeUserFolderId.value
-  const unclassifiedOnlyParentFolderIdForQuery =
-    typeof scope === 'number' && unclassifiedOnlyParentFolderId.value === scope ? scope : null
-  return {
-    scope: typeof scope === 'string' ? scope : 'folder',
-    folderId: typeof scope === 'number' ? scope : null,
-    unclassifiedOnlyParentFolderId: unclassifiedOnlyParentFolderIdForQuery,
-  }
-}
-
-async function getGallerySearchScopeCandidateImageIds() {
-  if (!library.value.largeLibraryMode) return null
+import SoftSelect from "./shared/ui/SoftSelect.vue";
+import AppIcon from "./shared/ui/AppIcon.vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
+import { api, errorMessage, invoke } from "./shared/ipc";
+import { useGallery } from "./features/gallery/useGallery";
+import { useSelection } from "./features/gallery/useSelection";
+import { provideWorkspace } from "./shared/workspace";
+import { useFolders } from "./features/folders/useFolders";
+import { useJobs } from "./features/jobs/useJobs";
+import { usePreferences } from "./features/settings/usePreferences";
+import FolderNav from "./features/folders/FolderNav.vue";
+import GalleryToolbar from "./features/gallery/GalleryToolbar.vue";
+import GalleryWall from "./features/gallery/GalleryWall.vue";
+import SearchBar from "./features/search/SearchBar.vue";
+import ImageViewer from "./features/viewer/ImageViewer.vue";
+import TagManager from "./features/tags/TagManager.vue";
+import TaskCenter from "./features/jobs/TaskCenter.vue";
+import SettingsPage from "./features/settings/SettingsPage.vue";
+import SoftDialog from "./shared/ui/SoftDialog.vue";
+import type { GalleryImage } from "./shared/contracts/GalleryImage";
+import type { LibraryFolder } from "./shared/contracts/LibraryFolder";
+import type { ImageMutation } from "./shared/contracts/ImageMutation";
+import type { UserFolderRuleCondition } from "./shared/contracts/UserFolderRuleCondition";
+const gallery = useGallery(),
+  selection = useSelection(),
+  folders = useFolders(),
+  preferences = usePreferences();
+provideWorkspace({ gallery, selection });
+const page = ref("gallery"),
+  sources = ref<LibraryFolder[]>([]),
+  drawer = ref(false),
+  viewer = ref<GalleryImage | null>(null),
+  error = ref(""),
+  notice = ref(""),
+  pinned = ref(false);
+const jobs = useJobs(() => {
+  if (page.value === "gallery") void gallery.search();
+});
+const scopeName = computed(() =>
+  gallery.query.value.unclassifiedOnlyParentFolderId !== null
+    ? (folders.folders.value.find(
+        (f) => f.id === gallery.query.value.unclassifiedOnlyParentFolderId,
+      )?.name ?? "当前分类") + " · 仅本级待分类"
+    : gallery.query.value.folderId !== null
+      ? (folders.folders.value.find(
+          (f) => f.id === gallery.query.value.folderId,
+        )?.name ?? "文件夹")
+      : ((
+          {
+            all: "全部图片",
+            random: "随机浏览",
+            favorites: "收藏",
+            unclassified: "待分类",
+            trash: "应用回收站",
+          } as Record<string, string>
+        )[gallery.query.value.scope] ?? "全部图片"),
+);
+const dialog = ref<null | {
+    kind: string;
+    title: string;
+    id?: number;
+    parentId?: number | null;
+  }>(null),
+  draft = ref(""),
+  targetFolder = ref<number | null>(null),
+  ruleConditions = ref<UserFolderRuleCondition[]>([]),
+  busy = ref(false);
+async function refresh() {
   try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    return await invoke<string[]>('list_gallery_image_ids_for_scope_command', currentGalleryPageQuery())
-  } catch (error) {
-    errorText.value = formatError(error)
-    return null
+    const b = await api.bootstrap();
+    folders.folders.value = b.userFolders;
+    sources.value = b.folders;
+    return b;
+  } catch (e) {
+    error.value = errorMessage(e);
   }
 }
-
-function currentGallerySearchScopeFilter() {
-  return currentGalleryPageQuery()
+async function go(scope: string, folderId: number | null = null) {
+  page.value = "gallery";
+  drawer.value = false;
+  gallery.query.value.scope = scope;
+  gallery.query.value.folderId = folderId;
+  gallery.query.value.unclassifiedOnlyParentFolderId = null;
+  if (scope === "random") gallery.query.value.randomSeed = Date.now();
+  selection.clear();
+  await gallery.search();
 }
-
-function hasAnyActiveSearch() {
-  return (
-    searchMode.value === 'image' ||
-    searchZhSelected.value.length > 0 ||
-    searchEnQuery.value.trim().length > 0 ||
-    searchFileNameQuery.value.trim().length > 0 ||
-    searchNaturalLanguageQuery.value.trim().length > 0
-  )
-}
-
-async function loadGalleryImagePage(offset: number, mode: 'replace' | 'append') {
-  if (!library.value.largeLibraryMode || isGalleryPageLoading.value) return
-  isGalleryPageLoading.value = true
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    const searchResultIds = largeLibrarySearchResultIds.value
-    const searchPageIds = searchResultIds
-      ? searchResultIds.slice(Math.max(0, offset), Math.max(0, offset) + galleryPageSize)
-      : null
-    const page = searchPageIds
-      ? await invoke<GalleryImagePage>('list_gallery_images_by_ids_page_command', {
-          imageIds: searchPageIds,
-          offset: 0,
-          limit: galleryPageSize,
-        })
-      : await invoke<GalleryImagePage>('list_gallery_images_page_command', {
-          ...currentGalleryPageQuery(),
-          offset,
-          limit: galleryPageSize,
-        })
-    const totalImageCount = searchResultIds ? searchResultIds.length : page.totalImageCount
-    galleryCurrentQueryTotalCount.value = totalImageCount
-    const existingById = new Map(library.value.images.map((image) => [image.id, image]))
-    const images =
-      mode === 'append'
-        ? [...library.value.images, ...page.images.filter((image) => !existingById.has(image.id))]
-        : page.images
-    library.value = {
-      ...library.value,
-      images,
-      totalImageCount,
-      imageOffset: 0,
-      imageLimit: Math.max(images.length, page.limit),
-    }
-    if (mode === 'replace') {
-      scrollGalleryToTop()
-    }
-  } catch (error) {
-    errorText.value = formatError(error)
-  } finally {
-    isGalleryPageLoading.value = false
-  }
-}
-
-async function loadMoreGalleryImages() {
-  await loadGalleryImagePage(library.value.images.length, 'append')
-}
-
-async function resetGalleryImagePage() {
-  largeLibrarySearchResultIds.value = null
-  await loadGalleryImagePage(0, 'replace')
-}
-
-async function refreshGalleryAfterImagesRemoved(imageIds: string[]) {
-  if (!library.value.largeLibraryMode) return
-  if (largeLibrarySearchResultIds.value) {
-    const removed = new Set(imageIds)
-    largeLibrarySearchResultIds.value = largeLibrarySearchResultIds.value.filter(
-      (imageId) => !removed.has(imageId),
-    )
-    removeSearchResultImageIds(imageIds)
-  }
-  await loadGalleryImagePage(0, 'replace')
-}
-
-async function applyLargeLibrarySearchResultImageIds(imageIds: string[] | null) {
-  if (!library.value.largeLibraryMode) return
-  largeLibrarySearchResultIds.value = imageIds
-  if (!imageIds) {
-    await loadGalleryImagePage(0, 'replace')
-    return
-  }
-  await loadGalleryImagePage(0, 'replace')
-}
-
-type KnownAutoTagSuggestion = {
-  tagEn: string
-  tagZh?: string | null
-  imageCount: number
-  isUserCustom?: boolean
-}
-
-const imageDetailCustomTagDraft = ref('')
-const imageDetailCustomTagEditorOpen = ref(false)
-const imageDetailCustomTagConflict = ref<{
-  input: string
-  tagEn: string
-  tagZh: string | null
-} | null>(null)
-const imageDetailCustomTagExpandedFolderIds = ref<number[]>([])
-const imageDetailCustomTagSelectedExistingTags = ref<string[]>([])
-const imageDetailSupplementPickerOpen = ref(false)
-const imageDetailSupplementQuery = ref('')
-const imageDetailSupplementSuggestions = ref<KnownAutoTagSuggestion[]>([])
-const imageDetailSupplementSuggestLoading = ref(false)
-const imageDetailSupplementSuggestTimer = ref<number | null>(null)
-const imageDetailSupplementSuggestRequestToken = ref(0)
-const imageDetailMediaScale = ref(1)
-const imageDetailMediaPan = ref({ x: 0, y: 0 })
-const imageDetailMediaDrag = ref<null | {
-  pointerId: number
-  startX: number
-  startY: number
-  panX: number
-  panY: number
-}>(null)
-
-const favoriteVisibleImageIds = computed(() =>
-  visibleImages.value.filter((image) => image.isFavorite).map((image) => image.id),
-)
-const imageDetailMediaStyle = computed(() => ({
-  transform: `translate3d(${imageDetailMediaPan.value.x}px, ${imageDetailMediaPan.value.y}px, 0) scale(${imageDetailMediaScale.value})`,
-  cursor: imageDetailMediaScale.value > 1 ? (imageDetailMediaDrag.value ? 'grabbing' : 'grab') : 'zoom-in',
-}))
-const isGalleryBatchMode = ref(false)
-const galleryBatchSelectedImageIds = ref<string[]>([])
-type GalleryBatchActionItem = {
-  key:
-    | 'copy-folder'
-    | 'move-folder'
-    | 'add-tags'
-    | 'remove-from-folder'
-    | 'assign-folder'
-    | 'favorite'
-    | 'favorite-remove'
-    | 'restore-trash'
-    | 'system-trash'
-    | 'trash'
-  label: string
-}
-type PendingBatchTag =
-  | {
-      id: string
-      kind: 'custom'
-      tagText: string
-      label: string
-      subLabel?: string
-    }
-  | {
-      id: string
-      kind: 'supplement'
-      tagEn: string
-      tagZh: string | null
-      label: string
-      subLabel: string
-    }
-const batchFolderPickerModal = ref<null | { mode: 'copy' | 'move' | 'assign'; title: string; confirmLabel: string }>(null)
-const batchFolderPickerTargetId = ref<number | null>(null)
-const batchTagModalOpen = ref(false)
-const batchTagDraft = ref('')
-const batchTagSuggestions = ref<KnownAutoTagSuggestion[]>([])
-const batchTagPending = ref<PendingBatchTag[]>([])
-const batchTagCustomConflict = ref<{
-  input: string
-  tagEn: string
-  tagZh: string | null
-} | null>(null)
-const batchTagExpandedFolderIds = ref<number[]>([])
-const batchTagSuggestTimer = ref<number | null>(null)
-const batchTagSuggestLoading = ref(false)
-const batchTagSuggestToken = ref(0)
-type FolderRuleConditionDraft = {
-  id: number
-  logic: 'AND' | 'OR' | 'NOT'
-  source: 'danbooru' | 'custom' | 'filename'
-  keyword: string
-}
-type FolderRuleTagGroup = {
-  key: string
-  title: string
-  tags: string[]
-}
-const folderRuleEditor = ref<{
-  folderId: number
-  folderName: string
-  conditions: FolderRuleConditionDraft[]
-} | null>(null)
-const folderRuleSeed = ref(1)
-const folderRuleDanbooruActiveConditionId = ref<number | null>(null)
-const folderRuleDanbooruSuggestions = ref<KnownAutoTagSuggestion[]>([])
-const folderRuleDanbooruSuggestLoading = ref(false)
-const folderRuleDanbooruSuggestTimer = ref<number | null>(null)
-const folderRuleDanbooruSuggestToken = ref(0)
-const batchSelectedImageIds = computed(() => Array.from(new Set(galleryBatchSelectedImageIds.value)))
-const isGalleryBatchAllSelected = computed(() => {
-  if (!isGalleryBatchMode.value) return false
-  const visibleIds = visibleImages.value.map((image) => image.id)
-  if (visibleIds.length === 0) return false
-  const selected = new Set(galleryBatchSelectedImageIds.value)
-  return visibleIds.every((id) => selected.has(id))
-})
-const galleryBatchActionLabels = computed<GalleryBatchActionItem[]>(() => {
-  if (typeof activeUserFolderId.value === 'number') {
-    return [
-      { key: 'copy-folder', label: '复制到其他文件夹' },
-      { key: 'move-folder', label: '移动到其他文件夹' },
-      { key: 'add-tags', label: '添加标签' },
-      { key: 'remove-from-folder', label: '从文件夹中删除' },
-    ]
-  }
-  if (activeUserFolderId.value === 'trash') {
-    return [
-      { key: 'restore-trash', label: '还原' },
-      { key: 'system-trash', label: '移动到系统回收站' },
-    ]
-  }
-  if (activeUserFolderId.value === 'favorites') {
-    return [
-      { key: 'assign-folder', label: '归类到文件夹' },
-      { key: 'add-tags', label: '添加标签' },
-      { key: 'favorite-remove', label: '从我喜爱的中移除' },
-      { key: 'trash', label: '移动到回收站' },
-    ]
-  }
-  return [
-    { key: 'assign-folder', label: '归类到文件夹' },
-    { key: 'add-tags', label: '添加标签' },
-    { key: 'favorite', label: '归类到我喜爱的' },
-    { key: 'trash', label: '移动到回收站' },
-  ]
-})
-
-const folderRuleCustomTagGroups = computed<FolderRuleTagGroup[]>(() => {
-  const normalizeTags = (tags: string[]) =>
-    Array.from(new Set(tags.map((tag) => tag.trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'zh-CN'))
-  const groups: FolderRuleTagGroup[] = []
-  for (const folder of tagManagerFolders.value) {
-    const tags = normalizeTags(folder.tags)
-    if (tags.length === 0) continue
-    groups.push({
-      key: `folder:${folder.id}`,
-      title: folder.name,
-      tags,
-    })
-  }
-  const unclassified = normalizeTags(tagManagerUnclassifiedTags.value)
-  if (unclassified.length > 0) {
-    groups.push({
-      key: 'unclassified',
-      title: '未分类标签',
-      tags: unclassified,
-    })
-  }
-  return groups
-})
-
-function clearGalleryBatchSelection() {
-  galleryBatchSelectedImageIds.value = []
-}
-
-function closeBatchFolderPickerModal() {
-  batchFolderPickerModal.value = null
-  batchFolderPickerTargetId.value = null
-}
-
-function closeBatchTagModal() {
-  batchTagModalOpen.value = false
-  batchTagDraft.value = ''
-  batchTagSuggestions.value = []
-  batchTagPending.value = []
-  batchTagCustomConflict.value = null
-  batchTagExpandedFolderIds.value = []
-  batchTagSuggestLoading.value = false
-  if (batchTagSuggestTimer.value !== null) {
-    window.clearTimeout(batchTagSuggestTimer.value)
-    batchTagSuggestTimer.value = null
-  }
-}
-
-function enterGalleryBatchMode(seedImageId?: string) {
-  isGalleryBatchMode.value = true
-  if (seedImageId) {
-    galleryBatchSelectedImageIds.value = [seedImageId]
-    return
-  }
-  clearGalleryBatchSelection()
-}
-
-function exitGalleryBatchMode() {
-  closeBatchFolderPickerModal()
-  closeBatchTagModal()
-  isGalleryBatchMode.value = false
-  clearGalleryBatchSelection()
-}
-
-function toggleGalleryBatchImageSelection(imageId: string) {
-  if (!isGalleryBatchMode.value) return
-  const next = new Set(galleryBatchSelectedImageIds.value)
-  if (next.has(imageId)) {
-    next.delete(imageId)
-  } else {
-    next.add(imageId)
-  }
-  galleryBatchSelectedImageIds.value = [...next]
-}
-
-function appendGalleryBatchImageSelection(imageIds: string[]) {
-  if (!isGalleryBatchMode.value || imageIds.length === 0) return
-  const next = new Set(galleryBatchSelectedImageIds.value)
-  for (const imageId of imageIds) {
-    next.add(imageId)
-  }
-  galleryBatchSelectedImageIds.value = [...next]
-}
-
-function selectAllGalleryBatchImages() {
-  if (!isGalleryBatchMode.value) return
-  galleryBatchSelectedImageIds.value = visibleImages.value.map((image) => image.id)
-}
-
-function toggleSelectAllGalleryBatchImages() {
-  if (!isGalleryBatchMode.value) return
-  if (isGalleryBatchAllSelected.value) {
-    clearGalleryBatchSelection()
-    return
-  }
-  selectAllGalleryBatchImages()
-}
-
-async function runBatchAction(
-  actionName: string,
-  action: (imageId: string) => Promise<void>,
-  options?: { clearSelection?: boolean; exitBatchMode?: boolean },
+async function mutate(
+  action: string,
+  ids = Array.from(selection.ids.value),
+  extra: Partial<ImageMutation> = {},
 ) {
-  const imageIds = batchSelectedImageIds.value
-  if (imageIds.length === 0) {
-    errorText.value = '请先选择图片'
-    return
-  }
-  isLoading.value = true
-  let succeeded = 0
-  let failed = 0
-  let firstError = ''
+  if (busy.value) return;
+  busy.value = true;
+  error.value = "";
+  notice.value = "";
   try {
-    for (const imageId of imageIds) {
-      try {
-        await action(imageId)
-        succeeded += 1
-      } catch (error) {
-        failed += 1
-        if (!firstError) {
-          firstError = formatError(error)
-        }
-      }
-    }
+    const result = await api.mutate({
+      action,
+      imageIds: ids,
+      folderId: null,
+      favorite: null,
+      customTags: [],
+      supplementTags: [],
+      ...extra,
+    });
+    gallery.patch(result.images);
+    if (viewer.value)
+      viewer.value =
+        result.images.find((i) => i.id === viewer.value?.id) ?? viewer.value;
+    selection.done(result.successfulIds);
+    if (result.failures.length)
+      error.value = result.failures
+        .map((f) => `${f.imageId.split(/[\\/]/).at(-1)}：${f.message}`)
+        .join("\n");
+    notice.value = `已完成 ${result.successfulIds.length} 项`;
+    if (["trash", "restore", "systemTrash", "move", "remove"].includes(action))
+      await gallery.search();
+  } catch (e) {
+    error.value = errorMessage(e);
   } finally {
-    isLoading.value = false
-  }
-
-  if (failed > 0) {
-    errorText.value = `${actionName}：成功 ${succeeded}，失败 ${failed}${firstError ? `，原因：${firstError}` : ''}`
-  } else {
-    errorText.value = ''
-    statusText.value = `${actionName}完成：${succeeded} 张`
-  }
-
-  if (succeeded > 0 && options?.clearSelection !== false) {
-    clearGalleryBatchSelection()
-  }
-
-  if (succeeded + failed > 0 && (options?.exitBatchMode ?? true)) {
-    exitGalleryBatchMode()
+    busy.value = false;
   }
 }
-
-async function runBatchInvokeAction(actionName: string, invokeCall: () => Promise<LibraryStore>) {
-  const imageIds = batchSelectedImageIds.value
-  if (imageIds.length === 0) {
-    errorText.value = '请先选择图片'
-    return false
-  }
-  isLoading.value = true
-  try {
-    library.value = await invokeCall()
-    errorText.value = ''
-    statusText.value = `${actionName}完成：${imageIds.length} 张`
-    clearGalleryBatchSelection()
-    exitGalleryBatchMode()
-    return true
-  } catch (error) {
-    errorText.value = formatError(error)
-    return false
-  } finally {
-    isLoading.value = false
-  }
+function favorite(id: string) {
+  const image = gallery.images.value.find((i) => i.id === id);
+  if (image) void mutate("favorite", [id], { favorite: !image.isFavorite });
 }
-
-async function runBatchFavorite() {
-  const { invoke } = await import('@tauri-apps/api/core')
-  await runBatchInvokeAction('加入我喜爱的', async () => {
-    return invoke<LibraryStore>('set_images_favorite_command', {
-      imageIds: batchSelectedImageIds.value,
-      favorite: true,
-    })
-  })
-}
-
-async function runBatchRemoveFavorite() {
-  const { invoke } = await import('@tauri-apps/api/core')
-  await runBatchInvokeAction('从我喜爱的中移除', async () => {
-    return invoke<LibraryStore>('set_images_favorite_command', {
-      imageIds: batchSelectedImageIds.value,
-      favorite: false,
-    })
-  })
-}
-
-async function runBatchMoveToTrash() {
-  const { invoke } = await import('@tauri-apps/api/core')
-  const imageIds = [...batchSelectedImageIds.value]
-  const ok = await runBatchInvokeAction('移入回收站', async () => {
-    return invoke<LibraryStore>('remove_images_from_index_command', {
-      imageIds,
-    })
-  })
-  if (ok) await refreshGalleryAfterImagesRemoved(imageIds)
-}
-
-async function runBatchRestoreFromTrash() {
-  const { invoke } = await import('@tauri-apps/api/core')
-  const imageIds = [...batchSelectedImageIds.value]
-  const ok = await runBatchInvokeAction('还原', async () => {
-    return invoke<LibraryStore>('restore_images_from_trash_command', {
-      imageIds,
-    })
-  })
-  if (ok) await refreshGalleryAfterImagesRemoved(imageIds)
-}
-
-async function runBatchMoveToSystemTrash() {
-  type BatchSystemTrashResult = {
-    store: LibraryStore
-    movedCount: number
-    failedImageIds: string[]
-    firstError?: string | null
-  }
-  const { invoke } = await import('@tauri-apps/api/core')
-  const imageIds = batchSelectedImageIds.value
-  if (imageIds.length === 0) {
-    errorText.value = '请先选择图片'
-    return
-  }
-  isLoading.value = true
-  try {
-    const result = await invoke<BatchSystemTrashResult>('move_images_to_system_trash_command', {
-      imageIds,
-    })
-    library.value = result.store
-    const moved = result.movedCount ?? 0
-    const failed = result.failedImageIds?.length ?? 0
-    if (failed > 0) {
-      const reason = result.firstError ? `，原因：${result.firstError}` : ''
-      errorText.value = `移动到系统回收站：成功 ${moved}，失败 ${failed}${reason}`
-    } else {
-      errorText.value = ''
-      statusText.value = `移动到系统回收站完成：${moved} 张`
-    }
-    if (moved > 0 || failed > 0) {
-      clearGalleryBatchSelection()
-      exitGalleryBatchMode()
-    }
-    if (moved > 0) {
-      const failedIds = new Set(result.failedImageIds ?? [])
-      await refreshGalleryAfterImagesRemoved(imageIds.filter((imageId) => !failedIds.has(imageId)))
-    }
-  } catch (error) {
-    errorText.value = formatError(error)
-  } finally {
-    isLoading.value = false
-  }
-}
-
-async function runBatchRemoveFromCurrentFolder() {
-  if (typeof activeUserFolderId.value !== 'number') return
-  const folderId = activeUserFolderId.value
-  const { invoke } = await import('@tauri-apps/api/core')
-  await runBatchInvokeAction('从文件夹中移除', async () => {
-    return invoke<LibraryStore>('remove_images_from_user_folder_command', {
-      imageIds: batchSelectedImageIds.value,
-      folderId,
-    })
-  })
-}
-
-function openBatchFolderPicker(mode: 'copy' | 'move' | 'assign') {
-  batchFolderPickerTargetId.value = null
-  if (mode === 'copy') {
-    batchFolderPickerModal.value = { mode, title: '复制到文件夹', confirmLabel: '复制' }
-    return
-  }
-  if (mode === 'move') {
-    batchFolderPickerModal.value = { mode, title: '移动到文件夹', confirmLabel: '移动' }
-    return
-  }
-  batchFolderPickerModal.value = { mode, title: '归类到文件夹', confirmLabel: '归类' }
-}
-
-function onBatchFolderRowClick(folder: { id: number; hasChildren: boolean; isExpanded: boolean }) {
-  batchFolderPickerTargetId.value = folder.id
-  if (!folder.hasChildren) return
-  toggleFolderExpanded(folder.id)
-}
-
-function isBatchFolderTargetSelected(folderId: number) {
-  return batchFolderPickerTargetId.value === folderId
-}
-
-async function confirmBatchFolderAction() {
-  const modal = batchFolderPickerModal.value
-  const targetFolderId = batchFolderPickerTargetId.value
-  if (!modal || targetFolderId === null) return
-  if (modal.mode !== 'assign' && typeof activeUserFolderId.value === 'number' && activeUserFolderId.value === targetFolderId) {
-    errorText.value = '目标文件夹不能与当前文件夹相同'
-    return
-  }
-
-  const { invoke } = await import('@tauri-apps/api/core')
-  if (modal.mode === 'copy') {
-    const ok = await runBatchInvokeAction('复制到文件夹', async () => {
-      return invoke<LibraryStore>('assign_images_to_user_folder_command', {
-        imageIds: batchSelectedImageIds.value,
-        folderId: targetFolderId,
-      })
-    })
-    if (ok) closeBatchFolderPickerModal()
-    return
-  }
-
-  if (modal.mode === 'move') {
-    if (typeof activeUserFolderId.value !== 'number') {
-      errorText.value = '当前不在可移动的文件夹视图'
-      return
-    }
-    const fromFolderId = activeUserFolderId.value
-    const ok = await runBatchInvokeAction('移动到文件夹', async () => {
-      return invoke<LibraryStore>('move_images_to_user_folder_command', {
-        imageIds: batchSelectedImageIds.value,
-        fromFolderId,
-        targetFolderId,
-      })
-    })
-    if (ok) closeBatchFolderPickerModal()
-    return
-  }
-
-  const ok = await runBatchInvokeAction('归类到文件夹', async () => {
-    return invoke<LibraryStore>('assign_images_to_user_folder_command', {
-      imageIds: batchSelectedImageIds.value,
-      folderId: targetFolderId,
-    })
-  })
-  if (ok) closeBatchFolderPickerModal()
-}
-
-async function refreshBatchTagSuggestionsNow() {
-  const keyword = batchTagDraft.value.trim()
-  if (!batchTagModalOpen.value || !keyword) {
-    batchTagSuggestions.value = []
-    batchTagSuggestLoading.value = false
-    return
-  }
-  const token = batchTagSuggestToken.value + 1
-  batchTagSuggestToken.value = token
-  batchTagSuggestLoading.value = true
-  try {
-    const rows = await suggestKnownAutoTagsForInput(keyword, 30, { includeDictionary: true })
-    if (token !== batchTagSuggestToken.value) return
-    batchTagSuggestions.value = rows
-  } catch (error) {
-    if (token !== batchTagSuggestToken.value) return
-    batchTagSuggestions.value = []
-    errorText.value = formatError(error)
-  } finally {
-    if (token === batchTagSuggestToken.value) {
-      batchTagSuggestLoading.value = false
-    }
-  }
-}
-
-function queueBatchTagSuggestions() {
-  if (batchTagSuggestTimer.value !== null) {
-    window.clearTimeout(batchTagSuggestTimer.value)
-    batchTagSuggestTimer.value = null
-  }
-  batchTagSuggestTimer.value = window.setTimeout(() => {
-    batchTagSuggestTimer.value = null
-    void refreshBatchTagSuggestionsNow()
-  }, 120)
-}
-
-async function openBatchTagModal() {
-  batchTagModalOpen.value = true
-  batchTagDraft.value = ''
-  batchTagSuggestions.value = []
-  batchTagPending.value = []
-  batchTagExpandedFolderIds.value = []
-  await reloadTagManagementState()
-}
-
-function isBatchPendingCustomTag(tagText: string) {
-  const normalized = tagText.trim()
-  if (!normalized) return false
-  return batchTagPending.value.some((tag) => tag.kind === 'custom' && tag.tagText === normalized)
-}
-
-function isBatchPendingSupplementTag(tagEn: string) {
-  const normalized = tagEn.trim().toLowerCase()
-  if (!normalized) return false
-  return batchTagPending.value.some((tag) => tag.kind === 'supplement' && tag.tagEn.toLowerCase() === normalized)
-}
-
-function addPendingCustomTag(tagText: string) {
-  const normalized = tagText.trim()
-  if (!normalized || isBatchPendingCustomTag(normalized)) return
-  batchTagPending.value = [
-    ...batchTagPending.value,
-    {
-      id: `custom:${normalized}`,
-      kind: 'custom',
-      tagText: normalized,
-      label: normalized,
-    },
-  ]
-}
-
-function addPendingSupplementTag(tagEn: string, tagZh?: string | null) {
-  const normalizedEn = tagEn.trim()
-  if (!normalizedEn || isBatchPendingSupplementTag(normalizedEn)) return
-  const normalizedZh = (tagZh ?? '').trim()
-  batchTagPending.value = [
-    ...batchTagPending.value,
-    {
-      id: `supplement:${normalizedEn.toLowerCase()}`,
-      kind: 'supplement',
-      tagEn: normalizedEn,
-      tagZh: normalizedZh || null,
-      label: normalizedZh || normalizedEn,
-      subLabel: normalizedZh ? normalizedEn : '',
-    },
-  ]
-}
-
-function removePendingBatchTag(tagId: string) {
-  batchTagPending.value = batchTagPending.value.filter((tag) => tag.id !== tagId)
-}
-
-async function addPendingCustomTagFromDraft() {
-  const tagText = batchTagDraft.value.trim()
-  if (!tagText) return
-  try {
-    const match = await findExactKnownAutoTag(tagText)
-    if (match) {
-      batchTagCustomConflict.value = {
-        input: tagText,
-        tagEn: match.tagEn,
-        tagZh: match.tagZh ?? null,
-      }
-      return
-    }
-    addPendingCustomTag(tagText)
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-async function addPendingSupplementTagFromDraft() {
-  const keyword = batchTagDraft.value.trim()
-  if (!keyword) return
-  try {
-    const match = await findExactKnownAutoTag(keyword)
-    if (!match) {
-      errorText.value = '未找到对应自动标签，请从候选列表选择'
-      return
-    }
-    addPendingSupplementTag(match.tagEn, match.tagZh ?? null)
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-function addPendingSupplementTagBySuggestion(suggestion: KnownAutoTagSuggestion) {
-  addPendingSupplementTag(suggestion.tagEn, suggestion.tagZh ?? null)
-}
-
-function addPendingExistingTag(tagText: string) {
-  addPendingCustomTag(tagText)
-}
-
-function isBatchTagFolderExpanded(folderId: number) {
-  return batchTagExpandedFolderIds.value.includes(folderId)
-}
-
-function toggleBatchTagFolderExpanded(folderId: number) {
-  if (isBatchTagFolderExpanded(folderId)) {
-    batchTagExpandedFolderIds.value = batchTagExpandedFolderIds.value.filter((id) => id !== folderId)
-    return
-  }
-  batchTagExpandedFolderIds.value = [...batchTagExpandedFolderIds.value, folderId]
-}
-
-function resolveBatchCustomTagConflict(action: 'supplement' | 'custom') {
-  const conflict = batchTagCustomConflict.value
-  if (!conflict) return
-  if (action === 'supplement') {
-    addPendingSupplementTag(conflict.tagEn, conflict.tagZh)
-  } else {
-    const input = conflict.input.trim()
-    if (input) {
-      const suffix = '（自定义）'
-      const customText = input.endsWith(suffix) ? input : `${input}${suffix}`
-      addPendingCustomTag(customText)
-    }
-  }
-  batchTagCustomConflict.value = null
-}
-
-function isExistingTagPending(tagText: string) {
-  return isBatchPendingCustomTag(tagText)
-}
-
-async function applyBatchPendingTags() {
-  const pending = batchTagPending.value
-  if (pending.length === 0) {
-    errorText.value = '请先加入要添加的标签'
-    return
-  }
-  const customTags = pending
-    .filter((tag): tag is Extract<PendingBatchTag, { kind: 'custom' }> => tag.kind === 'custom')
-    .map((tag) => tag.tagText)
-  const supplementTags = pending
-    .filter((tag): tag is Extract<PendingBatchTag, { kind: 'supplement' }> => tag.kind === 'supplement')
-    .map((tag) => ({
-      tagEn: tag.tagEn,
-      tagZh: tag.tagZh ?? null,
-    }))
-  const { invoke } = await import('@tauri-apps/api/core')
-  await runBatchInvokeAction('批量添加标签', async () => {
-    return invoke<LibraryStore>('add_images_user_tags_command', {
-      imageIds: batchSelectedImageIds.value,
-      customTags,
-      supplementTags,
-    })
-  })
-}
-
-function onGalleryBatchAction(actionKey: GalleryBatchActionItem['key']) {
-  if (batchSelectedImageIds.value.length === 0) {
-    errorText.value = '请先选择图片'
-    return
-  }
-  if (actionKey === 'copy-folder') {
-    openBatchFolderPicker('copy')
-    return
-  }
-  if (actionKey === 'move-folder') {
-    openBatchFolderPicker('move')
-    return
-  }
-  if (actionKey === 'assign-folder') {
-    openBatchFolderPicker('assign')
-    return
-  }
-  if (actionKey === 'add-tags') {
-    void openBatchTagModal()
-    return
-  }
-  if (actionKey === 'remove-from-folder') {
-    void runBatchRemoveFromCurrentFolder()
-    return
-  }
-  if (actionKey === 'favorite') {
-    void runBatchFavorite()
-    return
-  }
-  if (actionKey === 'favorite-remove') {
-    void runBatchRemoveFavorite()
-    return
-  }
-  if (actionKey === 'restore-trash') {
-    void runBatchRestoreFromTrash()
-    return
-  }
-  if (actionKey === 'system-trash') {
-    void runBatchMoveToSystemTrash()
-    return
-  }
-  void runBatchMoveToTrash()
-}
-
-const activeTagManagerFolder = computed(() =>
-  tagManagerFolders.value.find((folder) => folder.id === activeTagManagerFolderId.value) ?? null,
-)
-
-const tagManagerDraggingTagText = ref<string | null>(null)
-const tagManagerDragOverFolderId = ref<number | null>(null)
-const tagManagerTagContextMenu = ref<{ tagText: string; x: number; y: number } | null>(null)
-
-const activeTagManagerFolderNameForHint = computed(() => activeTagManagerFolder.value?.name ?? '')
-
-const activeTagManagerFolderTags = computed(() => activeTagManagerFolder.value?.tags ?? [])
-const tagManagerTagContextMenuStyle = computed(() => {
-  if (!tagManagerTagContextMenu.value) return {}
-  return {
-    left: `${tagManagerTagContextMenu.value.x}px`,
-    top: `${tagManagerTagContextMenu.value.y}px`,
-  }
-})
-const tagManagerDragGhostEl = ref<HTMLElement | null>(null)
-
-function clearTagManagerDragGhost() {
-  if (!tagManagerDragGhostEl.value) return
-  tagManagerDragGhostEl.value.remove()
-  tagManagerDragGhostEl.value = null
-}
-
-function startTagManagerTagDrag(tagText: string, event: DragEvent) {
-  const normalized = tagText.trim()
-  if (!normalized) return
-  tagManagerDraggingTagText.value = normalized
-  if (event.dataTransfer) {
-    event.dataTransfer.effectAllowed = 'move'
-    event.dataTransfer.setData('text/plain', normalized)
-
-    clearTagManagerDragGhost()
-    const ghost = document.createElement('span')
-    ghost.className = 'tag-manager-modal__tag-chip-ghost'
-    ghost.textContent = normalized
-    ghost.style.position = 'fixed'
-    ghost.style.left = '-9999px'
-    ghost.style.top = '-9999px'
-    document.body.appendChild(ghost)
-    tagManagerDragGhostEl.value = ghost
-    event.dataTransfer.setDragImage(ghost, Math.round(ghost.offsetWidth / 2), Math.round(ghost.offsetHeight / 2))
-  }
-}
-
-function endTagManagerTagDrag() {
-  clearTagManagerDragGhost()
-  tagManagerDraggingTagText.value = null
-  tagManagerDragOverFolderId.value = null
-}
-
-function closeTagManagerTagContextMenu() {
-  tagManagerTagContextMenu.value = null
-}
-
-function openTagManagerTagContextMenu(tagText: string, event: MouseEvent) {
-  const normalized = tagText.trim()
-  if (!normalized) return
-  event.preventDefault()
-  event.stopPropagation()
-  tagManagerTagContextMenu.value = {
-    tagText: normalized,
-    x: event.clientX,
-    y: event.clientY,
-  }
-}
-
-async function deleteTagManagerTagFromContextMenu() {
-  const current = tagManagerTagContextMenu.value
-  if (!current) return
-  closeTagManagerTagContextMenu()
-  await deleteTagManagerTag(current.tagText)
-}
-
-function onTagManagerFolderDragOver(folderId: number, event: DragEvent) {
-  if (!tagManagerDraggingTagText.value) return
-  event.preventDefault()
-  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
-  tagManagerDragOverFolderId.value = folderId
-}
-
-function onTagManagerFolderDragLeave(folderId: number) {
-  if (tagManagerDragOverFolderId.value === folderId) {
-    tagManagerDragOverFolderId.value = null
-  }
-}
-
-async function onTagManagerFolderDrop(folderId: number, event: DragEvent) {
-  event.preventDefault()
-  const text = event.dataTransfer?.getData('text/plain')?.trim() ?? ''
-  const tagText = text || tagManagerDraggingTagText.value || ''
-  tagManagerDragOverFolderId.value = null
-  if (!tagText) return
-  await assignTagToFolder(tagText, folderId)
-  tagManagerDraggingTagText.value = null
-}
-
-const {
-  galleryEl,
-  galleryScrollTop,
-  renderedLayoutItems,
-  masonryContentWidth,
-  totalHeight,
-  setGalleryElement,
-  onGalleryScroll,
-  onGalleryWheel,
-  updateViewportSize,
-  saveGalleryScrollPosition,
-  restoreGalleryScrollPosition,
-  scrollGalleryToTop,
-} = useGalleryMasonry({
-  visibleImages,
-  convertFileSrc,
-  clamp,
-})
-
-const galleryScrollableHeight = computed(() => {
-  const element = galleryEl.value
-  if (!element) return 0
-  return Math.max(0, element.scrollHeight - element.clientHeight)
-})
-
-const galleryScrollProgress = computed(() => {
-  const maxScroll = galleryScrollableHeight.value
-  if (maxScroll <= 0) return 0
-  return clamp(galleryScrollTop.value / maxScroll, 0, 1)
-})
-
-const settingsScrollableHeight = ref(0)
-const settingsScrollTop = ref(0)
-
-function syncSettingsScrollMetricsFromElement(element: HTMLElement) {
-  const maxScroll = Math.max(0, element.scrollHeight - element.clientHeight)
-  settingsScrollableHeight.value = maxScroll
-  settingsScrollTop.value = clamp(element.scrollTop, 0, maxScroll)
-}
-
-function onSettingsScroll(event: Event) {
-  const target = event.target
-  if (!(target instanceof HTMLElement)) return
-  syncSettingsScrollMetricsFromElement(target)
-}
-
-function refreshSettingsScrollMetrics() {
-  const element = document.querySelector<HTMLElement>('.settings')
-  if (!element) {
-    settingsScrollableHeight.value = 0
-    settingsScrollTop.value = 0
-    return
-  }
-  syncSettingsScrollMetricsFromElement(element)
-}
-
-const settingsScrollProgress = computed(() => {
-  const maxScroll = settingsScrollableHeight.value
-  if (maxScroll <= 0) return 0
-  return clamp(settingsScrollTop.value / maxScroll, 0, 1)
-})
-
-const showWorkspaceScrollProgress = computed(() => {
-  if (viewMode.value === 'gallery') return galleryScrollableHeight.value > 1
-  if (viewMode.value === 'settings') return settingsScrollableHeight.value > 1
-  return false
-})
-
-const workspaceScrollProgress = computed(() => {
-  if (viewMode.value === 'gallery') return galleryScrollProgress.value
-  if (viewMode.value === 'settings') return settingsScrollProgress.value
-  return 0
-})
-
-const {
-  autoScanOnStartup,
-  isBackgroundScanRunning,
-  isBackgroundScanPaused,
-  scanProgressText,
-  scanRecentErrors,
-  lastBackgroundScanProgress,
-  isNaturalLanguageScanRunning,
-  isNaturalLanguageScanPaused,
-  naturalLanguageScanProgressText,
-  naturalLanguageScanRecentErrors,
-  initAutoScanOnStartupFromStorage,
-  setAutoScanOnStartup,
-  startScanAllFolders,
-  pauseScanAllFolders,
-  resumeScanAllFolders,
-  stopScanAllFolders,
-  startNaturalLanguageScan,
-  pauseNaturalLanguageScan,
-  resumeNaturalLanguageScan,
-  stopNaturalLanguageScan,
-  startStartupCleanup,
-  refreshBackgroundScanStatus,
-  refreshNaturalLanguageScanStatus,
-  startBackgroundScanPolling,
-  stopBackgroundScanPolling,
-  startAutoScanIfEnabled,
-  startScanAllFoldersCollectOnly,
-} = useBackgroundScan({
-  loadLibrary,
-  formatError,
-  setErrorText(value) {
-    errorText.value = value
-  },
-  autoScanOnStartupStorageKey,
-})
-
-const {
-  isThumbnailGenerationRunning,
-  isThumbnailGenerationPaused,
-  thumbnailProgressText,
-  thumbnailProgressPercent,
-  thumbnailRecentErrors,
-  startThumbnailGeneration,
-  pauseThumbnailGeneration,
-  resumeThumbnailGeneration,
-  stopThumbnailGeneration,
-  clearThumbnailCache,
-  rebuildThumbnailCache,
-  refreshThumbnailGenerationStatus,
-  startThumbnailGenerationPolling,
-  stopThumbnailGenerationPolling,
-} = useThumbnailGeneration({
-  loadLibrary,
-  formatError,
-  setErrorText(value) {
-    errorText.value = value
-  },
-})
-
-const {
-  isAtmosphereGenerationRunning,
-  isAtmosphereGenerationPaused,
-  atmosphereProgressText,
-  atmosphereProgressPercent,
-  atmosphereRecentErrors,
-  startAtmosphereGeneration,
-  pauseAtmosphereGeneration,
-  resumeAtmosphereGeneration,
-  stopAtmosphereGeneration,
-  rebuildAtmosphereSignatureCache,
-  refreshAtmosphereGenerationStatus,
-  startAtmosphereGenerationPolling,
-  stopAtmosphereGenerationPolling,
-} = useAtmosphereGeneration({
-  loadLibrary,
-  formatError,
-  setErrorText(value) {
-    errorText.value = value
-  },
-})
-
-const {
-  isColorSignatureGenerationRunning,
-  isColorSignatureGenerationPaused,
-  colorSignatureProgressText,
-  colorSignatureProgressPercent,
-  colorSignatureRecentErrors,
-  startColorSignatureGeneration,
-  pauseColorSignatureGeneration,
-  resumeColorSignatureGeneration,
-  stopColorSignatureGeneration,
-  rebuildColorSignatureCache,
-  refreshColorSignatureGenerationStatus,
-  startColorSignatureGenerationPolling,
-  stopColorSignatureGenerationPolling,
-} = useColorSignatureGeneration({
-  loadLibrary,
-  formatError,
-  setErrorText(value) {
-    errorText.value = value
-  },
-})
-
-const {
-  tagManagerOpen,
-  tagManagerTab,
-  isTagManagerLoading,
-  tagManagerFolders,
-  activeTagManagerFolderId,
-  tagManagerUnclassifiedTags,
-  newTagManagerFolderName,
-  newTagManagerTagText,
-  dictGroupId,
-  dictQuery,
-  dictOnlyUsed,
-  dictSort,
-  dictGroupItems,
-  filteredDictTags,
-  visibleDictTags,
-  openTagManager,
-  closeTagManager,
-  reloadTagManagementState,
-  createTagManagerFolder,
-  createTagManagerTag,
-  deleteTagManagerTag,
-  assignTagToFolder,
-  unassignTag,
-  deleteTagManagerFolder,
-  loadMoreDictTags,
-} = useTagManagement({
-  formatError,
-  setErrorText(value) {
-    errorText.value = value
-  },
-})
-
-async function refreshDataDirectoryInfo() {
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    dataDirectoryInfo.value = await invoke<DataDirectoryInfo>('data_directory_info_command')
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-async function openDataDirectory() {
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    await invoke('open_data_directory_command')
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-async function migrateDataDirectory() {
-  const target = await open({
-    title: '选择新的数据目录',
-    directory: true,
-    multiple: false,
-  })
-  if (!target || Array.isArray(target)) return
-  isMigratingDataDirectory.value = true
-  statusText.value = '正在迁移数据目录...'
-  errorText.value = ''
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    const result = await invoke<DataDirectoryMigrationResult>('migrate_data_directory_command', {
-      targetDir: target,
-    })
-    dataDirectoryRestartRequired.value = true
-    statusText.value = `数据目录迁移完成，已复制 ${result.copiedFiles} 个文件。请重启 illuTag 后确认新目录正常；旧目录不会自动删除。`
-    await refreshDataDirectoryInfo()
-  } catch (error) {
-    errorText.value = formatError(error)
-  } finally {
-    isMigratingDataDirectory.value = false
-  }
-}
-
-onMounted(async () => {
-  const mountedStart = performance.now()
-  console.info(`[startup-prof] App.vue onMounted_start_ms=${mountedStart.toFixed(1)}`)
-  initAppSettingsFromStorage()
-  initAutoScanOnStartupFromStorage()
-  void refreshDataDirectoryInfo()
-  void loadLibrary()
-  handleWindowResize()
-  window.addEventListener('resize', handleWindowResize)
-  window.addEventListener('pointermove', moveImageDrag)
-  window.addEventListener('pointermove', moveFolderPointer)
-  window.addEventListener('pointermove', trackGlobalPointerPosition, { passive: true })
-  window.addEventListener('pointerup', finishImageDrag)
-  window.addEventListener('pointerup', finishFolderPointer)
-  window.addEventListener('click', closeFolderContextMenu)
-  window.addEventListener('click', closeImageDetailContextMenu)
-  window.addEventListener('click', closeGalleryImageContextMenu)
-  window.addEventListener('click', closeTagManagerTagContextMenu)
-  window.addEventListener('mouseout', onWindowMouseOut)
-  window.addEventListener('keydown', handleGlobalKeydown)
-  void refreshBackgroundScanStatus()
-  void refreshWindowAlwaysOnTop()
-  startBackgroundScanPolling()
-  startThumbnailGenerationPolling()
-  startAtmosphereGenerationPolling()
-  startColorSignatureGenerationPolling()
-  void startStartupCleanup()
-  if (autoScanOnStartup.value) {
-    await nextTick()
-    scheduleStartupAutoScanPipeline()
-  }
-  if (
-    thumbnailCacheEnabled.value &&
-    !isBackgroundScanRunning.value &&
-    !autoScanOnStartup.value &&
-    !dataDirectoryRestartRequired.value
-  ) {
-    void startThumbnailGeneration()
-  }
-  console.info(`[startup-prof] App.vue onMounted_end_ms=${performance.now().toFixed(1)}`)
-})
-
-const startupAutoScanPipelineRunning = ref(false)
-const startupAutoScanTimer = ref<number | null>(null)
-
-function sleep(ms: number) {
-  return new Promise<void>((resolve) => {
-    window.setTimeout(resolve, ms)
-  })
-}
-
-async function waitUntilIdle(refresh: () => Promise<void>, isRunning: () => boolean) {
-  await refresh()
-  while (isRunning()) {
-    await sleep(700)
-    await refresh()
-  }
-}
-
-async function runStartupAutoScanPipeline() {
-  await runOneClickScanPipeline(async () => await startAutoScanIfEnabled())
-}
-
-function clearStartupAutoScanTimer() {
-  if (startupAutoScanTimer.value === null) return
-  window.clearTimeout(startupAutoScanTimer.value)
-  startupAutoScanTimer.value = null
-}
-
-function scheduleStartupAutoScanPipeline(delayMs = startupAutoScanDelayMs) {
-  clearStartupAutoScanTimer()
-  startupAutoScanTimer.value = window.setTimeout(() => {
-    startupAutoScanTimer.value = null
-    void runStartupAutoScanPipeline()
-  }, Math.max(0, delayMs))
-}
-
-async function runOneClickScanPipeline(
-  startCollectPhase: () => Promise<boolean>,
+function openDialog(
+  kind: string,
+  title: string,
+  id?: number,
+  parentId?: number | null,
 ) {
-  if (startupAutoScanPipelineRunning.value) return
-  startupAutoScanPipelineRunning.value = true
+  draft.value = "";
+  targetFolder.value = null;
+  dialog.value = { kind, title, id, parentId };
+}
+async function saveDialog() {
+  const d = dialog.value;
+  if (!d) return;
   try {
-    await refreshBackgroundScanStatus()
-    if (isBackgroundScanRunning.value) {
-      await stopScanAllFolders()
-      await waitUntilIdle(refreshBackgroundScanStatus, () => isBackgroundScanRunning.value)
-    }
-
-    let started = await startCollectPhase()
-    if (!started) {
-      await waitUntilIdle(refreshBackgroundScanStatus, () => isBackgroundScanRunning.value)
-      started = await startCollectPhase()
-      if (!started) return
-    }
-
-    await waitUntilIdle(refreshBackgroundScanStatus, () => isBackgroundScanRunning.value)
-    await startThumbnailGeneration()
-    await waitUntilIdle(refreshThumbnailGenerationStatus, () => isThumbnailGenerationRunning.value)
-
-    await startNaturalLanguageScan()
-    await waitUntilIdle(refreshNaturalLanguageScanStatus, () => isNaturalLanguageScanRunning.value)
-
-    await startAtmosphereGeneration()
-    await waitUntilIdle(refreshAtmosphereGenerationStatus, () => isAtmosphereGenerationRunning.value)
-
-    await startColorSignatureGeneration()
-    await waitUntilIdle(refreshColorSignatureGenerationStatus, () => isColorSignatureGenerationRunning.value)
-
-    await startScanAllFolders()
-    await waitUntilIdle(refreshBackgroundScanStatus, () => isBackgroundScanRunning.value)
-  } finally {
-    startupAutoScanPipelineRunning.value = false
+    if (d.kind === "create")
+      await folders.create(draft.value.trim(), d.parentId ?? null);
+    else if (d.kind === "rename" && d.id)
+      await folders.rename(d.id, draft.value.trim());
+    else if (d.kind === "delete" && d.id) {
+      await folders.remove(d.id);
+      if (gallery.query.value.folderId === d.id) await go("all");
+    } else if (d.kind === "rule" && d.id)
+      await invoke("save_user_folder_rule_command", {
+        folderId: d.id,
+        conditions: ruleConditions.value,
+        applyNow: false,
+      });
+    else if (["assign", "move", "remove"].includes(d.kind)) {
+      if (targetFolder.value === null) return;
+      await mutate(d.kind, undefined, { folderId: targetFolder.value });
+    } else if (d.kind === "tags")
+      await mutate("addTags", undefined, {
+        customTags: draft.value
+          .split(/[,，\n]/)
+          .map((t) => t.trim())
+          .filter(Boolean),
+      });
+    else if (d.kind === "systemTrash") await mutate("systemTrash");
+    dialog.value = null;
+    await refresh();
+  } catch (e) {
+    error.value = errorMessage(e);
   }
 }
-
-async function runOneClickScan() {
-  await runOneClickScanPipeline(async () => await startScanAllFoldersCollectOnly())
-}
-
-onUnmounted(() => {
-  clearStartupAutoScanTimer()
-  clearTagManagerDragGhost()
-  clearSidebarHoverCloseTimer()
-  closeFolderRuleDanbooruSuggestions()
-  stopBackgroundScanPolling()
-  stopThumbnailGenerationPolling()
-  stopAtmosphereGenerationPolling()
-  stopColorSignatureGenerationPolling()
-  window.removeEventListener('resize', handleWindowResize)
-  window.removeEventListener('pointermove', moveImageDrag)
-  window.removeEventListener('pointermove', moveFolderPointer)
-  window.removeEventListener('pointermove', trackGlobalPointerPosition)
-  window.removeEventListener('pointerup', finishImageDrag)
-  window.removeEventListener('pointerup', finishFolderPointer)
-  window.removeEventListener('click', closeFolderContextMenu)
-  window.removeEventListener('click', closeImageDetailContextMenu)
-  window.removeEventListener('click', closeGalleryImageContextMenu)
-  window.removeEventListener('click', closeTagManagerTagContextMenu)
-  window.removeEventListener('mouseout', onWindowMouseOut)
-  window.removeEventListener('keydown', handleGlobalKeydown)
-  resetImageDetailUserTagEditor()
-})
-
-watch(sidebarPinned, async (value) => {
-  if (value) sidebarHoverOpen.value = false
-  await nextTick()
-  updateViewportSize()
-})
-
-watch(gallerySidebarsDisabled, (disabled) => {
-  if (!disabled) return
-  sidebarHoverOpen.value = false
-  isLeftSidebarPreheatActive.value = false
-  clearSidebarHoverCloseTimer()
-})
-
-watch(
-  () => activeImageDetailId.value,
-  () => {
-    resetImageDetailUserTagEditor()
-  },
-)
-
-watch(visibleImages, (images) => {
-  if (slideshowOpen.value && images.length === 0) {
-    closeGallerySlideshow()
-  }
-})
-
-watch(
-  () => imageDetailSupplementQuery.value,
-  () => {
-    if (!imageDetailSupplementPickerOpen.value) return
-    queueImageDetailSupplementSuggestions()
-  },
-)
-
-watch(
-  viewMode,
-  () => {
-    saveLastWorkspaceState()
-  },
-)
-
-watch([visibleImages, sidebarPinned], async () => {
-  await nextTick()
-  updateViewportSize()
-})
-
-watch(batchTagDraft, () => {
-  if (!batchTagModalOpen.value) return
-  queueBatchTagSuggestions()
-})
-
-watch(
-  [viewMode, activeUserFolderId, unclassifiedOnlyParentFolderId],
-  async ([nextViewMode, nextFolderId], [prevViewMode, prevFolderId]) => {
-    if (
-      isGalleryBatchMode.value &&
-      (prevViewMode !== nextViewMode || prevFolderId !== nextFolderId || nextViewMode !== 'gallery')
-    ) {
-      exitGalleryBatchMode()
-    }
-
-    const rerunSearchForScopeChange =
-      nextViewMode === 'gallery' && prevFolderId !== nextFolderId && hasAnyActiveSearch()
-    if (rerunSearchForScopeChange) {
-      executeGallerySearch()
-    }
-    if (nextViewMode === 'gallery' && library.value.largeLibraryMode && !rerunSearchForScopeChange) {
-      await resetGalleryImagePage()
-    }
-
-    const prevScopeKey = galleryScrollScopeKeyOf(prevFolderId)
-    const nextScopeKey = galleryScrollScopeKeyOf(nextFolderId)
-
-    if (prevViewMode === 'gallery') {
-      saveGalleryScrollPosition(prevScopeKey)
-    }
-
-    if (nextViewMode === 'gallery') {
-      restoreGalleryScrollPosition(nextScopeKey)
-      await nextTick()
-      updateViewportSize()
-    } else if (nextViewMode === 'settings') {
-      await nextTick()
-      refreshSettingsScrollMetrics()
-    }
-  },
-)
-
-watch(thumbnailCacheEnabled, (enabled) => {
-  if (!enabled) return
-  if (dataDirectoryRestartRequired.value) return
-  if (startupAutoScanPipelineRunning.value) return
-  if (isBackgroundScanRunning.value) return
-  void startThumbnailGeneration()
-})
-
-watch(isBackgroundScanRunning, (running, wasRunning) => {
-  if (!wasRunning || running) return
-  if (dataDirectoryRestartRequired.value) return
-  if (startupAutoScanPipelineRunning.value) return
-  if (!thumbnailCacheEnabled.value) return
-  void startThumbnailGeneration()
-})
-
-async function loadLibrary(options?: { silent?: boolean }) {
-  const silent = Boolean(options?.silent)
-  const begin = performance.now()
-  let assigned = false
-  console.info(`[startup-prof] loadLibrary start_ms=${begin.toFixed(1)} silent=${silent}`)
-  if (!silent) {
-    isLoading.value = true
-    errorText.value = ''
-  }
-
+async function rule(id: number) {
   try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    console.info(`[startup-prof] loadLibrary invoke_start_ms=${performance.now().toFixed(1)} silent=${silent}`)
-    const nextLibrary = await invoke<LibraryStore>('list_library')
-    console.info(
-      `[startup-prof] loadLibrary invoke_return_ms=${performance.now().toFixed(1)} silent=${silent} images=${nextLibrary.images.length}`,
-    )
-    library.value = nextLibrary
-    galleryCurrentQueryTotalCount.value = nextLibrary.totalImageCount || nextLibrary.images.length
-    assigned = true
-    console.info(
-      `[startup-prof] loadLibrary assigned_ms=${performance.now().toFixed(1)} silent=${silent} images=${library.value.images.length}`,
-    )
-    if (
-      library.value.largeLibraryMode &&
-      viewMode.value === 'gallery' &&
-      (activeUserFolderId.value !== 'all' || unclassifiedOnlyParentFolderId.value !== null)
-    ) {
-      await resetGalleryImagePage()
-    }
-    restorePendingWorkspaceState()
-    updateStatus()
-  } catch (error) {
-    if (!silent) {
-      errorText.value = formatError(error)
-    }
-  } finally {
-    console.info(
-      `[startup-prof] loadLibrary total_ms=${(performance.now() - begin).toFixed(1)} silent=${silent}`,
-    )
-    if (!silent) {
-      isLoading.value = false
-    }
-    if (assigned) {
-      console.info(`[startup-prof] loadLibrary post_assign_before_nextTick_ms=${performance.now().toFixed(1)} silent=${silent}`)
-    }
-    await nextTick()
-    if (assigned) {
-      console.info(`[startup-prof] loadLibrary post_assign_after_nextTick_ms=${performance.now().toFixed(1)} silent=${silent}`)
-    }
-    updateViewportSize()
+    const r = await invoke<{ conditions: UserFolderRuleCondition[] } | null>(
+      "get_user_folder_rule_command",
+      { folderId: id },
+    );
+    ruleConditions.value = r?.conditions ?? [];
+    openDialog("rule", "自动分类规则", id);
+  } catch (e) {
+    error.value = errorMessage(e);
   }
 }
-
-async function pickFolder() {
-  if (isPickingFolder.value) return
-  isPickingFolder.value = true
-  errorText.value = ''
-  try {
-    const selected = await open({
-      directory: true,
-      multiple: false,
-      title: '选择图库文件夹',
-    })
-
-    if (typeof selected === 'string') {
-      folderPathInput.value = selected
-      await addFolderByPath(selected)
-    }
-  } finally {
-    isPickingFolder.value = false
-  }
+async function start(kind: string, sourceFolderId: number | null = null) {
+  page.value = "tasks";
+  await jobs.start(kind, preferences.thumbnails.value, sourceFolderId);
 }
-
-async function pickExternalImageSearchFilePath() {
-  const selected = await open({
-    directory: false,
-    multiple: false,
-    title: '选择用于以图搜图的图片',
-    filters: [
-      {
-        name: 'Images',
-        extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'ico'],
-      },
-    ],
-  })
-  return typeof selected === 'string' ? selected : null
+function tagSearch(tag: string) {
+  viewer.value = null;
+  page.value = "gallery";
+  if (!gallery.query.value.tags.includes(tag))
+    gallery.query.value.tags.push(tag);
+  void gallery.search();
 }
-
-async function addFolder() {
-  await addFolderByPath(folderPathInput.value)
+async function unclassified(id: number) {
+  page.value = "gallery";
+  gallery.query.value.folderId = null;
+  gallery.query.value.unclassifiedOnlyParentFolderId = id;
+  await gallery.search();
 }
-
-async function addFolderByPath(rawFolderPath: string) {
-  if (isAddingFolder.value) return
-  errorText.value = ''
-  const normalizedPath = rawFolderPath.trim()
-  if (normalizedPath.length === 0) {
-    errorText.value = '请输入图库文件夹路径'
-    return
-  }
-
-  isAddingFolder.value = true
-  statusText.value = '正在扫描图库...'
-
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    library.value = await invoke<LibraryStore>('add_gallery_folder_command', {
-      folderPath: normalizedPath,
-    })
-    folderPathInput.value = ''
-    updateStatus()
-    statusText.value = '已添加文件夹，正在后台扫描图片...'
-    await startScanAllFoldersCollectOnly()
-  } catch (error) {
-    errorText.value = formatError(error)
-  } finally {
-    isAddingFolder.value = false
-    await nextTick()
-    updateViewportSize()
-  }
-}
-
-async function removeFolder(folderPath: string) {
-  errorText.value = ''
-  isLoading.value = true
-  statusText.value = '正在移除文件夹索引...'
-
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    library.value = await invoke<LibraryStore>('remove_gallery_folder_command', { folderPath })
-    updateStatus()
-  } catch (error) {
-    errorText.value = formatError(error)
-  } finally {
-    isLoading.value = false
-  }
-}
-
-function openRemoveFolderConfirm(folderPath: string) {
-  removeFolderConfirmPath.value = folderPath
-}
-
-function closeRemoveFolderConfirm() {
-  removeFolderConfirmPath.value = null
-}
-
-function closeRemoveFromFolderConfirm() {
-  removeFromFolderConfirmState.value = null
-}
-
-function closeSystemTrashMoveErrorDialog() {
-  systemTrashMoveErrorMessage.value = null
-}
-
-async function confirmRemoveFolder() {
-  const folderPath = removeFolderConfirmPath.value
-  if (!folderPath) return
-  removeFolderConfirmPath.value = null
-  await removeFolder(folderPath)
-}
-
-async function removeImageFromFolderAssignments(imageId: string, targetFolderIds: number[]) {
-  if (targetFolderIds.length === 0) return
-  const { invoke } = await import('@tauri-apps/api/core')
-  if (targetFolderIds.length === 1) {
-    library.value = await invoke<LibraryStore>('remove_image_from_user_folder_command', {
-      imageId,
-      folderId: targetFolderIds[0],
-    })
-    return
-  }
-  let nextLibrary: LibraryStore | null = null
-  for (const folderId of targetFolderIds) {
-    nextLibrary = await invoke<LibraryStore>('remove_images_from_user_folder_command', {
-      imageIds: [imageId],
-      folderId,
-    })
-  }
-  if (nextLibrary) {
-    library.value = nextLibrary
-  }
-}
-
-async function confirmRemoveFromFolder() {
-  const pending = removeFromFolderConfirmState.value
-  if (!pending) return
-  removeFromFolderConfirmState.value = null
-  try {
-    await removeImageFromFolderAssignments(pending.imageId, pending.targetFolderIds)
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-function isEditableKeyboardTarget(event: KeyboardEvent) {
-  const target = event.target as HTMLElement | null
-  if (!target) return false
-  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) return true
-  return target.isContentEditable
-}
-
-function handleGlobalKeydown(event: KeyboardEvent) {
-  if (event.key === 'Escape') {
-    closeFolderContextMenu()
-    closeCreateFolderDraft()
-    cancelUserFolderRename()
-    closeTagManagerPanel()
-    endTagManagerTagDrag()
-    closeTagManagerTagContextMenu()
-    closeImageDetail()
-    closeRemoveFromFolderConfirm()
-    closeGalleryImageContextMenu()
-    cancelImageDrag()
-    clearFolderPress()
-
-    folderPointerState.value = null
-    draggedFolderId.value = null
-    folderDragOverId.value = null
-    return
-  }
-
-  if (event.isComposing || isEditableKeyboardTarget(event)) return
-
-  if (viewMode.value === 'gallery' && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'v') {
-    event.preventDefault()
-    void pasteExternalImageSearchFromClipboard().then((ok) => {
-      if (ok) void executeGallerySearch()
-    })
-    return
-  }
-}
-
-function guessImageMimeTypeFromName(fileName: string) {
-  const ext = fileName.split('.').pop()?.toLowerCase() ?? ''
-  if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg'
-  if (ext === 'png') return 'image/png'
-  if (ext === 'webp') return 'image/webp'
-  if (ext === 'gif') return 'image/gif'
-  if (ext === 'bmp') return 'image/bmp'
-  if (ext === 'avif') return 'image/avif'
-  if (ext === 'heic') return 'image/heic'
-  if (ext === 'heif') return 'image/heif'
-  return 'application/octet-stream'
-}
-
-function isImageDragFile(file: File) {
-  if (file.type.startsWith('image/')) return true
-  return guessImageMimeTypeFromName(file.name).startsWith('image/')
-}
-
-function updateStatus() {
-  const imageCount = library.value.images.length
-  const folderCount = library.value.folders.length
-  statusText.value =
-    imageCount > 0 ? `${imageCount} 张图片，来自 ${folderCount} 个图库文件夹` : '还没有添加图库文件夹'
-}
-
-function handleWindowResize() {
-  updateViewportSize()
-  refreshSettingsScrollMetrics()
-  void refreshWindowMaximized()
-}
-
-async function refreshWindowMaximized() {
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    isWindowMaximized.value = await invoke<boolean>('window_is_maximized_command')
-  } catch {
-    isWindowMaximized.value = false
-  }
-}
-
-async function refreshWindowAlwaysOnTop() {
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    isWindowAlwaysOnTop.value = await invoke<boolean>('window_is_always_on_top_command')
-  } catch {
-    isWindowAlwaysOnTop.value = false
-  }
-}
-
-function showTitlebarByHotspot() {
-  if (isWindowMaximized.value || autoHideTitlebarInWindowMode.value) {
-    isTitlebarHovered.value = true
-  }
-}
-
-function onTitlebarMouseEnter() {
-  if (isWindowMaximized.value || autoHideTitlebarInWindowMode.value) {
-    isTitlebarHovered.value = true
-  }
-}
-
-function onTitlebarMouseLeave(event: MouseEvent) {
-  if (!(isWindowMaximized.value || autoHideTitlebarInWindowMode.value)) return
-  const nextTarget = event.relatedTarget
-  if (!nextTarget) {
-    // Keep titlebar visible when cursor leaves the app window entirely.
-    return
-  }
-  isTitlebarHovered.value = false
-}
-
-async function minimizeWindow() {
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    await invoke('window_minimize_command')
-  } catch {}
-}
-
-async function toggleWindowAlwaysOnTop() {
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    isWindowAlwaysOnTop.value = await invoke<boolean>('window_toggle_always_on_top_command')
-  } catch {}
-}
-
-async function toggleWindowMaximize() {
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    const maximized = await invoke<boolean>('window_toggle_maximize_command')
-    isWindowMaximized.value = maximized
-    if (!maximized) {
-      isTitlebarHovered.value = true
-    } else if (!isTitlebarHovered.value) {
-      isTitlebarHovered.value = false
-    }
-  } catch {}
-}
-
-async function startWindowDrag(event: PointerEvent) {
-  if (event.button !== 0) return
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    await invoke('window_start_dragging_command')
-  } catch {}
-}
-
-function isTitlebarControlTarget(target: EventTarget | null) {
-  if (!(target instanceof Element)) return false
-  return Boolean(target.closest('.app-titlebar__right, .app-titlebar__button'))
-}
-
-function onTitlebarPointerDown(event: PointerEvent) {
-  if (isTitlebarControlTarget(event.target)) return
-  void startWindowDrag(event)
-}
-
-function onTitlebarDoubleClick(event: MouseEvent) {
-  if (event.button !== 0) return
-  if (isTitlebarControlTarget(event.target)) return
-  void toggleWindowMaximize()
-}
-
-async function closeWindow() {
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    await invoke('window_close_command')
-    return
-  } catch {}
-
-  try {
-    const { getCurrentWindow } = await import('@tauri-apps/api/window')
-    await getCurrentWindow().close()
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-function openSidebarByHover() {
-  clearSidebarHoverCloseTimer()
-  if (isSettingsView.value) return
-  if (gallerySidebarsDisabled.value) return
-  if (!sidebarPinned.value) sidebarHoverOpen.value = true
-}
-
-function trackGlobalPointerPosition(event: PointerEvent) {
-  lastPointerPosition.value = {
-    x: event.clientX,
-    y: event.clientY,
-    at: performance.now(),
-  }
-  recoverSidebarsFromPointerPosition()
-}
-
-function recoverSidebarsFromPointerPosition() {
-  if (isSearchFocused.value || isSearchPointerInside.value) return
-  if (gallerySidebarsDisabled.value) {
-    isLeftSidebarPreheatActive.value = false
-    return
-  }
-  const pointer = lastPointerPosition.value
-  if (!pointer || performance.now() - pointer.at > sidebarPointerUseMaxAgeMs) return
-  isLeftSidebarPreheatActive.value = isPointInsideLeftSidebarPreheatZone(pointer.x)
-  if (isPointInsideLeftSidebarTriggerZone(pointer.x)) {
-    openSidebarByHover()
-  }
-}
-
-function isPointInsideLeftSidebarPreheatZone(x: number) {
-  return x >= 0 && x <= sidebarPreheatZoneWidth
-}
-
-function isPointInsideLeftSidebarTriggerZone(x: number) {
-  return x >= 0 && x <= sidebarTriggerZoneWidth
-}
-
-function isPointInsideElement(selector: string, x: number, y: number) {
-  const element = document.querySelector(selector)
-  if (!(element instanceof HTMLElement)) return false
-  const rect = element.getBoundingClientRect()
-  if (rect.width <= 0 || rect.height <= 0) return false
-  return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
-}
-
-function isPointerInsideAnyElement(selectors: string[]) {
-  const pointer = lastPointerPosition.value
-  if (!pointer || performance.now() - pointer.at > sidebarPointerUseMaxAgeMs) return false
-  return selectors.some((selector) => isPointInsideElement(selector, pointer.x, pointer.y))
-}
-
-function closeSidebarByHover() {
-  clearSidebarHoverCloseTimer()
-  sidebarHoverCloseTimer.value = window.setTimeout(() => {
-    sidebarHoverCloseTimer.value = null
-    if (performance.now() < sidebarHoverCloseHoldUntil.value) return
-    if (
-      !sidebarPinnedEffective.value &&
-      !folderDraft.value &&
-      !isComposingFolderName.value &&
-      renamingUserFolderId.value === null &&
-      !isComposingUserFolderRename.value &&
-      draggedFolderId.value === null &&
-      !isSidebarHoverSafeAreaActive()
-    ) {
-      sidebarHoverOpen.value = false
-      closeFolderContextMenu()
-    }
-  }, 90)
-}
-
-function clearSidebarHoverCloseTimer() {
-  if (sidebarHoverCloseTimer.value === null) return
-  window.clearTimeout(sidebarHoverCloseTimer.value)
-  sidebarHoverCloseTimer.value = null
-}
-
-function isSidebarHoverSafeAreaActive() {
-  const pointer = lastPointerPosition.value
-  return (
-    Boolean(pointer && performance.now() - pointer.at <= sidebarPointerUseMaxAgeMs && isPointInsideLeftSidebarPreheatZone(pointer.x)) ||
-    isPointerInsideAnyElement(['.sidebar', '.sidebar-hotspot'])
-  )
-}
-
-function onWindowMouseOut(event: MouseEvent) {
-  if (event.relatedTarget) return
-  lastPointerPosition.value = null
-  isLeftSidebarPreheatActive.value = false
-  closeSidebarByHover()
-}
-
-function openSettings() {
-    closeTagManagerPanel()
-    closeTagManagerTagContextMenu()
-    viewMode.value = 'settings'
-  sidebarHoverOpen.value = false
-}
-
-function openTagManagerPanel(tab: 'custom' | 'dict' = 'custom') {
-  viewMode.value = 'gallery'
-  setSuppressGallerySearch(true)
-  void openTagManager(tab)
-}
-
-function closeTagManagerPanel() {
-  closeTagManager()
-  setSuppressGallerySearch(false)
-}
-
-function isDictionaryTagInSearch(tagEn: string) {
-  return searchZhSelected.value.some((tag) => tag.tagEn === tagEn)
-}
-
-function addDictionaryTagToSearch(tag: { tagEn: string; tagZh?: string | null; imageCount: number }) {
-  if (isDictionaryTagInSearch(tag.tagEn)) {
-    removeSearchZhSuggestion(tag.tagEn)
-    return
-  }
-  selectSearchZhSuggestion({
-    tagEn: tag.tagEn,
-    tagZh: tag.tagZh ?? null,
-    imageCount: tag.imageCount,
-    isUserCustom: false,
-  })
-}
-
-function hideSearchPanel() {
-  hideSearchPanelByState()
-}
-
-function setNewFolderName(value: string) {
-  newFolderName.value = value
-}
-
-function setComposingFolderName(value: boolean) {
-  isComposingFolderName.value = value
-}
-
-function canEditFolderRule(folderId: number) {
-  const folder = folderTree.value.find((item) => item.id === folderId)
-  if (!folder) return false
-  return !folder.hasChildren
-}
-
-function createEmptyFolderRuleCondition(): FolderRuleConditionDraft {
-  const id = folderRuleSeed.value++
-  return {
+const drag = ref<{
+  id: string;
+  startX: number;
+  startY: number;
+  x: number;
+  y: number;
+  active: boolean;
+  target: number | null;
+} | null>(null);
+let dragTimer: ReturnType<typeof setTimeout> | undefined,
+  suppressOpen = false;
+function beginDrag(id: string, e: PointerEvent) {
+  if (e.button !== 0 || selection.active.value) return;
+  drag.value = {
     id,
-    logic: 'AND',
-    source: 'danbooru',
-    keyword: '',
+    startX: e.clientX,
+    startY: e.clientY,
+    x: e.clientX,
+    y: e.clientY,
+    active: false,
+    target: null,
+  };
+  dragTimer = setTimeout(() => {
+    if (drag.value) drag.value.active = true;
+  }, 160);
+}
+function dragMove(e: PointerEvent) {
+  const d = drag.value;
+  if (!d) return;
+  d.x = e.clientX;
+  d.y = e.clientY;
+  if (!d.active && Math.hypot(e.clientX - d.startX, e.clientY - d.startY) > 8) {
+    clearTimeout(dragTimer);
+    drag.value = null;
+    return;
+  }
+  if (d.active) {
+    e.preventDefault();
+    suppressOpen = true;
+    if (e.clientX < 65) drawer.value = true;
+    const target = document
+      .elementFromPoint(e.clientX, e.clientY)
+      ?.closest<HTMLElement>("[data-folder-id]");
+    d.target = target ? Number(target.dataset.folderId) : null;
   }
 }
-
-function clearFolderRuleDanbooruSuggestionTimer() {
-  if (folderRuleDanbooruSuggestTimer.value === null) return
-  window.clearTimeout(folderRuleDanbooruSuggestTimer.value)
-  folderRuleDanbooruSuggestTimer.value = null
-}
-
-function closeFolderRuleDanbooruSuggestions() {
-  clearFolderRuleDanbooruSuggestionTimer()
-  folderRuleDanbooruActiveConditionId.value = null
-  folderRuleDanbooruSuggestLoading.value = false
-  folderRuleDanbooruSuggestions.value = []
-}
-
-async function refreshFolderRuleDanbooruSuggestions(conditionId: number, keyword: string) {
-  const normalized = keyword.trim()
-  if (!normalized) {
-    folderRuleDanbooruSuggestions.value = []
-    folderRuleDanbooruSuggestLoading.value = false
-    return
-  }
-  const token = folderRuleDanbooruSuggestToken.value + 1
-  folderRuleDanbooruSuggestToken.value = token
-  folderRuleDanbooruSuggestLoading.value = true
-  try {
-    const rows = await suggestKnownAutoTagsForInput(normalized, 24, { includeDictionary: true })
-    if (token !== folderRuleDanbooruSuggestToken.value) return
-    if (folderRuleDanbooruActiveConditionId.value !== conditionId) return
-    folderRuleDanbooruSuggestions.value = rows
-  } catch (error) {
-    if (token !== folderRuleDanbooruSuggestToken.value) return
-    folderRuleDanbooruSuggestions.value = []
-    errorText.value = formatError(error)
-  } finally {
-    if (token === folderRuleDanbooruSuggestToken.value) {
-      folderRuleDanbooruSuggestLoading.value = false
-    }
-  }
-}
-
-function queueFolderRuleDanbooruSuggestions(conditionId: number, keyword: string) {
-  folderRuleDanbooruActiveConditionId.value = conditionId
-  clearFolderRuleDanbooruSuggestionTimer()
-  const normalized = keyword.trim()
-  if (!normalized) {
-    folderRuleDanbooruSuggestions.value = []
-    folderRuleDanbooruSuggestLoading.value = false
-    return
-  }
-  folderRuleDanbooruSuggestTimer.value = window.setTimeout(() => {
-    folderRuleDanbooruSuggestTimer.value = null
-    void refreshFolderRuleDanbooruSuggestions(conditionId, normalized)
-  }, 120)
-}
-
-function onFolderRuleConditionSourceChange(condition: FolderRuleConditionDraft) {
-  condition.keyword = ''
-  if (condition.source !== 'danbooru' && folderRuleDanbooruActiveConditionId.value === condition.id) {
-    closeFolderRuleDanbooruSuggestions()
-  }
-}
-
-function onFolderRuleDanbooruKeywordInput(condition: FolderRuleConditionDraft, value: string) {
-  condition.keyword = value.trim()
-  queueFolderRuleDanbooruSuggestions(condition.id, condition.keyword)
-}
-
-function focusFolderRuleDanbooruCondition(condition: FolderRuleConditionDraft) {
-  folderRuleDanbooruActiveConditionId.value = condition.id
-  queueFolderRuleDanbooruSuggestions(condition.id, condition.keyword)
-}
-
-function scheduleCloseFolderRuleDanbooruSuggestions() {
-  window.setTimeout(() => {
-    if (!folderRuleEditor.value) return
-    closeFolderRuleDanbooruSuggestions()
-  }, 120)
-}
-
-function selectFolderRuleDanbooruSuggestion(condition: FolderRuleConditionDraft, suggestion: KnownAutoTagSuggestion) {
-  condition.keyword = suggestion.tagEn
-  closeFolderRuleDanbooruSuggestions()
-}
-
-function addFolderRuleCondition() {
-  if (!folderRuleEditor.value) return
-  folderRuleEditor.value = {
-    ...folderRuleEditor.value,
-    conditions: [
-      ...folderRuleEditor.value.conditions,
-      createEmptyFolderRuleCondition(),
-    ],
-  }
-}
-
-function removeFolderRuleCondition(conditionId: number) {
-  if (!folderRuleEditor.value) return
-  folderRuleEditor.value = {
-    ...folderRuleEditor.value,
-    conditions: folderRuleEditor.value.conditions.filter((item) => item.id !== conditionId),
-  }
-  if (folderRuleDanbooruActiveConditionId.value === conditionId) {
-    closeFolderRuleDanbooruSuggestions()
-  }
-}
-
-function closeFolderRuleEditor() {
-  closeFolderRuleDanbooruSuggestions()
-  folderRuleEditor.value = null
-}
-
-async function openFolderRuleEditor(folderId: number) {
-  if (!canEditFolderRule(folderId)) {
-    errorText.value = '仅最小层级文件夹支持编辑规则'
-    closeFolderContextMenu()
-    return
-  }
-  try {
-    await reloadTagManagementState()
-    const folder = folderTree.value.find((item) => item.id === folderId)
-    if (!folder) return
-    const { invoke } = await import('@tauri-apps/api/core')
-    const raw = await invoke<Record<string, unknown> | null>('get_user_folder_rule_command', {
-      folderId,
-    })
-    const loadedConditionsRaw = Array.isArray(raw?.conditions) ? raw?.conditions : []
-    const loadedConditions = loadedConditionsRaw
-      .map((item) => {
-        const logicRaw = String((item as Record<string, unknown>).logic ?? 'AND').toUpperCase()
-        const sourceRaw = String((item as Record<string, unknown>).source ?? 'danbooru').toLowerCase()
-        const keyword = String((item as Record<string, unknown>).keyword ?? '').trim()
-        const logic = logicRaw === 'OR' || logicRaw === 'NOT' ? logicRaw : 'AND'
-        const source = sourceRaw === 'custom' || sourceRaw === 'filename' ? sourceRaw : 'danbooru'
-        if (!keyword) return null
-        return {
-          id: folderRuleSeed.value++,
-          logic: logic as FolderRuleConditionDraft['logic'],
-          source: source as FolderRuleConditionDraft['source'],
-          keyword,
-        }
-      })
-      .filter((item): item is FolderRuleConditionDraft => Boolean(item))
-    folderRuleEditor.value = {
-      folderId,
-      folderName: folder.name,
-      conditions: loadedConditions.length > 0 ? loadedConditions : [createEmptyFolderRuleCondition()],
-    }
-    closeFolderContextMenu()
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-async function saveFolderRuleDraft(applyNow: boolean) {
-  if (!folderRuleEditor.value) return
-  try {
-    const payload = folderRuleEditor.value.conditions.map((condition) => ({
-      logic: condition.logic,
-      source: condition.source,
-      keyword: condition.keyword.trim(),
-    }))
-    const { invoke } = await import('@tauri-apps/api/core')
-    library.value = await invoke<LibraryStore>('save_user_folder_rule_command', {
-      folderId: folderRuleEditor.value.folderId,
-      conditions: payload,
-      applyNow,
-    })
-    statusText.value = applyNow
-      ? `已保存规则并立即应用：${folderRuleEditor.value.folderName}`
-      : `已保存规则：${folderRuleEditor.value.folderName}`
-    closeFolderRuleEditor()
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-async function deleteFolderRuleDraft() {
-  if (!folderRuleEditor.value) return
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    library.value = await invoke<LibraryStore>('save_user_folder_rule_command', {
-      folderId: folderRuleEditor.value.folderId,
-      conditions: [],
-      applyNow: false,
-    })
-    statusText.value = `已删除规则：${folderRuleEditor.value.folderName}`
-    closeFolderRuleEditor()
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-function openGalleryImageMenu(item: GalleryLayoutItem, event: MouseEvent) {
-  openGalleryImageMenuState(item, event)
-}
-
-function openGalleryImageDetailFromGallery(item: GalleryLayoutItem) {
-  if (galleryImageContextMenu.value) {
-    closeGalleryImageContextMenu()
-    return
-  }
-  openGalleryImageDetail(item)
-}
-
-function openGalleryBatchModeFromContextMenu(imageId: string) {
-  enterGalleryBatchMode(imageId)
-  closeGalleryImageContextMenu()
-}
-
-function openImageDetailMenu(event: MouseEvent) {
-  openImageDetailMenuState(event, Boolean(activeImageDetail.value))
-}
-
-function resetImageDetailMediaTransform() {
-  imageDetailMediaScale.value = 1
-  imageDetailMediaPan.value = { x: 0, y: 0 }
-  imageDetailMediaDrag.value = null
-}
-
-function zoomImageDetailMedia(event: WheelEvent) {
-  if (!activeImageDetail.value) return
-  event.preventDefault()
-  closeImageDetailContextMenu()
-  const nextScale = clamp(
-    imageDetailMediaScale.value * (event.deltaY < 0 ? 1.12 : 0.88),
-    1,
-    8,
-  )
-  imageDetailMediaScale.value = nextScale
-  if (nextScale === 1) {
-    imageDetailMediaPan.value = { x: 0, y: 0 }
-  }
-}
-
-function startImageDetailMediaDrag(event: PointerEvent) {
-  if (event.button !== 0 || imageDetailMediaScale.value <= 1) return
-  event.preventDefault()
-  closeImageDetailContextMenu()
-  imageDetailMediaDrag.value = {
-    pointerId: event.pointerId,
-    startX: event.clientX,
-    startY: event.clientY,
-    panX: imageDetailMediaPan.value.x,
-    panY: imageDetailMediaPan.value.y,
-  }
-  ;(event.currentTarget as HTMLElement | null)?.setPointerCapture?.(event.pointerId)
-}
-
-function moveImageDetailMediaDrag(event: PointerEvent) {
-  const drag = imageDetailMediaDrag.value
-  if (!drag || drag.pointerId !== event.pointerId) return
-  imageDetailMediaPan.value = {
-    x: drag.panX + event.clientX - drag.startX,
-    y: drag.panY + event.clientY - drag.startY,
-  }
-}
-
-function finishImageDetailMediaDrag(event: PointerEvent) {
-  const drag = imageDetailMediaDrag.value
-  if (!drag || drag.pointerId !== event.pointerId) return
-  imageDetailMediaDrag.value = null
-  ;(event.currentTarget as HTMLElement | null)?.releasePointerCapture?.(event.pointerId)
-}
-
-async function openGalleryImageWithDefaultApp(imageId: string) {
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    await invoke('open_gallery_image_with_default_app_command', { imageId })
-  } catch (error) {
-    errorText.value = formatError(error)
-  } finally {
-    imageDetailContextMenu.value = null
-    closeGalleryImageContextMenu()
-  }
-}
-
-async function exportGalleryImage(imageId: string) {
-  const image = library.value.images.find((entry) => entry.id === imageId)
-  const destination = await save({
-    title: '导出图片',
-    defaultPath: image?.fileName ?? `${imageId}.png`,
-  })
-  if (!destination || Array.isArray(destination)) return
-
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    await invoke('export_gallery_image_command', {
-      imageId,
-      destination,
-    })
-  } catch (error) {
-    errorText.value = formatError(error)
-  } finally {
-    imageDetailContextMenu.value = null
-    closeGalleryImageContextMenu()
-  }
-}
-
-async function removeGalleryImageFromIndex(imageId: string) {
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    library.value = await invoke<LibraryStore>('remove_image_from_index_command', {
-      imageId,
-    })
-    await refreshGalleryAfterImagesRemoved([imageId])
-    if (activeImageDetailId.value === imageId) {
-      closeImageDetail()
-    }
-  } catch (error) {
-    errorText.value = formatError(error)
-  } finally {
-    imageDetailContextMenu.value = null
-    closeGalleryImageContextMenu()
-  }
-}
-
-async function restoreGalleryImageFromTrash(imageId: string) {
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    library.value = await invoke<LibraryStore>('restore_image_from_trash_command', {
-      imageId,
-    })
-    await refreshGalleryAfterImagesRemoved([imageId])
-    if (activeImageDetailId.value === imageId) {
-      closeImageDetail()
-    }
-  } catch (error) {
-    errorText.value = formatError(error)
-  } finally {
-    imageDetailContextMenu.value = null
-    closeGalleryImageContextMenu()
-  }
-}
-
-async function moveGalleryImageToSystemTrash(imageId: string) {
-  systemTrashMoveErrorMessage.value = null
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    library.value = await invoke<LibraryStore>('move_image_to_system_trash_command', {
-      imageId,
-    })
-    await refreshGalleryAfterImagesRemoved([imageId])
-    if (activeImageDetailId.value === imageId) {
-      closeImageDetail()
-    }
-  } catch (error) {
-    const message = formatError(error)
-    errorText.value = message
-    systemTrashMoveErrorMessage.value = message
-  } finally {
-    imageDetailContextMenu.value = null
-    closeGalleryImageContextMenu()
-  }
-}
-
-async function toggleGalleryImageFavorite(imageId: string, favorite: boolean) {
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    library.value = await invoke<LibraryStore>('toggle_image_favorite_command', {
-      imageId,
-      favorite,
-    })
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-async function favoriteGalleryImageFromDetailMenu(imageId: string) {
-  await toggleGalleryImageFavorite(imageId, true)
-  imageDetailContextMenu.value = null
-}
-
-async function removeGalleryImageFromFolder(imageId: string) {
-  if (typeof activeUserFolderId.value !== 'number') return
-  try {
-    const currentFolderId = activeUserFolderId.value
-    const childrenByParent = new Map<number, number[]>()
-    for (const folder of library.value.userFolders) {
-      if (folder.parentId == null) continue
-      const list = childrenByParent.get(folder.parentId) ?? []
-      list.push(folder.id)
-      childrenByParent.set(folder.parentId, list)
-    }
-
-    const scopedFolderIds = new Set<number>()
-    const stack = [currentFolderId]
-    while (stack.length > 0) {
-      const folderId = stack.pop()!
-      if (scopedFolderIds.has(folderId)) continue
-      scopedFolderIds.add(folderId)
-      for (const childId of childrenByParent.get(folderId) ?? []) {
-        stack.push(childId)
-      }
-    }
-
-    const assignedFolderIds = new Set(
-      library.value.imageFolders
-        .filter((assignment) => assignment.imageId === imageId && scopedFolderIds.has(assignment.folderId))
-        .map((assignment) => assignment.folderId),
-    )
-    if (assignedFolderIds.size === 0) return
-
-    const descendantFolderIds = [...assignedFolderIds].filter((folderId) => folderId !== currentFolderId)
-    if (descendantFolderIds.length > 0) {
-      const folderNameById = new Map(library.value.userFolders.map((folder) => [folder.id, folder.name]))
-      const names = descendantFolderIds
-        .map((folderId) => folderNameById.get(folderId))
-        .filter((name): name is string => Boolean(name))
-      const preview = names.slice(0, 3).join('、')
-      const more = names.length > 3 ? ` 等${names.length}个子文件夹` : ''
-      const folderText = preview || `共${descendantFolderIds.length}个子文件夹`
-      removeFromFolderConfirmState.value = {
-        imageId,
-        targetFolderIds: [...assignedFolderIds],
-        message: `此操作将从子文件夹 ${folderText}${more} 中移除该图片，是否继续？`,
-      }
-      return
-    }
-
-    await removeImageFromFolderAssignments(imageId, [...assignedFolderIds])
-  } catch (error) {
-    errorText.value = formatError(error)
-  } finally {
-    imageDetailContextMenu.value = null
-    closeGalleryImageContextMenu()
-  }
-}
-
-async function copyGalleryImageToClipboard(imageId: string) {
-  try {
-    await copyImageToSystemClipboard(imageId)
-  } catch (error) {
-    errorText.value = buildClipboardCopyErrorText(error, '图库复制')
-  } finally {
-    imageDetailContextMenu.value = null
-    closeGalleryImageContextMenu()
-  }
-}
-
-function resetImageDetailUserTagEditor() {
-  imageDetailCustomTagDraft.value = ''
-  imageDetailCustomTagEditorOpen.value = false
-  imageDetailCustomTagConflict.value = null
-  imageDetailCustomTagExpandedFolderIds.value = []
-  imageDetailCustomTagSelectedExistingTags.value = []
-  imageDetailSupplementPickerOpen.value = false
-  imageDetailSupplementQuery.value = ''
-  imageDetailSupplementSuggestions.value = []
-  imageDetailSupplementSuggestLoading.value = false
-  if (imageDetailSupplementSuggestTimer.value !== null) {
-    window.clearTimeout(imageDetailSupplementSuggestTimer.value)
-    imageDetailSupplementSuggestTimer.value = null
-  }
-}
-
-function openImageDetailCustomTagEditor() {
-  imageDetailCustomTagEditorOpen.value = true
-  imageDetailCustomTagDraft.value = ''
-  imageDetailCustomTagExpandedFolderIds.value = []
-  imageDetailCustomTagSelectedExistingTags.value = []
-  void reloadTagManagementState()
-}
-
-function cancelImageDetailCustomTagEditor() {
-  imageDetailCustomTagEditorOpen.value = false
-  imageDetailCustomTagDraft.value = ''
-  imageDetailCustomTagExpandedFolderIds.value = []
-  imageDetailCustomTagSelectedExistingTags.value = []
-}
-
-function isImageDetailTagFolderExpanded(folderId: number) {
-  return imageDetailCustomTagExpandedFolderIds.value.includes(folderId)
-}
-
-function toggleImageDetailTagFolderExpanded(folderId: number) {
-  if (isImageDetailTagFolderExpanded(folderId)) {
-    imageDetailCustomTagExpandedFolderIds.value = imageDetailCustomTagExpandedFolderIds.value.filter((id) => id !== folderId)
-    return
-  }
-  imageDetailCustomTagExpandedFolderIds.value = [...imageDetailCustomTagExpandedFolderIds.value, folderId]
-}
-
-function isImageDetailExistingTagSelected(tagText: string) {
-  return imageDetailCustomTagSelectedExistingTags.value.includes(tagText)
-}
-
-function toggleImageDetailExistingTag(tagText: string) {
-  const normalized = tagText.trim()
-  if (!normalized) return
-  if (isImageDetailExistingTagSelected(normalized)) {
-    imageDetailCustomTagSelectedExistingTags.value = imageDetailCustomTagSelectedExistingTags.value.filter((tag) => tag !== normalized)
-    return
-  }
-  imageDetailCustomTagSelectedExistingTags.value = [...imageDetailCustomTagSelectedExistingTags.value, normalized]
-}
-
-async function submitImageDetailCustomTagDraft() {
-  const imageId = activeImageDetailId.value
-  if (!imageId) return
-  const input = imageDetailCustomTagDraft.value.trim()
-  const selectedTags = Array.from(
-    new Set(imageDetailCustomTagSelectedExistingTags.value.map((tag) => tag.trim()).filter((tag) => tag.length > 0)),
-  )
-  if (!input && selectedTags.length === 0) return
-  try {
-    const matched = input ? await findExactKnownAutoTag(input) : null
-    if (input && matched) {
-      imageDetailCustomTagConflict.value = {
-        input,
-        tagEn: matched.tagEn,
-        tagZh: matched.tagZh ?? null,
-      }
-      imageDetailCustomTagEditorOpen.value = false
-      return
-    }
-    const existingCustomTagSet = new Set(activeImageCustomTags.value.map((tag) => tag.tagText))
-    if (input && !existingCustomTagSet.has(input)) {
-      await addImageUserCustomTag(imageId, input)
-      existingCustomTagSet.add(input)
-    }
-    for (const selectedTag of selectedTags) {
-      if (existingCustomTagSet.has(selectedTag)) continue
-      await addImageUserCustomTag(imageId, selectedTag)
-      existingCustomTagSet.add(selectedTag)
-    }
-    imageDetailCustomTagDraft.value = ''
-    imageDetailCustomTagEditorOpen.value = false
-    imageDetailCustomTagSelectedExistingTags.value = []
-    imageDetailCustomTagExpandedFolderIds.value = []
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-async function resolveImageDetailCustomTagConflict(mode: 'supplement' | 'custom') {
-  const conflict = imageDetailCustomTagConflict.value
-  const imageId = activeImageDetailId.value
-  if (!conflict || !imageId) return
-  try {
-    if (mode === 'supplement') {
-      await addImageUserSupplementTag(imageId, conflict.tagEn, conflict.tagZh)
-    } else {
-      const suffix = '（自定义）'
-      const targetTag = conflict.input.endsWith(suffix) ? conflict.input : `${conflict.input}${suffix}`
-      await addImageUserCustomTag(imageId, targetTag)
-    }
-    imageDetailCustomTagConflict.value = null
-    imageDetailCustomTagDraft.value = ''
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-async function removeImageDetailCustomTag(tagText: string) {
-  const imageId = activeImageDetailId.value
-  if (!imageId) return
-  try {
-    await removeImageUserCustomTag(imageId, tagText)
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-async function removeImageDetailSupplementTag(tagEn: string) {
-  const imageId = activeImageDetailId.value
-  if (!imageId) return
-  try {
-    await removeImageUserSupplementTag(imageId, tagEn)
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-async function refreshImageDetailSupplementSuggestionsNow() {
-  if (!imageDetailSupplementPickerOpen.value) return
-  const keyword = imageDetailSupplementQuery.value.trim()
-  if (!keyword) {
-    imageDetailSupplementSuggestions.value = []
-    imageDetailSupplementSuggestLoading.value = false
-    return
-  }
-  const token = imageDetailSupplementSuggestRequestToken.value + 1
-  imageDetailSupplementSuggestRequestToken.value = token
-  imageDetailSupplementSuggestLoading.value = true
-  try {
-    const rows = await suggestKnownAutoTagsForInput(keyword, 60, { includeDictionary: true })
-    if (token !== imageDetailSupplementSuggestRequestToken.value) return
-    const existing = new Set(activeImageSupplementTags.value.map((item) => item.tagEn))
-    imageDetailSupplementSuggestions.value = rows.filter((item) => !existing.has(item.tagEn))
-  } catch (error) {
-    if (token !== imageDetailSupplementSuggestRequestToken.value) return
-    imageDetailSupplementSuggestions.value = []
-    errorText.value = formatError(error)
-  } finally {
-    if (token === imageDetailSupplementSuggestRequestToken.value) {
-      imageDetailSupplementSuggestLoading.value = false
-    }
-  }
-}
-
-function queueImageDetailSupplementSuggestions() {
-  if (imageDetailSupplementSuggestTimer.value !== null) {
-    window.clearTimeout(imageDetailSupplementSuggestTimer.value)
-    imageDetailSupplementSuggestTimer.value = null
-  }
-  imageDetailSupplementSuggestTimer.value = window.setTimeout(() => {
-    imageDetailSupplementSuggestTimer.value = null
-    void refreshImageDetailSupplementSuggestionsNow()
-  }, 140)
-}
-
-function openImageDetailSupplementPicker() {
-  imageDetailSupplementPickerOpen.value = true
-  imageDetailSupplementQuery.value = ''
-  imageDetailSupplementSuggestions.value = []
-}
-
-function closeImageDetailSupplementPicker() {
-  imageDetailSupplementPickerOpen.value = false
-  imageDetailSupplementQuery.value = ''
-  imageDetailSupplementSuggestions.value = []
-  imageDetailSupplementSuggestLoading.value = false
-}
-
-async function addImageDetailSupplementTag(suggestion: KnownAutoTagSuggestion) {
-  const imageId = activeImageDetailId.value
-  if (!imageId) return
-  try {
-    await addImageUserSupplementTag(imageId, suggestion.tagEn, suggestion.tagZh ?? null)
-    closeImageDetailSupplementPicker()
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-function searchByTagFromImageDetail(tagEn: string, tagZh?: string | null) {
-  searchBySingleTag(tagEn, tagZh ?? null)
-  closeImageDetail()
-}
-
-function formatFileSize(bytes: number) {
-  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB']
-  let value = bytes
-  let unitIndex = 0
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024
-    unitIndex += 1
-  }
-  return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`
-}
-
-function formatTime(timestamp: number) {
-  if (!Number.isFinite(timestamp) || timestamp <= 0) return '--'
-  return new Date(timestamp).toLocaleString('zh-CN')
-}
-
-function closeSidebarByToggle() {
-  sidebarHoverOpen.value = false
-}
-
-function openGallerySlideshow() {
-  if (visibleImages.value.length === 0) return
-  galleryBrowseModeBeforeSlideshow.value =
-    galleryBrowseMode.value === 'carousel' ? 'default' : galleryBrowseMode.value
-  const firstRenderedImageId = renderedLayoutItems.value[0]?.id
-  const firstRenderedIndex = firstRenderedImageId
-    ? visibleImages.value.findIndex((image) => image.id === firstRenderedImageId)
-    : -1
-  slideshowStartIndex.value = firstRenderedIndex >= 0 ? firstRenderedIndex : 0
-  slideshowOpen.value = true
-  galleryBrowseMode.value = 'carousel'
-  sidebarHoverOpen.value = false
-  isLeftSidebarPreheatActive.value = false
-}
-
-function closeGallerySlideshow() {
-  slideshowOpen.value = false
-  galleryBrowseMode.value = galleryBrowseModeBeforeSlideshow.value
-  isLeftSidebarPreheatActive.value = false
-}
-
-function setGalleryBrowseMode(mode: GalleryBrowseMode) {
-  if (mode === 'carousel') {
-    openGallerySlideshow()
-    return
-  }
-  galleryBrowseMode.value = mode
-  if (mode === 'sidebar-disabled') {
-    sidebarHoverOpen.value = false
-    isLeftSidebarPreheatActive.value = false
-  }
-}
-
-function collectMigrationFrontendSettings() {
-  const localStorageSnapshot: Record<string, string> = {}
-  for (let index = 0; index < localStorage.length; index += 1) {
-    const key = localStorage.key(index)
-    if (!key || !key.startsWith('illutag.')) continue
-    const value = localStorage.getItem(key)
-    if (value !== null) {
-      localStorageSnapshot[key] = value
-    }
-  }
-  return {
-    localStorage: localStorageSnapshot,
-  }
-}
-
-function applyMigrationFrontendSettings(settings?: MigrationBackupInspection['frontendSettings']) {
-  const snapshot = settings?.localStorage
-  if (!snapshot || typeof snapshot !== 'object') return
-  for (const [key, value] of Object.entries(snapshot)) {
-    if (!key.startsWith('illutag.')) continue
-    localStorage.setItem(key, String(value))
-  }
-  initAppSettingsFromStorage()
-  initAutoScanOnStartupFromStorage()
-}
-
-async function exportMigrationBackup() {
-  const destination = await save({
-    title: '导出 illuTag 数据迁移备份',
-    defaultPath: `illutag-backup-${new Date().toISOString().slice(0, 10)}.json`,
-    filters: [{ name: 'illuTag 数据备份', extensions: ['json'] }],
-  })
-  if (!destination || Array.isArray(destination)) return
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    await invoke('export_data_migration_backup_command', {
-      destinationPath: destination,
-      frontendSettings: collectMigrationFrontendSettings(),
-    })
-    statusText.value = '数据迁移备份已导出'
-    errorText.value = ''
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-async function importMigrationBackup() {
-  const selected = await open({
-    title: '导入 illuTag 数据迁移备份',
-    multiple: false,
-    filters: [{ name: 'illuTag 数据备份', extensions: ['json'] }],
-  })
-  if (!selected || Array.isArray(selected)) return
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    const inspection = await invoke<MigrationBackupInspection>('inspect_data_migration_backup_command', {
-      backupPath: selected,
-    })
-    const pathMappings: MigrationBackupPathMapping[] = []
-    for (const status of inspection.pathStatuses) {
-      if (status.exists) continue
-      const remapped = await open({
-        title: `选择新图库路径：${status.path}`,
-        directory: true,
-        multiple: false,
-      })
-      if (!remapped || Array.isArray(remapped)) {
-        errorText.value = `已取消导入：缺少路径重映射 ${status.path}`
-        return
-      }
-      pathMappings.push({ from: status.path, to: remapped })
-    }
-    library.value = await invoke<LibraryStore>('import_data_migration_backup_command', {
-      backupPath: selected,
-      pathMappings,
-    })
-    applyMigrationFrontendSettings(inspection.frontendSettings)
-    statusText.value = `已导入备份：${inspection.imageCount} 张图片`
-    errorText.value = ''
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-async function exportOrganizedFolderResult() {
-  const destination = await open({
-    title: '选择整理结果导出目录',
-    directory: true,
-    multiple: false,
-  })
-  if (!destination || Array.isArray(destination)) return
-  try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    const manifest = await invoke<OrganizedExportManifest>('export_organized_folder_result_command', {
-      destinationDir: destination,
-    })
-    statusText.value = `整理结果已导出：${manifest.entries.length} 个文件`
-    errorText.value = ''
-  } catch (error) {
-    errorText.value = formatError(error)
-  }
-}
-
-const settingsViewHandlers = {
-  setSidebarPinned,
-  setAutoHideTitlebarInWindowMode,
-  setThemeMode,
-  setThumbnailCacheEnabled,
-  exportMigrationBackup,
-  importMigrationBackup,
-  exportOrganizedFolderResult,
-  openDataDirectory,
-  migrateDataDirectory,
-  startThumbnailGeneration,
-  pauseThumbnailGeneration,
-  resumeThumbnailGeneration,
-  stopThumbnailGeneration,
-  clearThumbnailCache,
-  rebuildThumbnailCache,
-  startAtmosphereGeneration,
-  pauseAtmosphereGeneration,
-  resumeAtmosphereGeneration,
-  stopAtmosphereGeneration,
-  rebuildAtmosphereSignatureCache,
-  startColorSignatureGeneration,
-  pauseColorSignatureGeneration,
-  resumeColorSignatureGeneration,
-  stopColorSignatureGeneration,
-  rebuildColorSignatureCache,
-  setAutoScanOnStartup,
-  runOneClickScan,
-  startScanAllFolders,
-  pauseScanAllFolders,
-  resumeScanAllFolders,
-  stopScanAllFolders,
-  startNaturalLanguageScan,
-  pauseNaturalLanguageScan,
-  resumeNaturalLanguageScan,
-  stopNaturalLanguageScan,
-  addFolder,
-  pickFolder,
-  setFolderPathInput(value: string) {
-    folderPathInput.value = value
-  },
-  removeFolder: openRemoveFolderConfirm,
-  onSettingsScroll,
-}
-
-const leftSidebarHandlers = {
-  closeHover: closeSidebarByHover,
-  closeByToggle: closeSidebarByToggle,
-  showAllImages,
-  showRandomImages,
-  showFavoriteImages,
-  showUnclassifiedImages,
-  showTrashImages,
-  openTagManager: openTagManagerPanel,
-  openFolderSectionMenu,
-  openFolderMenu,
-  startFolderPointer,
-  onUserFolderRowClick,
-  startUserFolderRename,
-  toggleFolderExpanded,
-  setRenamingUserFolderName,
-  onUserFolderRenameEnter,
-  cancelUserFolderRename,
-  commitUserFolderRename,
-  startComposingUserFolderRename,
-  endComposingUserFolderRename,
-  openSettings,
-  openCreateFolderDraft,
-  canEditFolderRule,
-  openFolderRuleEditor,
-  deleteUserFolder,
-  commitFolderDraft,
-  setNewFolderName,
-  closeCreateFolderDraft,
-  setComposingFolderName,
-}
-
-const galleryViewHandlers = {
-  setGalleryElement,
-  onGalleryScroll,
-  setSearchViewportState,
-  triggerSearchRevealByHotspot,
-  onGalleryWheel,
-  setSearchPointerInside,
-  setSearchFocus,
-  hideSearchPanel,
-  setSearchZhInput,
-  openSearchZhSuggestionPanel,
-  closeSearchZhSuggestionPanelDeferred,
-  selectSearchZhSuggestion,
-  removeSearchZhSuggestion,
-  setSearchEnQuery,
-  setSearchFileNameQuery,
-  setSearchNaturalLanguageQuery,
-  setSearchMode,
-  setExternalImageSearchType,
-  setSearchConfidenceMin,
-  setSearchConfidenceMax,
-  executeGallerySearch,
-  clearExternalImageSearch,
-  clearAllSearchInputs,
-  setExternalImageQueryUrl,
-  pasteExternalImageSearchFromPasteEvent,
-  setExternalImageSearchFromFile,
-  selectExternalImageSearchFile,
-  pasteExternalImageSearchFromClipboard,
-  openSettings,
-  toggleActiveFolderUnclassifiedOnly,
-  scrollGalleryToCurrentTop,
-  startImagePress,
-  clearImagePress,
-  toggleGalleryImageFavorite,
-  openGalleryImageDetail: openGalleryImageDetailFromGallery,
-  openGalleryImageMenu,
-  exitGalleryBatchMode,
-  toggleSelectAllGalleryBatchImages,
-  onGalleryBatchAction,
-  toggleGalleryBatchImageSelection,
-  appendGalleryBatchImageSelection,
-  setGalleryBrowseMode,
-  loadMoreGalleryImages,
-}
-
-function readStoredWorkspaceState(): LastWorkspaceState | null {
-  const raw = localStorage.getItem(lastWorkspaceStateStorageKey)
-  if (!raw) return null
-  try {
-    const parsed = JSON.parse(raw) as Partial<LastWorkspaceState>
-    if (parsed.viewMode !== 'gallery' && parsed.viewMode !== 'settings') {
-      return null
-    }
-    return { viewMode: parsed.viewMode }
-  } catch {
-    return null
-  }
-}
-
-function saveLastWorkspaceState() {
-  localStorage.setItem(lastWorkspaceStateStorageKey, JSON.stringify({ viewMode: viewMode.value }))
-}
-
-function restorePendingWorkspaceState() {
-  if (workspaceRestoreApplied.value) return
-  const state = pendingWorkspaceRestore.value
-  if (!state) return
-  workspaceRestoreApplied.value = true
-  pendingWorkspaceRestore.value = null
-  viewMode.value = state.viewMode
-}
-
-function clamp(value: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, value))
-}
-
-function galleryScrollScopeKeyOf(folderId: number | 'all' | 'random' | 'favorites' | 'unclassified' | 'trash') {
-  if (folderId === 'all') return 'all'
-  if (folderId === 'random') return 'random'
-  if (folderId === 'favorites') return 'favorites'
-  if (folderId === 'unclassified') return 'unclassified'
-  if (folderId === 'trash') return 'trash'
-  return `folder:${folderId}`
-}
-
-function scrollGalleryToCurrentTop() {
-  scrollGalleryToTop(galleryScrollScopeKeyOf(activeUserFolderId.value))
-}
-
-function isPointInsideExternalImageSearchDropZone(x: number, y: number) {
-  const node = document.elementFromPoint(x, y) as HTMLElement | null
-  if (!node) return false
-  return Boolean(node.closest('.gallery-search__lens-drop'))
-}
-
-async function setExternalImageSearchFromGalleryDrag(imageId: string) {
-  return setExternalImageSearchFromGalleryImage(imageId)
-}
-
-function formatError(error: unknown) {
-  return error instanceof Error ? error.message : String(error)
-}
-
-console.info(
-  `[startup-prof] App.vue setup_end_ms=${performance.now().toFixed(1)} duration_ms=${(performance.now() - appSetupStartMs).toFixed(1)}`,
-)
+function dragEnd() {
+  clearTimeout(dragTimer);
+  const d = drag.value;
+  drag.value = null;
+  if (d?.active && d.target !== null)
+    void mutate("assign", [d.id], { folderId: d.target });
+  if (d?.active) setTimeout(() => (suppressOpen = false), 0);
+}
+function openImage(image: GalleryImage) {
+  if (!suppressOpen) viewer.value = image;
+}
+function key(e: KeyboardEvent) {
+  if (e.key !== "Escape" || dialog.value || viewer.value) return;
+  if (drawer.value) {
+    drawer.value = false;
+    e.preventDefault();
+  } else if (selection.active.value) {
+    selection.clear();
+    e.preventDefault();
+  } else if (preferences.immersive.value) preferences.immersive.value = false;
+}
+function windowAction(command: string) {
+  void invoke(command).catch((e) => (error.value = errorMessage(e)));
+}
+onMounted(async () => {
+  window.addEventListener("keydown", key);
+  window.addEventListener("pointermove", dragMove);
+  window.addEventListener("pointerup", dragEnd);
+  window.addEventListener("pointercancel", dragEnd);
+  const b = await refresh();
+  if (b) gallery.adopt(b.page);
+  else await gallery.search();
+  console.info(
+    `[startup-prof] first_screen_ms=${performance.now().toFixed(1)}`,
+  );
+});
+onUnmounted(() => {
+  clearTimeout(dragTimer);
+  window.removeEventListener("keydown", key);
+  window.removeEventListener("pointermove", dragMove);
+  window.removeEventListener("pointerup", dragEnd);
+  window.removeEventListener("pointercancel", dragEnd);
+});
 </script>
-
 <template>
   <div
-    class="app-shell"
+    class="app"
     :class="{
-      'is-sidebar-pinned': sidebarPinnedEffective,
-      'is-gallery-view': viewMode === 'gallery',
-      'is-settings-view': isSettingsView,
-      'is-left-sidebar-preheat-active': isLeftSidebarPreheatActive && !sidebarOpen,
-      'is-titlebar-pinned': isTitlebarPinned,
-      'is-window-maximized': isWindowMaximized,
-      'is-gallery-search-active': isSearchFocused || isSearchPointerInside,
-      'is-gallery-sidebars-disabled': gallerySidebarsDisabled,
-      'theme-light': themeMode === 'light',
-      'theme-dark': themeMode === 'dark',
+      'nav-collapsed': preferences.collapsed.value,
+      immersive: preferences.immersive.value,
+      'drawer-open': drawer,
+      'auto-title': preferences.hideTitle.value,
     }"
   >
-    <div class="app-titlebar-hotspot" @mouseenter="showTitlebarByHotspot" />
-    <header
-      v-if="isTitlebarPinned"
-      class="app-titlebar"
-      @mouseenter="onTitlebarMouseEnter"
-      @mouseleave="onTitlebarMouseLeave"
-      @pointerdown="onTitlebarPointerDown"
-      @dblclick="onTitlebarDoubleClick"
-    >
-      <div class="app-titlebar__left">
-        <span class="app-titlebar__brand">illuTag</span>
-        <span class="app-titlebar__view">
-          {{ viewMode === 'settings' ? '设置' : '图库' }}
-        </span>
-      </div>
+    <header class="titlebar">
       <div
-        class="app-titlebar__drag"
-      />
-      <div class="app-titlebar__right">
-        <button
-          class="app-titlebar__button app-titlebar__button--win app-titlebar__button--pin"
-          :class="{ 'is-active': isWindowAlwaysOnTop }"
-          type="button"
-          :aria-label="isWindowAlwaysOnTop ? '取消置顶' : '窗口置顶'"
-          @click="toggleWindowAlwaysOnTop"
-        >
-          <Pushpin
-            class="app-titlebar__button--pin-icon"
-            theme="outline"
-            :size="14"
-            :fill="['currentColor']"
-            aria-hidden="true"
-          />
-        </button>
-        <button
-          class="app-titlebar__button app-titlebar__button--win app-titlebar__button--minimize"
-          type="button"
-          aria-label="最小化"
-          @click="minimizeWindow"
-        >
-          <span class="app-titlebar__button-icon" aria-hidden="true" />
-        </button>
-        <button
-          class="app-titlebar__button app-titlebar__button--win"
-          :class="isWindowMaximized ? 'app-titlebar__button--restore' : 'app-titlebar__button--maximize'"
-          type="button"
-          :aria-label="isWindowMaximized ? '还原' : '最大化'"
-          @click="toggleWindowMaximize"
-        >
-          <span class="app-titlebar__button-icon" aria-hidden="true" />
-        </button>
-        <button
-          class="app-titlebar__button app-titlebar__button--win app-titlebar__button--close"
-          type="button"
-          aria-label="关闭"
-          @click="closeWindow"
-        >
-          <span class="app-titlebar__button-icon" aria-hidden="true" />
-        </button>
+        class="brand"
+        @pointerdown.self="windowAction('window_start_dragging_command')"
+      >
+        illuTag <small>画廊工作台</small>
       </div>
+      <span class="spacer" data-tauri-drag-region /><button
+        class="window-control"
+        :aria-pressed="pinned"
+        aria-label="窗口置顶"
+        @click="
+          invoke<boolean>('window_toggle_always_on_top_command')
+            .then((v) => (pinned = v))
+            .catch((e) => (error = errorMessage(e)))
+        "
+      >
+        <AppIcon name="pin" :size="16" /></button
+      ><button
+        class="window-control"
+        aria-label="最小化"
+        @click="windowAction('window_minimize_command')"
+      >
+        <AppIcon name="minimize" :size="16" /></button
+      ><button
+        class="window-control"
+        aria-label="最大化或还原"
+        @click="windowAction('window_toggle_maximize_command')"
+      >
+        <AppIcon name="square" :size="14" /></button
+      ><button
+        class="window-control close-control"
+        aria-label="关闭窗口"
+        @click="windowAction('window_close_command')"
+      >
+        <AppIcon name="close" :size="16" />
+      </button>
     </header>
-    <div v-if="!isSettingsView" class="sidebar-hotspot" @mouseenter="openSidebarByHover">
-      <MoreApp class="sidebar-hotspot__icon" theme="outline" :size="15" :fill="['currentColor']" aria-hidden="true" />
-    </div>
-    <LeftSidebar
-      :visible="sidebarOpen"
-      :sidebar-pinned="sidebarPinnedEffective"
-      :view-mode="viewMode"
-      :active-user-folder-id="activeUserFolderId"
-      :tag-manager-open="tagManagerOpen"
-      :tag-manager-tab="tagManagerTab"
-      :folder-tree="folderTree"
-      :image-drag-active="Boolean(dragState)"
-      :folder-drag-over-id="folderDragOverId"
-      :dragged-folder-id="draggedFolderId"
-      :renaming-user-folder-id="renamingUserFolderId"
-      :renaming-user-folder-name="renamingUserFolderName"
-      :folder-context-menu="folderContextMenu"
-      :context-menu-style="contextMenuStyle"
-      :folder-draft="folderDraft"
-      :folder-draft-style="folderDraftStyle"
-      :new-folder-name="newFolderName"
-      :handlers="leftSidebarHandlers"
-    />
-
-    <main
-      class="workspace"
-      :class="{
-        'is-titlebar-pinned': isTitlebarPinned,
-        'is-settings-view': isSettingsView,
-      }"
-    >
-      <Transition name="workspace-switch" mode="out-in">
-        <div :key="workspaceTransitionKey" class="workspace-view">
-          <SettingsView
-            v-if="viewMode === 'settings'"
-            :sidebar-pinned="sidebarPinned"
-            :auto-hide-titlebar-in-window-mode="autoHideTitlebarInWindowMode"
-            :thumbnail-cache-enabled="thumbnailCacheEnabled"
-            :is-thumbnail-generation-running="isThumbnailGenerationRunning"
-            :is-thumbnail-generation-paused="isThumbnailGenerationPaused"
-            :thumbnail-progress-text="thumbnailProgressText"
-            :thumbnail-progress-percent="thumbnailProgressPercent"
-            :thumbnail-recent-errors="thumbnailRecentErrors"
-            :is-atmosphere-generation-running="isAtmosphereGenerationRunning"
-            :is-atmosphere-generation-paused="isAtmosphereGenerationPaused"
-            :atmosphere-progress-text="atmosphereProgressText"
-            :atmosphere-progress-percent="atmosphereProgressPercent"
-            :atmosphere-recent-errors="atmosphereRecentErrors"
-            :is-color-signature-generation-running="isColorSignatureGenerationRunning"
-            :is-color-signature-generation-paused="isColorSignatureGenerationPaused"
-            :color-signature-progress-text="colorSignatureProgressText"
-            :color-signature-progress-percent="colorSignatureProgressPercent"
-            :color-signature-recent-errors="colorSignatureRecentErrors"
-            :auto-scan-on-startup="autoScanOnStartup"
-            :is-one-click-scan-running="startupAutoScanPipelineRunning"
-            :is-background-scan-running="isBackgroundScanRunning"
-            :is-background-scan-paused="isBackgroundScanPaused"
-            :scan-progress-text="scanProgressText"
-            :scan-recent-errors="scanRecentErrors"
-            :is-natural-language-scan-running="isNaturalLanguageScanRunning"
-            :is-natural-language-scan-paused="isNaturalLanguageScanPaused"
-            :natural-language-scan-progress-text="naturalLanguageScanProgressText"
-            :natural-language-scan-recent-errors="naturalLanguageScanRecentErrors"
-            :theme-mode="themeMode"
-            :app-version="currentAppVersion"
-            :data-directory-path="dataDirectoryInfo?.dataDir ?? ''"
-            :data-directory-warning="dataDirectoryWarningText"
-            :is-migrating-data-directory="isMigratingDataDirectory"
-            :data-directory-restart-required="dataDirectoryRestartRequired"
-            :folder-path-input="folderPathInput"
-            :is-picking-folder="isPickingFolder"
-            :is-adding-folder="isAddingFolder"
-            :is-loading="isLoading"
-            :error-text="errorText"
-            :folders="library.folders"
-            :handlers="settingsViewHandlers"
-          />
-
-          <GalleryView
-            v-else
-            :visible-images="visibleImages"
-            :search-panel-style="searchPanelStyle"
-            :search-reveal-mode="searchRevealMode"
-            :is-search-focused="isSearchFocused"
-            :search-zh-input="searchZhInput"
-            :search-zh-selected="searchZhSelected"
-            :search-zh-suggestions="searchZhSuggestions"
-            :search-zh-open="searchZhOpen"
-            :search-en-query="searchEnQuery"
-            :search-file-name-query="searchFileNameQuery"
-            :search-natural-language-query="searchNaturalLanguageQuery"
-            :search-mode="searchMode"
-            :external-image-search-type="externalImageSearchType"
-            :external-image-query-url="externalImageQueryUrl"
-            :external-image-query-preview-url="externalImageQueryPreviewUrl"
-            :external-image-query-label="externalImageQueryLabel"
-            :search-confidence-min="searchConfidenceMin"
-            :search-confidence-max="searchConfidenceMax"
-            :search-running="searchRunning"
-            :search-error="searchError"
-            :gallery-browse-mode="galleryBrowseMode"
-            :is-loading="isLoading"
-            :large-library-mode="library.largeLibraryMode"
-            :gallery-loaded-image-count="galleryLoadedImageCount"
-            :gallery-total-image-count="galleryTotalImageCount"
-            :can-load-more-gallery-images="canLoadMoreGalleryImages"
-            :is-gallery-page-loading="isGalleryPageLoading"
-            :show-unclassified-toggle="showGalleryUnclassifiedToggle"
-            :is-unclassified-only="isGalleryUnclassifiedOnly"
-            :favorite-image-ids="favoriteVisibleImageIds"
-            :is-batch-mode="isGalleryBatchMode"
-            :is-batch-all-selected="isGalleryBatchAllSelected"
-            :batch-selected-image-ids="galleryBatchSelectedImageIds"
-            :batch-action-labels="galleryBatchActionLabels"
-            :layout-items="renderedLayoutItems"
-            :total-height="totalHeight"
-            :content-width="masonryContentWidth"
-            :drag-state="dragState ? { imageId: dragState.imageId, x: dragState.x, y: dragState.y } : null"
-            :handlers="galleryViewHandlers"
-          />
-        </div>
-      </Transition>
-      <div v-if="showWorkspaceScrollProgress" class="gallery-scroll-progress-indicator" aria-hidden="true">
-        <div class="gallery-scroll-progress-indicator__track">
-          <div
-            class="gallery-scroll-progress-indicator__fill"
-            :style="{ transform: `scaleY(${workspaceScrollProgress})` }"
-          />
-        </div>
-      </div>
-    </main>
-
-    <SlideshowOverlay
-      v-if="slideshowOpen"
-      :images="visibleImages"
-      :initial-index="slideshowStartIndex"
-      :to-file-src="convertFileSrc"
-      @close="closeGallerySlideshow"
-      @favorite-toggle="toggleGalleryImageFavorite"
-    />
-
-
-    <div v-if="removeFolderConfirmPath" class="image-detail-modal__dialog-layer" @click="closeRemoveFolderConfirm()">
-      <article class="image-detail-modal__dialog" @click.stop>
-        <h4>确认移除索引</h4>
-        <p class="image-detail-modal__dialog-text">该操作不会删除本地文件，仅移除该图库文件夹的索引。</p>
-        <p class="image-detail-modal__dialog-text">{{ removeFolderConfirmPath }}</p>
-        <div class="image-detail-modal__dialog-actions">
-          <button type="button" class="secondary-button" @click="closeRemoveFolderConfirm()">取消</button>
-          <button type="button" class="danger-button" @click="confirmRemoveFolder()">确认移除</button>
-        </div>
-      </article>
-    </div>
-
-    <div
-      v-if="removeFromFolderConfirmState"
-      class="image-detail-modal__dialog-layer"
-      @click="closeRemoveFromFolderConfirm()"
-    >
-      <article class="image-detail-modal__dialog" @click.stop>
-        <h4>确认移除</h4>
-        <p class="image-detail-modal__dialog-text">{{ removeFromFolderConfirmState.message }}</p>
-        <div class="image-detail-modal__dialog-actions">
-          <button type="button" class="secondary-button" @click="closeRemoveFromFolderConfirm()">取消</button>
-          <button type="button" class="danger-button" @click="confirmRemoveFromFolder()">继续</button>
-        </div>
-      </article>
-    </div>
-
-    <div
-      v-if="systemTrashMoveErrorMessage"
-      class="image-detail-modal__dialog-layer"
-      @click="closeSystemTrashMoveErrorDialog()"
-    >
-      <article class="image-detail-modal__dialog" @click.stop>
-        <h4>移动到系统回收站失败</h4>
-        <p class="image-detail-modal__dialog-text">{{ systemTrashMoveErrorMessage }}</p>
-        <div class="image-detail-modal__dialog-actions">
-          <button type="button" class="primary-button" @click="closeSystemTrashMoveErrorDialog()">知道了</button>
-        </div>
-      </article>
-    </div>
-
-    <div v-if="folderRuleEditor" class="folder-rule-editor-layer" @click="closeFolderRuleEditor()">
-      <article class="folder-rule-editor" @click.stop>
-        <header class="folder-rule-editor__header">
-          <h3>编辑规则 · {{ folderRuleEditor.folderName }}</h3>
-          <button type="button" class="folder-rule-editor__close" @click="closeFolderRuleEditor()">×</button>
-        </header>
-        <div class="folder-rule-editor__hint">为文件夹创建规则:满足条件的图片将自动加入这个文件夹</div>
-        <div class="folder-rule-editor__body">
-          <section class="folder-rule-editor__section">
-            <div class="folder-rule-editor__section-title">条件列表</div>
-            <div class="folder-rule-editor__conditions">
-              <div
-                v-for="condition in folderRuleEditor.conditions"
-                :key="`folder-rule:${condition.id}`"
-                class="folder-rule-editor__condition-item"
-              >
-                <div class="folder-rule-editor__condition-row">
-                  <select v-model="condition.logic" class="folder-rule-editor__select">
-                    <option value="AND">AND</option>
-                    <option value="OR">OR</option>
-                    <option value="NOT">NOT</option>
-                  </select>
-                  <select
-                    v-model="condition.source"
-                    class="folder-rule-editor__select"
-                    @change="onFolderRuleConditionSourceChange(condition)"
-                  >
-                    <option value="danbooru">自动标签</option>
-                    <option value="custom">自定义标签</option>
-                    <option value="filename">文件名</option>
-                  </select>
-                  <template v-if="condition.source === 'custom'">
-                    <select v-model="condition.keyword" class="folder-rule-editor__select folder-rule-editor__select--keyword">
-                      <option value="">选择已有自定义标签</option>
-                      <optgroup v-for="group in folderRuleCustomTagGroups" :key="`folder-rule-custom-group:${group.key}`" :label="group.title">
-                        <option
-                          v-for="tagText in group.tags"
-                          :key="`folder-rule-custom-tag:${group.key}:${tagText}`"
-                          :value="tagText"
-                        >
-                          {{ tagText }}
-                        </option>
-                      </optgroup>
-                    </select>
-                  </template>
-                  <input
-                    v-else
-                    :value="condition.keyword"
-                    class="folder-rule-editor__input"
-                    type="text"
-                    :placeholder="
-                      condition.source === 'filename'
-                        ? '输入文件名关键词'
-                        : '输入自动标签关键词（支持联想）'
-                    "
-                    @focus="condition.source === 'danbooru' ? focusFolderRuleDanbooruCondition(condition) : null"
-                    @blur="condition.source === 'danbooru' ? scheduleCloseFolderRuleDanbooruSuggestions() : null"
-                    @input="
-                      condition.source === 'danbooru'
-                        ? onFolderRuleDanbooruKeywordInput(condition, ($event.target as HTMLInputElement).value)
-                        : (condition.keyword = ($event.target as HTMLInputElement).value.trim())
-                    "
-                  />
-                  <button
-                    type="button"
-                    class="folder-rule-editor__remove"
-                    :disabled="folderRuleEditor.conditions.length <= 1"
-                    @click="removeFolderRuleCondition(condition.id)"
-                  >
-                    删除
-                  </button>
-                </div>
-                <div
-                  v-if="condition.source === 'danbooru' && folderRuleDanbooruActiveConditionId === condition.id"
-                  class="folder-rule-editor__suggestions"
-                >
-                  <button
-                    v-for="item in folderRuleDanbooruSuggestions"
-                    :key="`folder-rule-suggestion:${condition.id}:${item.tagEn}`"
-                    type="button"
-                    class="folder-rule-editor__suggestion"
-                    @mousedown.prevent="selectFolderRuleDanbooruSuggestion(condition, item)"
-                  >
-                    <span>{{ item.tagZh || item.tagEn }}</span>
-                    <small>{{ item.tagZh ? item.tagEn : '' }}</small>
-                  </button>
-                  <p v-if="folderRuleDanbooruSuggestLoading" class="folder-rule-editor__placeholder">搜索中...</p>
-                  <p
-                    v-else-if="condition.keyword && folderRuleDanbooruSuggestions.length === 0"
-                    class="folder-rule-editor__placeholder"
-                  >
-                    暂无匹配标签
-                  </p>
-                </div>
-              </div>
-            </div>
-            <button type="button" class="secondary-button folder-rule-editor__add" @click="addFolderRuleCondition()">
-              新增条件
-            </button>
-          </section>
-        </div>
-        <footer class="folder-rule-editor__footer">
-          <button type="button" class="secondary-button folder-rule-editor__delete" @click="deleteFolderRuleDraft()">
-            删除规则
-          </button>
-          <div class="folder-rule-editor__footer-actions">
-            <button type="button" class="secondary-button" @click="saveFolderRuleDraft(false)">保存规则</button>
-            <button type="button" class="primary-button" @click="saveFolderRuleDraft(true)">保存并立即应用</button>
-          </div>
-        </footer>
-      </article>
-    </div>
-
-    <div v-if="batchFolderPickerModal" class="batch-action-layer">
-      <article class="batch-action-modal" @click.stop>
-        <header class="batch-action-modal__header">
-          <h3>{{ batchFolderPickerModal.title }}</h3>
-          <button type="button" class="batch-action-modal__close" @click="closeBatchFolderPickerModal()">×</button>
-        </header>
-        <div class="batch-action-modal__body">
-          <div class="batch-action-modal__hint">已选 {{ batchSelectedImageIds.length }} 张图片</div>
-          <div class="batch-action-modal__folder-list">
-            <div
-              v-for="folder in folderTree"
-              :key="`batch-folder:${folder.id}`"
-              class="folder-tree__row"
-              :class="{ 'is-active': isBatchFolderTargetSelected(folder.id) }"
-              :style="{ paddingLeft: `${8 + folder.depth * 16}px` }"
-              @click="onBatchFolderRowClick(folder)"
-            >
-              <div class="folder-tree__content">
-                <component
-                  :is="
-                    folder.hasChildren ? (folder.isExpanded ? FolderOpen : FolderClose) : isBatchFolderTargetSelected(folder.id) ? FolderOpen : FolderClose
-                  "
-                  class="folder-tree__folder-icon"
-                  theme="outline"
-                  :size="16"
-                  :stroke-width="3"
-                  :fill="['currentColor']"
-                  aria-hidden="true"
-                />
-                <button class="folder-tree__item" type="button">
-                  <span class="folder-tree__item-label">{{ folder.name }}</span>
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-        <footer class="batch-action-modal__footer">
-          <button type="button" class="secondary-button" @click="closeBatchFolderPickerModal()">取消</button>
-          <button
-            type="button"
-            class="primary-button"
-            :disabled="batchFolderPickerTargetId === null"
-            @click="confirmBatchFolderAction()"
-          >
-            {{ batchFolderPickerModal.confirmLabel }}
-          </button>
-        </footer>
-      </article>
-    </div>
-
-    <div v-if="batchTagModalOpen" class="batch-action-layer">
-      <article class="batch-action-modal batch-action-modal--tags" @click.stop>
-        <header class="batch-action-modal__header">
-          <h3>批量添加标签</h3>
-          <button type="button" class="batch-action-modal__close" @click="closeBatchTagModal()">×</button>
-        </header>
-        <div class="batch-action-modal__body">
-          <div class="batch-action-modal__hint">已选 {{ batchSelectedImageIds.length }} 张图片</div>
-          <div class="batch-action-modal__pending">
-            <div class="batch-action-modal__pending-title">待添加标签</div>
-            <div class="batch-action-modal__pending-list">
-              <span
-                v-for="tag in batchTagPending"
-                :key="`batch-pending-tag:${tag.id}`"
-                class="gallery-search__chip batch-action-modal__pending-chip"
-              >
-                <span class="gallery-search__chip-text">{{ tag.label }}</span>
-                <small v-if="tag.subLabel" class="batch-action-modal__pending-sub">{{ tag.subLabel }}</small>
-                <button type="button" class="gallery-search__chip-remove" @click.stop="removePendingBatchTag(tag.id)">×</button>
-              </span>
-              <p v-if="batchTagPending.length === 0" class="batch-action-modal__placeholder">暂未添加标签</p>
-            </div>
-          </div>
-          <input
-            v-model.trim="batchTagDraft"
-            class="batch-action-modal__input"
-            type="text"
-            placeholder="创建一个新标签或搜索自动标签"
-            autocomplete="off"
-            @keydown.enter.prevent="void addPendingCustomTagFromDraft()"
-          />
-          <div class="batch-action-modal__tag-actions">
-            <button type="button" class="secondary-button" :disabled="!batchTagDraft" @click="void addPendingCustomTagFromDraft()">
-              创建标签
-            </button>
-          </div>
-          <div class="batch-action-modal__existing-tags">
-            <div class="batch-action-modal__pending-title">已有标签</div>
-            <section class="image-detail-modal__existing-tags-picker batch-action-modal__existing-tags-picker">
-              <div
-                v-if="tagManagerFolders.length > 0 || tagManagerUnclassifiedTags.length > 0"
-                class="image-detail-modal__existing-folder-list"
-              >
-                <div
-                  v-for="folder in tagManagerFolders"
-                  :key="`batch-custom-folder:${folder.id}`"
-                  class="image-detail-modal__existing-folder"
-                >
-                  <button
-                    type="button"
-                    class="image-detail-modal__existing-folder-toggle"
-                    @click="toggleBatchTagFolderExpanded(folder.id)"
-                  >
-                    <span class="image-detail-modal__existing-folder-caret">
-                      {{ isBatchTagFolderExpanded(folder.id) ? '▾' : '▸' }}
-                    </span>
-                    <span class="image-detail-modal__existing-folder-name">{{ folder.name }}</span>
-                    <small>{{ folder.tags.length }}</small>
-                  </button>
-                  <div v-if="isBatchTagFolderExpanded(folder.id)" class="image-detail-modal__existing-tag-list">
-                    <button
-                      v-for="tagText in folder.tags"
-                      :key="`batch-custom-folder-tag:${folder.id}:${tagText}`"
-                      type="button"
-                      class="gallery-search__chip image-detail-modal__existing-tag-chip"
-                      :class="{ 'is-selected': isExistingTagPending(tagText) }"
-                      @click="addPendingExistingTag(tagText)"
-                    >
-                      <span class="gallery-search__chip-text">{{ tagText }}</span>
-                    </button>
-                    <p v-if="folder.tags.length === 0" class="image-detail-modal__dialog-empty">该文件夹暂无标签</p>
-                  </div>
-                </div>
-                <div v-if="tagManagerUnclassifiedTags.length > 0" class="image-detail-modal__existing-folder">
-                  <button
-                    type="button"
-                    class="image-detail-modal__existing-folder-toggle"
-                    @click="toggleBatchTagFolderExpanded(-1)"
-                  >
-                    <span class="image-detail-modal__existing-folder-caret">
-                      {{ isBatchTagFolderExpanded(-1) ? '▾' : '▸' }}
-                    </span>
-                    <span class="image-detail-modal__existing-folder-name">未分类标签</span>
-                    <small>{{ tagManagerUnclassifiedTags.length }}</small>
-                  </button>
-                  <div v-if="isBatchTagFolderExpanded(-1)" class="image-detail-modal__existing-tag-list">
-                    <button
-                      v-for="tagText in tagManagerUnclassifiedTags"
-                      :key="`batch-custom-unclassified-tag:${tagText}`"
-                      type="button"
-                      class="gallery-search__chip image-detail-modal__existing-tag-chip"
-                      :class="{ 'is-selected': isExistingTagPending(tagText) }"
-                      @click="addPendingExistingTag(tagText)"
-                    >
-                      <span class="gallery-search__chip-text">{{ tagText }}</span>
-                    </button>
-                  </div>
-                </div>
-              </div>
-              <p v-else class="image-detail-modal__dialog-empty">暂无可选标签</p>
-            </section>
-          </div>
-          <div class="batch-action-modal__tag-list">
+    <div class="workspace">
+      <button
+        v-if="drawer"
+        class="drawer-scrim"
+        aria-label="关闭导航"
+        @click="drawer = false"
+      /><FolderNav
+        :page="page"
+        :scope="gallery.query.value.scope"
+        :folder-id="gallery.query.value.folderId"
+        :rows="folders.rows.value"
+        :expanded="folders.expanded.value"
+        :drop-target="drag?.target ?? null"
+        :running="jobs.rows.value.some((j) => j.state === 'running')"
+        @go="go"
+        @page="
+          page = $event;
+          drawer = false;
+        "
+        @collapse="
+          preferences.collapsed.value = !preferences.collapsed.value;
+          drawer = false;
+        "
+        @toggle="folders.toggle"
+        @create="openDialog('create', '新建虚拟文件夹', undefined, $event)"
+        @rename="
+          openDialog('rename', '重命名文件夹', $event.id);
+          draft = $event.name;
+        "
+        @remove="openDialog('delete', '删除虚拟文件夹', $event)"
+        @rule="rule"
+        @unclassified="unclassified"
+        @reorder="
+          (id, target) =>
+            folders
+              .reorder(id, target, 'before')
+              .then(refresh)
+              .catch((e) => (error = errorMessage(e)))
+        "
+      />
+      <main class="main-workspace">
+        <template v-if="page === 'gallery'"
+          ><div class="search-area">
             <button
-              v-for="item in batchTagSuggestions"
-              :key="`batch-tag-suggestion:${item.tagEn}`"
-              type="button"
-              class="batch-action-modal__tag-option"
-              @click="addPendingSupplementTagBySuggestion(item)"
+              class="soft-button nav-opener"
+              aria-label="展开导航"
+              @click="drawer = !drawer"
             >
-              <span class="batch-action-modal__tag-main">{{ item.tagZh || item.tagEn }}</span>
-              <small class="batch-action-modal__tag-sub">{{ item.tagZh ? item.tagEn : '' }}</small>
+              <AppIcon name="menu" /></button
+            ><SearchBar :scope-label="scopeName" /><button
+              v-if="preferences.immersive.value"
+              class="soft-button"
+              @click="preferences.immersive.value = false"
+            >
+              退出沉浸
             </button>
-            <p v-if="batchTagSuggestLoading" class="batch-action-modal__placeholder">搜索中...</p>
-            <p v-else-if="batchTagDraft && batchTagSuggestions.length === 0" class="batch-action-modal__placeholder">暂无匹配标签</p>
           </div>
-        </div>
-        <footer class="batch-action-modal__footer">
-          <button type="button" class="secondary-button" @click="closeBatchTagModal()">取消</button>
-          <button type="button" class="primary-button" :disabled="batchTagPending.length === 0" @click="applyBatchPendingTags()">
-            添加以上标签
-          </button>
-        </footer>
-        <div v-if="batchTagCustomConflict" class="image-detail-modal__dialog-layer batch-action-modal__conflict-layer" @click.stop>
-          <article class="image-detail-modal__dialog" @click.stop>
-            <h4>标签已存在</h4>
-            <p class="image-detail-modal__dialog-text">
-              已有此自动标签（{{ batchTagCustomConflict.tagZh || batchTagCustomConflict.tagEn }}），进行补充还是新建用户自定义标签？
-            </p>
-            <div class="image-detail-modal__dialog-actions">
-              <button type="button" class="secondary-button" @click="batchTagCustomConflict = null">取消</button>
-              <button type="button" class="secondary-button" @click="resolveBatchCustomTagConflict('supplement')">补充</button>
-              <button type="button" class="primary-button" @click="resolveBatchCustomTagConflict('custom')">自定义</button>
-            </div>
-          </article>
-        </div>
-      </article>
+          <GalleryToolbar
+            :scope-name="scopeName"
+            :total="gallery.total.value"
+            :active="selection.active.value"
+            :count="selection.count.value"
+            :busy="busy"
+            :scope="gallery.query.value.scope"
+            @select-all="selection.all(gallery.images.value)"
+            @select="selection.active.value = true"
+            @done="selection.clear()"
+            @favorite="mutate('favorite', undefined, { favorite: true })"
+            @dialog="(kind, title) => openDialog(kind, title)"
+            @trash="
+              mutate(
+                gallery.query.value.scope === 'trash' ? 'restore' : 'trash',
+              )
+            "
+            @immersive="
+              preferences.immersive.value = !preferences.immersive.value
+            "
+            @random="go('random')" />
+          <p v-if="error" class="inline-error" role="alert">
+            {{ error
+            }}<button aria-label="关闭提示" @click="error = ''">
+              <AppIcon name="close" :size="16" />
+            </button>
+          </p>
+          <p v-else-if="notice" class="inline-notice" role="status">
+            {{ notice
+            }}<button aria-label="关闭提示" @click="notice = ''">
+              <AppIcon name="close" :size="16" />
+            </button>
+          </p>
+          <GalleryWall
+            :thumbnails="preferences.thumbnails.value"
+            @open="openImage"
+            @favorite="favorite"
+            @drag="beginDrag"
+        /></template>
+        <template v-else
+          ><button
+            class="soft-button page-nav-opener"
+            aria-label="展开导航"
+            @click="drawer = !drawer"
+          >
+            <AppIcon name="menu" /></button
+          ><TaskCenter
+            v-if="page === 'tasks'"
+            :rows="jobs.rows.value"
+            :error="jobs.error.value"
+            :thumbnails="preferences.thumbnails.value"
+            @start="start"
+            @control="jobs.control" /><TagManager
+            v-else-if="page === 'tags'"
+            @search="tagSearch" /><SettingsPage
+            v-else
+            :sources="sources"
+            v-model:thumbnails="preferences.thumbnails.value"
+            v-model:hide-title="preferences.hideTitle.value"
+            @refresh="refresh"
+            @task="start"
+        /></template>
+      </main>
     </div>
-
-    <div
-      v-if="tagManagerOpen"
-      class="tag-manager-layer"
-      @click="
-        closeTagManagerPanel();
-        endTagManagerTagDrag();
-        closeTagManagerTagContextMenu();
-      "
-    >
-      <article class="tag-manager-modal" @click.stop>
-        <header class="tag-manager-modal__header">
-          <div class="tag-manager-modal__title">{{ tagManagerTab === 'dict' ? '标签浏览' : '标签管理' }}</div>
+    <ImageViewer
+      v-if="viewer"
+      :image="viewer"
+      :images="gallery.images.value"
+      :folders="folders.folders.value"
+      @close="viewer = null"
+      @change="viewer = $event"
+      @favorite="favorite"
+      @tag-search="tagSearch"
+      @metadata-changed="gallery.search()"
+    />
+    <SoftDialog v-if="dialog" :title="dialog.title" @close="dialog = null"
+      ><form id="workspace-dialog" @submit.prevent="saveDialog">
+        <label v-if="['create', 'rename', 'tags'].includes(dialog.kind)"
+          >{{ dialog.kind === "tags" ? "标签（逗号分隔）" : "名称"
+          }}<input v-model="draft" required autofocus maxlength="200" /></label
+        ><template
+          v-else-if="['assign', 'move', 'remove'].includes(dialog.kind)"
+          ><p>
+            {{
+              dialog.kind === "assign"
+                ? "只增加虚拟分类归属，磁盘原图保持原位置。"
+                : dialog.kind === "move"
+                  ? "替换当前图片的分类归属，磁盘原图保持原位置。"
+                  : "只移除指定虚拟分类归属。"
+            }}
+          </p>
+          <SoftSelect
+            :model-value="targetFolder"
+            @update:model-value="
+              targetFolder = typeof $event === 'number' ? $event : null
+            "
+            :options="
+              folders.folders.value.map((f) => ({ value: f.id, label: f.name }))
+            "
+            placeholder="请选择文件夹"
+            aria-label="目标虚拟文件夹" /></template
+        ><template v-else-if="dialog.kind === 'rule'"
+          ><p>规则自动作用于新增图片和标签变更。保存不会触发全库处理。</p>
+          <div v-for="(c, i) in ruleConditions" :key="i" class="rule-row">
+            <SoftSelect
+              :model-value="c.logic"
+              @update:model-value="
+                c.logic = String($event) as UserFolderRuleCondition['logic']
+              "
+              :options="[
+                { value: 'and', label: '并且' },
+                { value: 'or', label: '或者' },
+                { value: 'not', label: '排除' },
+              ]"
+              aria-label="条件逻辑"
+            /><SoftSelect
+              :model-value="c.source"
+              @update:model-value="
+                c.source = String($event) as UserFolderRuleCondition['source']
+              "
+              :options="[
+                { value: 'danbooru', label: '模型标签' },
+                { value: 'custom', label: '自定义标签' },
+                { value: 'filename', label: '文件名' },
+              ]"
+              aria-label="条件来源"
+            /><input
+              v-model="c.keyword"
+              aria-label="匹配内容"
+              required
+            /><button
+              class="icon-button"
+              type="button"
+              aria-label="删除条件"
+              @click="ruleConditions.splice(i, 1)"
+            >
+              <AppIcon name="close" :size="16" />
+            </button>
+          </div>
           <button
-            class="tag-manager-modal__close"
+            class="soft-button"
             type="button"
             @click="
-              closeTagManagerPanel();
-              endTagManagerTagDrag();
-              closeTagManagerTagContextMenu();
+              ruleConditions.push({
+                logic: 'and',
+                source: 'danbooru',
+                keyword: '',
+              })
             "
           >
-            ×
-          </button>
-        </header>
-        <div v-if="tagManagerTab === 'custom'" class="tag-manager-modal__content">
-          <aside class="tag-manager-modal__folders">
-            <div class="tag-manager-modal__section-title">标签文件夹</div>
-            <div class="tag-manager-modal__folder-list">
-              <button
-                v-for="folder in tagManagerFolders"
-                :key="folder.id"
-                type="button"
-                class="tag-manager-modal__folder-item"
-                :class="{
-                  'is-active': activeTagManagerFolderId === folder.id,
-                  'is-drop-target': tagManagerDragOverFolderId === folder.id,
-                }"
-                @click="activeTagManagerFolderId = folder.id"
-                @dragover="onTagManagerFolderDragOver(folder.id, $event)"
-                @dragleave="onTagManagerFolderDragLeave(folder.id)"
-                @drop="onTagManagerFolderDrop(folder.id, $event)"
-              >
-                <span>{{ folder.name }}</span>
-                <small>{{ folder.tags.length }}</small>
-              </button>
-            </div>
-            <div class="tag-manager-modal__create-row">
-              <input
-                v-model.trim="newTagManagerFolderName"
-                class="tag-manager-modal__create-input"
-                type="text"
-                placeholder="新建标签文件夹"
-                @keydown.enter.prevent="createTagManagerFolder()"
-              />
-              <button type="button" class="secondary-button tag-manager-modal__action" @click="createTagManagerFolder()">
-                新建
-              </button>
-            </div>
-            <button
-              type="button"
-              class="danger-button tag-manager-modal__action"
-              :disabled="activeTagManagerFolderId === null"
-              @click="activeTagManagerFolderId !== null ? deleteTagManagerFolder(activeTagManagerFolderId) : null"
-            >
-              删除当前文件夹
-            </button>
-          </aside>
-          <section class="tag-manager-modal__tags">
-            <div class="tag-manager-modal__section-title">
-              未分类标签
-              <span v-if="activeTagManagerFolderNameForHint">（拖拽到左侧「{{ activeTagManagerFolderNameForHint }}」）</span>
-            </div>
-            <div class="tag-manager-modal__tag-list">
-              <span
-                v-for="tag in tagManagerUnclassifiedTags"
-                :key="`unclassified:${tag}`"
-                class="gallery-search__chip tag-manager-modal__tag-chip"
-                draggable="true"
-                @dragstart="startTagManagerTagDrag(tag, $event)"
-                @dragend="endTagManagerTagDrag()"
-                @contextmenu.prevent="openTagManagerTagContextMenu(tag, $event)"
-              >
-                <span class="gallery-search__chip-text">{{ tag }}</span>
-              </span>
-            </div>
-            <div class="tag-manager-modal__create-row">
-              <input
-                v-model.trim="newTagManagerTagText"
-                class="tag-manager-modal__create-input"
-                type="text"
-                placeholder="新建标签"
-                @keydown.enter.prevent="createTagManagerTag()"
-              />
-              <button type="button" class="secondary-button tag-manager-modal__action" @click="createTagManagerTag()">
-                新建标签
-              </button>
-            </div>
-            <div class="tag-manager-modal__section-title">当前文件夹标签</div>
-            <div class="tag-manager-modal__tag-list">
-              <span
-                v-for="tag in activeTagManagerFolderTags"
-                :key="`folder-tag:${tag}`"
-                class="gallery-search__chip tag-manager-modal__tag-chip"
-                draggable="true"
-                @dragstart="startTagManagerTagDrag(tag, $event)"
-                @dragend="endTagManagerTagDrag()"
-                @contextmenu.prevent="openTagManagerTagContextMenu(tag, $event)"
-              >
-                <span class="gallery-search__chip-text">{{ tag }}</span>
-                <button type="button" class="gallery-search__chip-remove" @click.stop="unassignTag(tag)">×</button>
-              </span>
-              <p v-if="activeTagManagerFolderTags.length === 0" class="tag-manager-modal__placeholder">当前文件夹还没有标签</p>
-            </div>
-            <div v-if="isTagManagerLoading" class="tag-manager-modal__placeholder">处理中...</div>
-          </section>
-        </div>
-        <div v-else class="tag-manager-modal__content">
-          <aside class="tag-manager-modal__folders">
-            <div class="tag-manager-modal__section-title">分类</div>
-            <div class="tag-manager-modal__folder-list">
-              <button
-                v-for="group in dictGroupItems"
-                :key="group.id"
-                type="button"
-                class="tag-manager-modal__folder-item"
-                :class="{ 'is-active': dictGroupId === group.id }"
-                @click="dictGroupId = group.id"
-              >
-                <span>{{ group.zh }}</span>
-                <small>{{ group.count }}</small>
-              </button>
-            </div>
-          </aside>
-          <section class="tag-manager-modal__dict">
-            <div class="tag-manager-modal__dict-toolbar">
-              <input
-                v-model="dictQuery"
-                class="tag-manager-modal__create-input"
-                type="text"
-                placeholder="搜索中文或英文"
-              />
-              <select v-model="dictSort" class="tag-manager-modal__dict-sort">
-                <option value="count">图库次数</option>
-                <option value="index">默认顺序</option>
-                <option value="zh">中文</option>
-                <option value="en">英文</option>
-              </select>
-              <label class="tag-manager-modal__dict-check">
-                <input v-model="dictOnlyUsed" type="checkbox" />
-                仅已出现
-              </label>
-            </div>
-            <div class="tag-manager-modal__dict-selected">
-              <div class="tag-manager-modal__section-title">已选择 {{ searchZhSelected.length }}</div>
-              <div class="tag-manager-modal__dict-selected-list">
-                <span
-                  v-for="tag in searchZhSelected"
-                  :key="`dict-selected:${tag.tagEn}`"
-                  class="gallery-search__chip"
-                >
-                  <span class="gallery-search__chip-text">{{ tag.tagZh || tag.tagEn }}</span>
-                  <button
-                    type="button"
-                    class="gallery-search__chip-remove"
-                    @click.stop="removeSearchZhSuggestion(tag.tagEn)"
-                  >
-                    ×
-                  </button>
-                </span>
-                <p v-if="searchZhSelected.length === 0" class="tag-manager-modal__placeholder">点击下方标签加入，再点或点 × 取消</p>
-              </div>
-            </div>
-            <div class="tag-manager-modal__dict-list">
-              <button
-                v-for="tag in visibleDictTags"
-                :key="tag.tagEn"
-                type="button"
-                class="tag-manager-modal__dict-row"
-                :class="{ 'is-selected': isDictionaryTagInSearch(tag.tagEn) }"
-                @click="addDictionaryTagToSearch(tag)"
-              >
-                <span class="tag-manager-modal__dict-zh">{{ tag.tagZh || tag.tagEn }}</span>
-                <span class="tag-manager-modal__dict-en">{{ tag.tagEn }}</span>
-                <small>{{ tag.imageCount }}</small>
-              </button>
-              <p v-if="visibleDictTags.length === 0" class="tag-manager-modal__placeholder">没有匹配的标签</p>
-            </div>
-            <div class="tag-manager-modal__dict-footer">
-              <span v-if="isTagManagerLoading">加载中...</span>
-              <span v-else>共 {{ filteredDictTags.length }} 条，点击加入搜索</span>
-              <button
-                v-if="visibleDictTags.length < filteredDictTags.length"
-                type="button"
-                class="secondary-button tag-manager-modal__action"
-                @click="loadMoreDictTags()"
-              >
-                显示更多
-              </button>
-            </div>
-          </section>
-        </div>
-        <div
-          v-if="tagManagerTagContextMenu"
-          class="context-menu"
-          :style="tagManagerTagContextMenuStyle"
-          @click.stop
-          @contextmenu.prevent
+            添加条件
+          </button></template
         >
-          <button class="is-danger" type="button" @click="deleteTagManagerTagFromContextMenu()">删除标签</button>
-        </div>
-      </article>
-    </div>
-
-    <div v-if="activeImageDetail" class="image-detail-layer" @click="closeImageDetail()">
-      <article class="image-detail-modal" @click.stop="closeImageDetailContextMenu()">
-        <button class="image-detail-modal__close" type="button" @click="closeImageDetail()">×</button>
-        <div class="image-detail-modal__scroll">
-          <div class="image-detail-modal__main">
-            <div class="image-detail-modal__media-column">
-              <div class="image-detail-modal__media-sticky">
-                <div
-                  class="image-detail-modal__media"
-                  @contextmenu="openImageDetailMenu($event)"
-                  @wheel="zoomImageDetailMedia($event)"
-                  @pointerdown="startImageDetailMediaDrag($event)"
-                  @pointermove="moveImageDetailMediaDrag($event)"
-                  @pointerup="finishImageDetailMediaDrag($event)"
-                  @pointercancel="finishImageDetailMediaDrag($event)"
-                  @dblclick="resetImageDetailMediaTransform()"
-                >
-                  <img
-                    :src="convertFileSrc(activeImageDetail.path)"
-                    :alt="activeImageDetail.fileName"
-                    :style="imageDetailMediaStyle"
-                    draggable="false"
-                  />
-                </div>
-              </div>
-            </div>
-            <aside class="image-detail-modal__meta">
-              <div class="image-detail-modal__meta-scroll">
-                <div class="image-detail-modal__meta-stack">
-                  <div class="image-detail-modal__info-block">
-                    <h3>{{ activeImageDetail.fileName }}</h3>
-                    <div class="image-detail-modal__meta-list">
-                      <div class="image-detail-modal__meta-row">
-                        <span>尺寸</span>
-                        <strong>{{ activeImageDetail.width }} × {{ activeImageDetail.height }}</strong>
-                      </div>
-                      <div class="image-detail-modal__meta-row">
-                        <span>大小</span>
-                        <strong>{{ formatFileSize(activeImageDetail.fileSize) }}</strong>
-                      </div>
-                      <div class="image-detail-modal__meta-row">
-                        <span>修改时间</span>
-                        <strong>{{ formatTime(activeImageDetail.modifiedAt) }}</strong>
-                      </div>
-                      <div class="image-detail-modal__meta-row">
-                        <span>来源</span>
-                        <strong>{{ activeImageDetail.source }}</strong>
-                      </div>
-                    </div>
-                  </div>
-                  <section class="image-detail-modal__user-tags-section">
-                    <h4>自定义标签</h4>
-                    <div class="image-detail-modal__user-tags-box">
-                      <div class="image-detail-modal__user-tags-scroll">
-                        <button
-                          v-if="activeImageCustomTags.length === 0"
-                          type="button"
-                          class="image-detail-modal__chip-plus"
-                          @click="openImageDetailCustomTagEditor()"
-                        >
-                          +
-                        </button>
-                        <span
-                          v-for="tag in activeImageCustomTags"
-                          :key="`custom:${tag.tagText}`"
-                          class="gallery-search__chip image-detail-modal__user-chip"
-                        >
-                          <span class="gallery-search__chip-text">{{ tag.tagText }}</span>
-                          <button
-                            type="button"
-                            class="gallery-search__chip-remove"
-                            @click.stop="removeImageDetailCustomTag(tag.tagText)"
-                          >
-                            ×
-                          </button>
-                        </span>
-                        <button
-                          v-if="activeImageCustomTags.length > 0"
-                          type="button"
-                          class="image-detail-modal__chip-plus"
-                          @click="openImageDetailCustomTagEditor()"
-                        >
-                          +
-                        </button>
-                      </div>
-                    </div>
-                  </section>
-                  <section class="image-detail-modal__user-tags-section">
-                    <h4>补充自动标签</h4>
-                    <div class="image-detail-modal__user-tags-box">
-                      <div class="image-detail-modal__user-tags-scroll">
-                        <button
-                          v-if="activeImageSupplementTags.length === 0"
-                          type="button"
-                          class="image-detail-modal__chip-plus"
-                          @click="openImageDetailSupplementPicker()"
-                        >
-                          +
-                        </button>
-                        <span
-                          v-for="tag in activeImageSupplementTags"
-                          :key="`supplement:${tag.tagEn}`"
-                          class="gallery-search__chip image-detail-modal__user-chip"
-                        >
-                          <span class="gallery-search__chip-text">{{ tag.tagZh || tag.tagEn }}</span>
-                          <button
-                            type="button"
-                            class="gallery-search__chip-remove"
-                            @click.stop="removeImageDetailSupplementTag(tag.tagEn)"
-                          >
-                            ×
-                          </button>
-                        </span>
-                        <button
-                          v-if="activeImageSupplementTags.length > 0"
-                          type="button"
-                          class="image-detail-modal__chip-plus"
-                          @click="openImageDetailSupplementPicker()"
-                        >
-                          +
-                        </button>
-                      </div>
-                    </div>
-                  </section>
-                  <section class="image-detail-modal__tags">
-                    <h4>自动标签</h4>
-                    <div v-if="groupedImageTags.length > 0" class="image-detail-modal__tags-scroll">
-                      <div
-                        v-for="group in groupedImageTags"
-                        :key="group.key"
-                        class="image-detail-modal__tag-group"
-                      >
-                        <div class="image-detail-modal__tag-group-title">{{ group.label }}</div>
-                        <div class="image-detail-modal__tag-list">
-                          <div
-                            v-for="tag in group.rows"
-                            :key="`${group.key}:${tag.tagEn}`"
-                            class="image-detail-modal__tag-item"
-                            role="button"
-                            tabindex="0"
-                            @click="searchByTagFromImageDetail(tag.tagEn, tag.tagZh)"
-                            @keydown.enter.prevent="searchByTagFromImageDetail(tag.tagEn, tag.tagZh)"
-                            @keydown.space.prevent="searchByTagFromImageDetail(tag.tagEn, tag.tagZh)"
-                          >
-                            <div class="image-detail-modal__tag-main">{{ tag.tagZh || tag.tagEn }}</div>
-                            <div class="image-detail-modal__tag-sub">{{ tag.tagZh ? tag.tagEn : '' }}</div>
-                            <div class="image-detail-modal__tag-score">{{ tag.confidence.toFixed(3) }}</div>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                    <p v-else class="image-detail-modal__tags-empty">暂无自动标签</p>
-                  </section>
-                </div>
-              </div>
-            </aside>
-          </div>
-        </div>
-
-        <div
-          v-if="imageDetailCustomTagEditorOpen"
-          class="image-detail-modal__dialog-layer"
-          @click="cancelImageDetailCustomTagEditor()"
+        <p v-else-if="dialog.kind === 'delete'">
+          删除分类及其子分类，磁盘原图保留。图片不会进入回收站。
+        </p>
+        <p v-else>
+          所选原始文件将移入 Windows
+          系统回收站，并删除图库索引。可通过系统回收站恢复原文件，之后重新扫描。
+        </p>
+      </form>
+      <p v-if="error" class="error-text">{{ error }}</p>
+      <template #actions
+        ><button class="soft-button" @click="dialog = null">取消</button
+        ><button
+          class="soft-button accent"
+          form="workspace-dialog"
+          type="submit"
+          :disabled="busy"
         >
-          <article class="image-detail-modal__dialog" @click.stop>
-            <h4>添加自定义标签</h4>
-            <input
-              v-model.trim="imageDetailCustomTagDraft"
-              class="image-detail-modal__dialog-input"
-              type="text"
-              placeholder="创建标签"
-              @keydown.enter.prevent="submitImageDetailCustomTagDraft()"
-            />
-            <section class="image-detail-modal__existing-tags-picker">
-              <div class="image-detail-modal__existing-tags-title">从已有的标签中选择</div>
-              <div
-                v-if="tagManagerFolders.length > 0 || tagManagerUnclassifiedTags.length > 0"
-                class="image-detail-modal__existing-folder-list"
-              >
-                <div
-                  v-for="folder in tagManagerFolders"
-                  :key="`detail-custom-folder:${folder.id}`"
-                  class="image-detail-modal__existing-folder"
-                >
-                  <button
-                    type="button"
-                    class="image-detail-modal__existing-folder-toggle"
-                    @click="toggleImageDetailTagFolderExpanded(folder.id)"
-                  >
-                    <span class="image-detail-modal__existing-folder-caret">
-                      {{ isImageDetailTagFolderExpanded(folder.id) ? '▾' : '▸' }}
-                    </span>
-                    <span class="image-detail-modal__existing-folder-name">{{ folder.name }}</span>
-                    <small>{{ folder.tags.length }}</small>
-                  </button>
-                  <div v-if="isImageDetailTagFolderExpanded(folder.id)" class="image-detail-modal__existing-tag-list">
-                    <button
-                      v-for="tagText in folder.tags"
-                      :key="`detail-custom-folder-tag:${folder.id}:${tagText}`"
-                      type="button"
-                      class="gallery-search__chip image-detail-modal__existing-tag-chip"
-                      :class="{ 'is-selected': isImageDetailExistingTagSelected(tagText) }"
-                      @click="toggleImageDetailExistingTag(tagText)"
-                    >
-                      <span class="gallery-search__chip-text">{{ tagText }}</span>
-                    </button>
-                    <p v-if="folder.tags.length === 0" class="image-detail-modal__dialog-empty">该文件夹暂无标签</p>
-                  </div>
-                </div>
-                <div v-if="tagManagerUnclassifiedTags.length > 0" class="image-detail-modal__existing-folder">
-                  <button
-                    type="button"
-                    class="image-detail-modal__existing-folder-toggle"
-                    @click="toggleImageDetailTagFolderExpanded(-1)"
-                  >
-                    <span class="image-detail-modal__existing-folder-caret">
-                      {{ isImageDetailTagFolderExpanded(-1) ? '▾' : '▸' }}
-                    </span>
-                    <span class="image-detail-modal__existing-folder-name">未分类标签</span>
-                    <small>{{ tagManagerUnclassifiedTags.length }}</small>
-                  </button>
-                  <div v-if="isImageDetailTagFolderExpanded(-1)" class="image-detail-modal__existing-tag-list">
-                    <button
-                      v-for="tagText in tagManagerUnclassifiedTags"
-                      :key="`detail-custom-unclassified-tag:${tagText}`"
-                      type="button"
-                      class="gallery-search__chip image-detail-modal__existing-tag-chip"
-                      :class="{ 'is-selected': isImageDetailExistingTagSelected(tagText) }"
-                      @click="toggleImageDetailExistingTag(tagText)"
-                    >
-                      <span class="gallery-search__chip-text">{{ tagText }}</span>
-                    </button>
-                  </div>
-                </div>
-              </div>
-              <p v-else class="image-detail-modal__dialog-empty">暂无可选标签</p>
-            </section>
-            <div class="image-detail-modal__dialog-actions">
-              <button type="button" class="secondary-button" @click="cancelImageDetailCustomTagEditor()">取消</button>
-              <button type="button" class="primary-button" @click="submitImageDetailCustomTagDraft()">添加</button>
-            </div>
-          </article>
-        </div>
-
-        <div
-          v-if="imageDetailCustomTagConflict"
-          class="image-detail-modal__dialog-layer"
-          @click="imageDetailCustomTagConflict = null"
-        >
-          <article class="image-detail-modal__dialog" @click.stop>
-            <h4>标签已存在</h4>
-            <p class="image-detail-modal__dialog-text">
-              已有此自动标签（{{ imageDetailCustomTagConflict.tagZh || imageDetailCustomTagConflict.tagEn }}），进行补充还是新建用户自定义标签？
-            </p>
-            <div class="image-detail-modal__dialog-actions">
-              <button type="button" class="secondary-button" @click="imageDetailCustomTagConflict = null">取消</button>
-              <button type="button" class="secondary-button" @click="resolveImageDetailCustomTagConflict('supplement')">
-                补充
-              </button>
-              <button type="button" class="primary-button" @click="resolveImageDetailCustomTagConflict('custom')">
-                自定义
-              </button>
-            </div>
-          </article>
-        </div>
-
-        <div
-          v-if="imageDetailSupplementPickerOpen"
-          class="image-detail-modal__dialog-layer"
-          @click="closeImageDetailSupplementPicker()"
-        >
-          <article class="image-detail-modal__dialog image-detail-modal__dialog--wide" @click.stop>
-            <h4>补充自动标签</h4>
-            <input
-              v-model.trim="imageDetailSupplementQuery"
-              class="image-detail-modal__dialog-input"
-              type="text"
-              placeholder="搜索已有自动标签"
-            />
-            <div class="image-detail-modal__dialog-list">
-              <button
-                v-for="item in imageDetailSupplementSuggestions"
-                :key="`supplement-pick:${item.tagEn}`"
-                type="button"
-                class="image-detail-modal__dialog-option image-detail-modal__dialog-option--dual"
-                @click="addImageDetailSupplementTag(item)"
-              >
-                <span class="image-detail-modal__dialog-option-main">{{ item.tagZh || item.tagEn }}</span>
-                <span class="image-detail-modal__dialog-option-sub">{{ item.tagZh ? item.tagEn : '' }}</span>
-              </button>
-              <p
-                v-if="!imageDetailSupplementSuggestLoading && imageDetailSupplementQuery && imageDetailSupplementSuggestions.length === 0"
-                class="image-detail-modal__dialog-empty"
-              >
-                未找到可添加的标签
-              </p>
-              <p v-if="imageDetailSupplementSuggestLoading" class="image-detail-modal__dialog-empty">搜索中...</p>
-            </div>
-            <div class="image-detail-modal__dialog-actions">
-              <button type="button" class="secondary-button" @click="closeImageDetailSupplementPicker()">关闭</button>
-            </div>
-          </article>
-        </div>
-
-        <div
-          v-if="imageDetailContextMenu"
-          class="context-menu"
-          :style="imageDetailContextMenuStyle"
-          @click.stop
-          @contextmenu.prevent
-        >
-          <button type="button" @click="favoriteGalleryImageFromDetailMenu(activeImageDetail.id)">加入到我喜爱的</button>
-          <button type="button" @click="openGalleryImageWithDefaultApp(activeImageDetail.id)">使用默认软件打开</button>
-        </div>
-      </article>
-    </div>
-
-    <div
-      v-if="galleryImageContextMenu"
-      class="context-menu"
-      :style="galleryImageContextMenuStyle"
-      @click.stop
-      @contextmenu.prevent
+          确认
+        </button></template
+      ></SoftDialog
     >
-      <button type="button" @click="openGalleryBatchModeFromContextMenu(galleryImageContextMenu.imageId)">批量操作</button>
-      <button
-        v-if="
-          activeUserFolderId === 'all' ||
-          activeUserFolderId === 'random' ||
-          activeUserFolderId === 'favorites' ||
-          activeUserFolderId === 'unclassified'
-        "
-        class="is-danger"
-        type="button"
-        @click="removeGalleryImageFromIndex(galleryImageContextMenu.imageId)"
-      >
-        移入回收站
-      </button>
-      <template v-else-if="activeUserFolderId === 'trash'">
-        <button type="button" @click="restoreGalleryImageFromTrash(galleryImageContextMenu.imageId)">
-          还原
-        </button>
-        <button
-          class="is-danger"
-          type="button"
-          @click="moveGalleryImageToSystemTrash(galleryImageContextMenu.imageId)"
-        >
-          移动到系统回收站
-        </button>
-      </template>
-      <template v-else>
-        <button
-          class="is-danger"
-          type="button"
-          @click="removeGalleryImageFromFolder(galleryImageContextMenu.imageId)"
-        >
-          从文件夹中移除
-        </button>
-        <button
-          class="is-danger"
-          type="button"
-          @click="removeGalleryImageFromIndex(galleryImageContextMenu.imageId)"
-        >
-          移入回收站
-        </button>
-      </template>
-      <button type="button" @click="copyGalleryImageToClipboard(galleryImageContextMenu.imageId)">复制</button>
-      <button type="button" @click="exportGalleryImage(galleryImageContextMenu.imageId)">导出到本地</button>
+    <div
+      v-if="drag?.active"
+      class="drag-ghost"
+      :style="{ left: drag.x + 14 + 'px', top: drag.y + 14 + 'px' }"
+    >
+      拖到虚拟文件夹分类
     </div>
-
   </div>
 </template>

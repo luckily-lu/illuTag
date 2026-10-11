@@ -1,122 +1,82 @@
 param(
+  [Parameter(Mandatory=$true)][string]$ResourceRoot,
+  [string]$OutputRoot,
+  [string]$ReleaseExe,
   [switch]$Build,
-  [string]$Version = "1.0.3"
+  [switch]$SkipZip
 )
-
 $ErrorActionPreference = "Stop"
-
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$tauriRoot = Join-Path $repoRoot "src-tauri"
-$scriptSourceDir = Join-Path $tauriRoot "scripts"
-$releaseExe = Join-Path $tauriRoot "target\release\illutag.exe"
-$portableRoot = Join-Path $repoRoot "release\portable"
-$portableAppDir = Join-Path $portableRoot ("illuTag-{0}" -f $Version)
-$zipPath = Join-Path $portableRoot ("illuTag-portable-{0}.zip" -f $Version)
-
+$metadata = Get-Content -LiteralPath (Join-Path $repoRoot 'package.json') -Raw | ConvertFrom-Json
+$version = $metadata.version
+if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$') { throw 'Invalid package version' }
+$ResourceRoot = (Resolve-Path -LiteralPath $ResourceRoot).Path
+if (!$OutputRoot) { $OutputRoot = Join-Path $repoRoot 'release\portable' }
+$OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
+if (!$ReleaseExe) {
+  $targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repoRoot 'src-tauri\target' }
+  $ReleaseExe = Join-Path $targetRoot 'release\illutag.exe'
+}
 if ($Build) {
   Push-Location $repoRoot
   try {
-    Write-Host "[portable] running npm run tauri build -- --no-bundle ..."
-    npm run tauri build -- --no-bundle
-  } finally {
-    Pop-Location
-  }
+    & npm run tauri build -- --no-bundle
+    if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+  } finally { Pop-Location }
 }
-
-if (!(Test-Path $releaseExe)) {
-  throw "release exe not found: $releaseExe. Run npm run tauri build first, or use -Build."
-}
-
-$requiredPaths = @(
-  @{ Path = $releaseExe; Label = "release exe" },
-  @{ Path = (Join-Path $repoRoot "runtime\python\python.exe"); Label = "embedded python" },
-  @{ Path = (Join-Path $scriptSourceDir "wd_tagger_service.py"); Label = "wd tagger service script" },
-  @{ Path = (Join-Path $scriptSourceDir "chinese_clip_text_service.py"); Label = "clip text service script" },
-  @{ Path = (Join-Path $scriptSourceDir "chinese_clip_image_service.py"); Label = "clip image service script" },
-  @{ Path = (Join-Path $repoRoot "wd-swinv2-tagger-v3\model.onnx"); Label = "wd model" },
-  @{ Path = (Join-Path $repoRoot "wd-swinv2-tagger-v3\selected_tags.csv"); Label = "wd tags csv" },
-  @{ Path = (Join-Path $repoRoot "wd-swinv2-tagger-v3\selected_tags_full_translation.csv"); Label = "wd translation csv" },
-  @{ Path = (Join-Path $repoRoot "model\chinese-clip-vit-base-patch16\onnx\chinese_clip_text_encoder.onnx"); Label = "clip text onnx" },
-  @{ Path = (Join-Path $repoRoot "model\chinese-clip-vit-base-patch16\onnx\chinese_clip_image_encoder.onnx"); Label = "clip image onnx" },
-  @{ Path = (Join-Path $repoRoot "model\chinese-clip-vit-base-patch16\vocab.txt"); Label = "clip vocab" }
+$ReleaseExe = (Resolve-Path -LiteralPath $ReleaseExe).Path
+$required = @(
+  'runtime\python\python.exe',
+  'wd-swinv2-tagger-v3\model.onnx',
+  'wd-swinv2-tagger-v3\selected_tags.csv',
+  'wd-swinv2-tagger-v3\selected_tags_full_translation.csv',
+  'wd-swinv2-tagger-v3\tagger_config.json',
+  'wd-swinv2-tagger-v3\tag_groups.json',
+  'model\chinese-clip-vit-base-patch16\onnx\chinese_clip_text_encoder.onnx',
+  'model\chinese-clip-vit-base-patch16\onnx\chinese_clip_image_encoder.onnx',
+  'model\chinese-clip-vit-base-patch16\vocab.txt',
+  'model\chinese-clip-vit-base-patch16\preprocessor_config.json'
 )
-
-foreach ($item in $requiredPaths) {
-  if (!(Test-Path $item.Path)) {
-    throw ("missing {0}: {1}" -f $item.Label, $item.Path)
-  }
+foreach ($relative in $required) {
+  if (!(Test-Path -LiteralPath (Join-Path $ResourceRoot $relative) -PathType Leaf)) { throw "Missing resource: $relative" }
 }
-
-Write-Host "[portable] cleaning output: $portableRoot"
-if (Test-Path $portableAppDir) {
-  Remove-Item -LiteralPath $portableAppDir -Recurse -Force
-}
-if (Test-Path $zipPath) {
-  try {
-    Remove-Item -LiteralPath $zipPath -Force
-  } catch {
-    throw "zip file is locked: $zipPath. Close explorer preview/zip tools and retry."
-  }
-}
+$portableAppDir = Join-Path $OutputRoot "illuTag-$version"
+$zipPath = Join-Path $OutputRoot "illuTag-portable-$version.zip"
+# Never delete an existing release directory or overwrite another artifact.
+if ((Test-Path -LiteralPath $portableAppDir) -or (Test-Path -LiteralPath $zipPath)) { throw 'Output already exists; choose a new output directory' }
 New-Item -ItemType Directory -Path $portableAppDir -Force | Out-Null
-
-Write-Host "[portable] copying release exe"
-Copy-Item -LiteralPath $releaseExe -Destination (Join-Path $portableAppDir "illutag.exe") -Force
-
-Write-Host "[portable] copying runtime/python"
-Copy-Item -LiteralPath (Join-Path $repoRoot "runtime") -Destination (Join-Path $portableAppDir "runtime") -Recurse -Force
-
-Write-Host "[portable] copying scripts"
-Copy-Item -LiteralPath $scriptSourceDir -Destination (Join-Path $portableAppDir "scripts") -Recurse -Force
-
-Write-Host "[portable] copying wd model minimal files"
-$wdTargetDir = Join-Path $portableAppDir "wd-swinv2-tagger-v3"
-New-Item -ItemType Directory -Path $wdTargetDir | Out-Null
-Copy-Item -LiteralPath (Join-Path $repoRoot "wd-swinv2-tagger-v3\model.onnx") -Destination (Join-Path $wdTargetDir "model.onnx") -Force
-Copy-Item -LiteralPath (Join-Path $repoRoot "wd-swinv2-tagger-v3\selected_tags.csv") -Destination (Join-Path $wdTargetDir "selected_tags.csv") -Force
-Copy-Item -LiteralPath (Join-Path $repoRoot "wd-swinv2-tagger-v3\selected_tags_full_translation.csv") -Destination (Join-Path $wdTargetDir "selected_tags_full_translation.csv") -Force
-if (Test-Path (Join-Path $repoRoot "wd-swinv2-tagger-v3\dictionary01.xlsx")) {
-  Copy-Item -LiteralPath (Join-Path $repoRoot "wd-swinv2-tagger-v3\dictionary01.xlsx") -Destination (Join-Path $wdTargetDir "dictionary01.xlsx") -Force
+Copy-Item -LiteralPath $ReleaseExe -Destination (Join-Path $portableAppDir 'illutag.exe')
+Copy-Item -LiteralPath (Join-Path $repoRoot 'node_modules\@lucide\vue\LICENSE') -Destination (Join-Path $portableAppDir 'LICENSE-Lucide.txt')
+Copy-Item -LiteralPath (Join-Path $ResourceRoot 'runtime') -Destination (Join-Path $portableAppDir 'runtime') -Recurse
+foreach ($relative in $required | Where-Object { !$_.StartsWith('runtime\') }) {
+  $destination = Join-Path $portableAppDir $relative
+  New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+  Copy-Item -LiteralPath (Join-Path $ResourceRoot $relative) -Destination $destination
 }
-
-Write-Host "[portable] copying clip model minimal files"
-$clipBase = Join-Path $portableAppDir "model\chinese-clip-vit-base-patch16"
-$clipOnnx = Join-Path $clipBase "onnx"
-New-Item -ItemType Directory -Path $clipOnnx -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $repoRoot "model\chinese-clip-vit-base-patch16\onnx\chinese_clip_text_encoder.onnx") -Destination (Join-Path $clipOnnx "chinese_clip_text_encoder.onnx") -Force
-Copy-Item -LiteralPath (Join-Path $repoRoot "model\chinese-clip-vit-base-patch16\onnx\chinese_clip_image_encoder.onnx") -Destination (Join-Path $clipOnnx "chinese_clip_image_encoder.onnx") -Force
-Copy-Item -LiteralPath (Join-Path $repoRoot "model\chinese-clip-vit-base-patch16\vocab.txt") -Destination (Join-Path $clipBase "vocab.txt") -Force
-if (Test-Path (Join-Path $repoRoot "model\chinese-clip-vit-base-patch16\preprocessor_config.json")) {
-  Copy-Item -LiteralPath (Join-Path $repoRoot "model\chinese-clip-vit-base-patch16\preprocessor_config.json") -Destination (Join-Path $clipBase "preprocessor_config.json") -Force
+$scriptNames = @('wd_tagger_service.py','wd_tagger_test.py','chinese_clip_text_service.py','chinese_clip_image_service.py')
+New-Item -ItemType Directory -Path (Join-Path $portableAppDir 'scripts') | Out-Null
+foreach ($name in $scriptNames) { Copy-Item -LiteralPath (Join-Path $repoRoot "src-tauri\scripts\$name") -Destination (Join-Path $portableAppDir "scripts\$name") }
+Set-Content -LiteralPath (Join-Path $portableAppDir 'illutag.portable.json') -Value '{"dataDir":"data"}' -Encoding utf8NoBOM
+$records = foreach ($relative in $required | Where-Object { !$_.StartsWith('runtime\') }) {
+  $file = Get-Item -LiteralPath (Join-Path $portableAppDir $relative)
+  @{path=$relative.Replace('\','/');bytes=$file.Length;sha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
 }
-
-Write-Host "[portable] writing README-portable.txt"
-$readme = @"
-illuTag Portable Package
-=======================
-
-Contents:
-- illutag.exe
-- runtime/python (embedded python + dependencies)
-- scripts (python services)
-- wd-swinv2-tagger-v3 (minimal runtime files)
-- model/chinese-clip-vit-base-patch16 (onnx + vocab + preprocessor_config)
-
-Usage:
-1) Keep all folders next to illutag.exe.
-2) Launch illutag.exe directly.
-3) First run will still store app data under:
-   %AppData%\com.sunriseworks.illutag
-"@
-Set-Content -Path (Join-Path $portableAppDir "README-portable.txt") -Value $readme -Encoding UTF8
-
-Write-Host "[portable] creating zip: $zipPath"
-Compress-Archive -Path $portableAppDir -DestinationPath $zipPath -CompressionLevel Optimal
-
-$dirSize = (Get-ChildItem -Recurse -File $portableAppDir | Measure-Object Length -Sum).Sum
-$zipSize = (Get-Item $zipPath).Length
-Write-Host ("[portable] done. app_dir_size_mb={0} zip_size_mb={1}" -f `
-  [math]::Round($dirSize / 1MB, 2), `
-  [math]::Round($zipSize / 1MB, 2))
-Write-Host ("[portable] output dir: {0}" -f $portableAppDir)
-Write-Host ("[portable] output zip: {0}" -f $zipPath)
+@{appVersion=$version;chineseClip='onnx_v1';wdTagger='wd-swinv2-tagger-v3';files=@($records)} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $portableAppDir 'model-manifest.json') -Encoding utf8NoBOM
+$releaseRecords = foreach ($relative in @('illutag.exe','illutag.portable.json','model-manifest.json','LICENSE-Lucide.txt') + ($scriptNames | ForEach-Object {"scripts\$_"})) {
+  $file = Get-Item -LiteralPath (Join-Path $portableAppDir $relative)
+  @{path=$relative.Replace('\','/');bytes=$file.Length;sha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
+}
+@{version=$version;schemaVersion=2;sourceCommit=(& git -C $repoRoot rev-parse HEAD);files=@($releaseRecords)} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $portableAppDir 'release-manifest.json') -Encoding utf8NoBOM
+@"
+illuTag $version portable candidate
+Keep all folders together. Start illutag.exe; data is stored in the sibling data directory.
+This package contains no user database or source images. Restore a complete backup into an independent directory for evaluation.
+Complete backups exclude external source originals. Models are supplied in this program package.
+Schema 2 databases must never be opened with the old executable. Roll back the executable, scripts, configuration and schema 1 database as one saved set.
+"@ | Set-Content -LiteralPath (Join-Path $portableAppDir 'README-portable.txt') -Encoding utf8NoBOM
+if (!$SkipZip) {
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  [IO.Compression.ZipFile]::CreateFromDirectory($portableAppDir,$zipPath,[IO.Compression.CompressionLevel]::Optimal,$true)
+}
+Write-Output "Portable candidate: $portableAppDir"
+if (!$SkipZip) { Write-Output "Archive: $zipPath" }

@@ -1,5 +1,4 @@
 import argparse
-import csv
 import json
 import os
 import sys
@@ -7,8 +6,6 @@ import time
 
 try:
     import numpy as np
-    import onnxruntime as ort
-    from PIL import Image
 except ModuleNotFoundError as e:
     missing = getattr(e, "name", "unknown")
     print(
@@ -17,61 +14,28 @@ except ModuleNotFoundError as e:
     )
     sys.exit(2)
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ort_runtime import create_session
+from wd_tagger_service import (
+    infer_layout,
+    load_tagger_config,
+    load_tags,
+    preprocess_image,
+    resolve_hw,
+    to_probs,
+)
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="WD SwinV2 tagger single-image test")
+    parser = argparse.ArgumentParser(description="Local ONNX tagger single-image test")
     parser.add_argument("--image", required=True, help="Source image path")
     parser.add_argument("--model", required=True, help="model.onnx path")
     parser.add_argument("--tags", required=True, help="selected_tags.csv path")
-    parser.add_argument("--general-threshold", type=float, default=0.35)
-    parser.add_argument("--character-threshold", type=float, default=0.85)
+    parser.add_argument("--general-threshold", type=float, default=0.2)
+    parser.add_argument("--character-threshold", type=float, default=0.2)
     parser.add_argument("--image-id", default="")
+    parser.add_argument("--provider", choices=["cpu", "cuda"], default="cpu")
     return parser.parse_args()
-
-
-def load_tags(csv_path):
-    tags = []
-    with open(csv_path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            name = row.get("name", "").strip()
-            category_raw = row.get("category", "0").strip()
-            if not name:
-                continue
-            try:
-                category = int(category_raw)
-            except ValueError:
-                category = 0
-            tags.append((name, category))
-    if not tags:
-        raise RuntimeError("No tags loaded from selected_tags.csv")
-    return tags
-
-
-def to_rgb_with_white_bg(image):
-    rgba = image.convert("RGBA")
-    base = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
-    base.alpha_composite(rgba)
-    return base.convert("RGB")
-
-
-def pad_to_square(image_rgb):
-    w, h = image_rgb.size
-    side = max(w, h)
-    canvas = Image.new("RGB", (side, side), (255, 255, 255))
-    canvas.paste(image_rgb, ((side - w) // 2, (side - h) // 2))
-    return canvas
-
-
-def preprocess(image_path, input_height, input_width):
-    image = Image.open(image_path)
-    image = to_rgb_with_white_bg(image)
-    image = pad_to_square(image)
-    image = image.resize((input_width, input_height), Image.Resampling.BICUBIC)
-    arr = np.asarray(image, dtype=np.float32)
-    arr = arr[:, :, ::-1]
-    arr = np.expand_dims(arr, axis=0)
-    return arr
 
 
 def main():
@@ -83,25 +47,35 @@ def main():
     if not os.path.isfile(args.tags):
         raise RuntimeError(f"selected_tags.csv not found: {args.tags}")
 
-    session = ort.InferenceSession(args.model, providers=["CPUExecutionProvider"])
+    config = load_tagger_config(args.model)
+    preprocess = str(config.get("preprocess", "wd")).strip().lower() or "wd"
+    apply_sigmoid = bool(config.get("apply_sigmoid", False))
+    configured_output = str(config.get("output_name", "") or "").strip()
+    if config.get("general_threshold") is not None:
+        general_threshold = float(config["general_threshold"])
+    else:
+        general_threshold = float(args.general_threshold)
+    if config.get("character_threshold") is not None:
+        character_threshold = float(config["character_threshold"])
+    else:
+        character_threshold = float(args.character_threshold)
+
+    session = create_session(args.model, args.provider, "wd-test")
     input_info = session.get_inputs()[0]
-    output_info = session.get_outputs()[0]
+    outputs = session.get_outputs()
     input_name = input_info.name
-    output_name = output_info.name
-
+    output_names = [item.name for item in outputs]
+    output_name = configured_output if configured_output in output_names else output_names[0]
     shape = input_info.shape
-    if len(shape) != 4:
-        raise RuntimeError(f"Unexpected input shape: {shape}")
+    layout = infer_layout(shape, preprocess, str(config.get("layout", "") or "").strip().lower())
+    input_height, input_width = resolve_hw(shape, layout)
 
-    input_height = shape[1] if isinstance(shape[1], int) else 448
-    input_width = shape[2] if isinstance(shape[2], int) else 448
-
-    tensor = preprocess(args.image, int(input_height), int(input_width))
+    tensor = preprocess_image(args.image, preprocess, input_height, input_width)
     start = time.perf_counter()
-    outputs = session.run([output_name], {input_name: tensor})
+    raw = session.run([output_name], {input_name: tensor})
     elapsed_ms = (time.perf_counter() - start) * 1000.0
 
-    probs = outputs[0][0].astype(np.float32).tolist()
+    probs = to_probs(raw[0][0], apply_sigmoid)
     tags = load_tags(args.tags)
     if len(probs) != len(tags):
         raise RuntimeError(
@@ -111,14 +85,13 @@ def main():
     ratings = []
     general_tags = []
     character_tags = []
-
     for score, (name, category) in zip(probs, tags):
         item = {"tag": name, "score": float(score)}
         if category == 9:
             ratings.append(item)
-        elif category == 0 and score >= args.general_threshold:
+        elif category == 0 and score >= general_threshold:
             general_tags.append(item)
-        elif category == 4 and score >= args.character_threshold:
+        elif category == 4 and score >= character_threshold:
             character_tags.append(item)
 
     ratings.sort(key=lambda x: x["score"], reverse=True)
@@ -130,8 +103,8 @@ def main():
         "ratings": ratings,
         "generalTags": general_tags,
         "characterTags": character_tags,
-        "generalThreshold": float(args.general_threshold),
-        "characterThreshold": float(args.character_threshold),
+        "generalThreshold": float(general_threshold),
+        "characterThreshold": float(character_threshold),
         "elapsedMs": float(elapsed_ms),
     }
     print(json.dumps(result, ensure_ascii=False))

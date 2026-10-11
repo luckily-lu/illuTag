@@ -2,7 +2,9 @@ import argparse
 import csv
 import json
 import os
+import queue
 import sys
+import threading
 import time
 
 try:
@@ -145,21 +147,56 @@ def main():
     layout = infer_layout(shape, preprocess, str(config.get("layout", "") or "").strip().lower())
     input_height, input_width = resolve_hw(shape, layout)
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+    # 预取线程：提前读取请求并完成预处理，与主线程的 GPU 推理重叠
+    work_queue = queue.Queue(maxsize=4)
+
+    def request_reader():
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            image_id = ""
+            try:
+                request = json.loads(line)
+                image_id = str(request.get("image_id", "")).strip()
+                image_path = str(request.get("image_path", "")).strip()
+                if not image_path:
+                    raise RuntimeError("image_path is empty")
+                if not os.path.isfile(image_path):
+                    raise RuntimeError(f"Image not found: {image_path}")
+                p0 = time.perf_counter()
+                tensor = preprocess_image(image_path, preprocess, input_height, input_width)
+                preprocess_ms = (time.perf_counter() - p0) * 1000.0
+                work_queue.put(("ok", image_id, request, tensor, preprocess_ms, None))
+            except Exception as error:
+                work_queue.put(("err", image_id, None, None, 0.0, str(error)))
+        work_queue.put(("eof", None, None, None, 0.0, None))
+
+    threading.Thread(target=request_reader, daemon=True).start()
+
+    while True:
+        kind, image_id, request, tensor, preprocess_ms, read_error = work_queue.get()
+        if kind == "eof":
+            break
         total_start = time.perf_counter()
-        image_id = ""
-        image_path = ""
-        preprocess_ms = 0.0
         inference_ms = 0.0
         postprocess_ms = 0.0
         total_ms = 0.0
+        if kind == "err":
+            print(
+                f"[wd-service] image_id={image_id or 'unknown'} error={read_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(
+                json.dumps(
+                    {"error": read_error, "imageId": image_id, "totalMs": 0.0},
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            continue
         try:
-            request = json.loads(line)
-            image_id = str(request.get("image_id", "")).strip()
-            image_path = str(request.get("image_path", "")).strip()
             if config.get("general_threshold") is not None:
                 general_threshold = float(config["general_threshold"])
             else:
@@ -168,15 +205,6 @@ def main():
                 character_threshold = float(config["character_threshold"])
             else:
                 character_threshold = float(request.get("character_threshold", 0.2))
-
-            if not image_path:
-                raise RuntimeError("image_path is empty")
-            if not os.path.isfile(image_path):
-                raise RuntimeError(f"Image not found: {image_path}")
-
-            p0 = time.perf_counter()
-            tensor = preprocess_image(image_path, preprocess, input_height, input_width)
-            preprocess_ms = (time.perf_counter() - p0) * 1000.0
 
             i0 = time.perf_counter()
             outputs_raw = session.run([output_name], {input_name: tensor})
@@ -208,7 +236,7 @@ def main():
             total_ms = (time.perf_counter() - total_start) * 1000.0
 
             print(
-                f"[wd-service] image_id={image_id or image_path} preprocess_ms={preprocess_ms:.2f} "
+                f"[wd-service] image_id={image_id} preprocess_ms={preprocess_ms:.2f} "
                 f"inference_ms={inference_ms:.2f} postprocess_ms={postprocess_ms:.2f} total_ms={total_ms:.2f}",
                 file=sys.stderr,
                 flush=True,
@@ -236,7 +264,7 @@ def main():
         except Exception as error:
             total_ms = (time.perf_counter() - total_start) * 1000.0
             print(
-                f"[wd-service] image_id={image_id or image_path or 'unknown'} error={error} total_ms={total_ms:.2f}",
+                f"[wd-service] image_id={image_id or 'unknown'} error={error} total_ms={total_ms:.2f}",
                 file=sys.stderr,
                 flush=True,
             )

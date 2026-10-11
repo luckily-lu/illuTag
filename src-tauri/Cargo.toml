@@ -1,7 +1,11 @@
 [package]
 name = "illutag"
-version = "1.0.7"
+version = "1.1.0-rc.1"
 edition = "2021"
+
+[features]
+default = []
+custom-protocol = ["tauri/custom-protocol"]
 
 [lib]
 name = "illutag_core"
@@ -9,13 +13,13 @@ path = "src/lib.rs"
 
 [dependencies]
 arboard = "3.4"
-base64 = "0.22"
 calamine = "0.26"
 image = { version = "0.25", default-features = false, features = ["avif", "bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+ts-rs = { version = "12", features = ["serde-json-impl"] }
 tauri = { version = "=2.11.2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "=2.7.1"
 trash = "5"
