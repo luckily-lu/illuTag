@@ -53,7 +53,7 @@ foreach ($relative in $required | Where-Object { !$_.StartsWith('runtime\') }) {
   New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
   Copy-Item -LiteralPath (Join-Path $ResourceRoot $relative) -Destination $destination
 }
-$scriptNames = @('wd_tagger_service.py','wd_tagger_test.py','chinese_clip_text_service.py','chinese_clip_image_service.py')
+$scriptNames = @('wd_tagger_service.py','wd_tagger_test.py','chinese_clip_text_service.py','chinese_clip_image_service.py','ort_runtime.py')
 New-Item -ItemType Directory -Path (Join-Path $portableAppDir 'scripts') | Out-Null
 foreach ($name in $scriptNames) { Copy-Item -LiteralPath (Join-Path $repoRoot "src-tauri\scripts\$name") -Destination (Join-Path $portableAppDir "scripts\$name") }
 Set-Content -LiteralPath (Join-Path $portableAppDir 'illutag.portable.json') -Value '{"dataDir":"data"}' -Encoding utf8NoBOM

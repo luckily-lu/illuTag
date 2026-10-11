@@ -410,6 +410,9 @@ pub(super) fn tag_images_with_wd_model(
                     set_scan_progress_error(progress, &error);
                     push_scan_progress_recent_error(progress, &error);
                     read_idx += 1;
+                    // The failed item has consumed its one retry. Restart the remaining
+                    // pipeline at the next item, including any lost prefetch request.
+                    send_idx = read_idx;
                     retried_current = false;
                 } else {
                     retried_current = true;

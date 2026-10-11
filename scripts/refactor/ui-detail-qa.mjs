@@ -36,6 +36,18 @@ try {
   await page.getByRole('textbox', { name: '新增标签' }).focus();
   await page.keyboard.press('Escape');
   assert.equal(await page.locator('.viewer').count(), 0);
+  await page.getByRole('button', { name: '查看 画面_1.png', exact: true }).click();
+  for (const width of [500, 768, 1024, 1280, 1920]) {
+    await page.setViewportSize({ width, height: width === 500 ? 500 : 840 });
+    await page.waitForTimeout(350);
+    await overflow();
+    const panel = await page.locator('.viewer-info').evaluate(n => ({ width: n.clientWidth, scrollWidth: n.scrollWidth }));
+    assert.ok(panel.scrollWidth <= panel.width, `tag panel overflows at ${width}px`);
+    assert.equal(await page.getByRole('button', { name: '关闭查看器' }).isVisible(), true);
+    if (width === 500 || width === 1920) await page.screenshot({ path: `${output}/ui-viewer-${width}-updated.png` });
+    checks.push(`viewer table at ${width}px`);
+  }
+  await page.keyboard.press('Escape');
   checks.push('SVG navigation', 'Chinese chip preserves English query ID', 'aligned bilingual tag table', 'custom select keyboard / Escape layering', 'Escape in text field');
   for (const width of [500, 768, 1024, 1280, 1920]) {
     await page.setViewportSize({ width, height: 840 });
