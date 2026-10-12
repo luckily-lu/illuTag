@@ -418,6 +418,10 @@ pub fn start_startup_cleanup(state: &AppState) -> Result<bool, String> {
     if *running {
         return Ok(false);
     }
+    *state
+        .startup_cleanup_error
+        .lock()
+        .map_err(|_| "Startup cleanup error state is locked".to_string())? = None;
     *running = true;
     drop(running);
 
@@ -425,12 +429,16 @@ pub fn start_startup_cleanup(state: &AppState) -> Result<bool, String> {
     let library_cache = Arc::clone(&state.library);
     let startup_cleanup_running = Arc::clone(&state.startup_cleanup_running);
     let startup_cleanup_generation = Arc::clone(&state.startup_cleanup_generation);
+    let startup_cleanup_error = Arc::clone(&state.startup_cleanup_error);
     let clip_vector_cache = Arc::clone(&state.clip_vector_cache);
 
     thread::spawn(move || {
         let result = cleanup_missing_library_images_batched(&database_path, 256);
         if let Err(error) = &result {
             eprintln!("[startup-cleanup] {error}");
+            if let Ok(mut last_error) = startup_cleanup_error.lock() {
+                *last_error = Some(error.clone());
+            }
         } else if let Ok(removed) = result {
             eprintln!("[startup-cleanup] removed {removed} missing library images");
         }

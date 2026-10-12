@@ -412,6 +412,30 @@ fn write_portable_config(path: &Path, config: &PortableConfig) -> Result<(), Str
     illutag_core::runtime::write_atomic(path, text.as_bytes())
 }
 
+fn configured_portable_data_dir(
+    config: &PortableConfig,
+    executable_dir: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let Some(value) = config
+        .data_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let configured = PathBuf::from(value);
+    let resolved = if configured.is_absolute() {
+        configured
+    } else {
+        executable_dir.join(configured)
+    };
+    if !resolved.is_absolute() {
+        return Err("便携数据目录不能使用依赖当前工作目录的驱动器相对路径".into());
+    }
+    Ok(Some(resolved))
+}
+
 #[tauri::command]
 async fn migrate_data_directory_command(
     target_dir: String,
@@ -450,15 +474,13 @@ fn resolve_portable_data_dir(system_app_data_dir: PathBuf) -> (PathBuf, Option<S
     if let Ok(config_path) = portable_config_path() {
         match read_portable_config(&config_path) {
             Ok(config) => {
-                if let Some(configured_data_dir) = config
-                    .data_dir
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    let configured_data_dir = PathBuf::from(configured_data_dir);
-                    match fs::create_dir_all(&configured_data_dir) {
-                        Ok(()) => return (configured_data_dir, None),
+                let configured_dir = config_path
+                    .parent()
+                    .ok_or_else(|| "无法定位便携配置目录".to_string())
+                    .and_then(|dir| configured_portable_data_dir(&config, dir));
+                if let Ok(Some(configured_data_dir)) = configured_dir.as_ref() {
+                    match fs::create_dir_all(configured_data_dir) {
+                        Ok(()) => return (configured_data_dir.clone(), None),
                         Err(error) => {
                             let message = format!(
                                 "配置的数据目录 {} 无法创建：{error}。已回退到默认数据目录。",
@@ -467,6 +489,8 @@ fn resolve_portable_data_dir(system_app_data_dir: PathBuf) -> (PathBuf, Option<S
                             eprintln!("[data-dir] {message}");
                         }
                     }
+                } else if let Err(error) = configured_dir {
+                    eprintln!("[data-dir] {error}");
                 }
             }
             Err(error) => eprintln!("[data-dir] {error}"),
@@ -734,4 +758,84 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run illuTag");
+}
+
+#[cfg(test)]
+mod portable_path_tests {
+    use super::*;
+
+    #[test]
+    fn relative_data_directory_is_anchored_to_executable() {
+        let executable_dir = env::temp_dir().join("illutag-portable-app");
+        let config = PortableConfig {
+            data_dir: Some(" data ".into()),
+        };
+        let expected = executable_dir.join("data");
+        assert_eq!(
+            configured_portable_data_dir(&config, &executable_dir).unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn absolute_data_directory_is_preserved() {
+        let data_dir = env::temp_dir().join("illutag-existing-library");
+        let config = PortableConfig {
+            data_dir: Some(data_dir.to_string_lossy().into()),
+        };
+        assert_eq!(
+            configured_portable_data_dir(&config, &env::temp_dir()).unwrap(),
+            Some(data_dir)
+        );
+        #[cfg(windows)]
+        {
+            let production = PathBuf::from(r"\\?\D:\Ai\illuTag-danbooru-tag-query");
+            let config = PortableConfig {
+                data_dir: Some(production.to_string_lossy().into()),
+            };
+            assert_eq!(
+                configured_portable_data_dir(&config, &env::temp_dir()).unwrap(),
+                Some(production)
+            );
+        }
+    }
+
+    #[test]
+    fn empty_and_unknown_configuration_keeps_default_resolution() {
+        for json in [r"{}", r#"{"dataDir":" "}"#, r#"{"unknown":"data"}"#] {
+            let config = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                configured_portable_data_dir(&config, &env::temp_dir()).unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn shortcut_working_directory_cannot_redirect_portable_data() {
+        struct RestoreWorkingDirectory(PathBuf);
+        impl Drop for RestoreWorkingDirectory {
+            fn drop(&mut self) {
+                env::set_current_dir(&self.0).expect("restore test working directory");
+            }
+        }
+        let _restore = RestoreWorkingDirectory(env::current_dir().unwrap());
+        let executable_dir = env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        let config = PortableConfig {
+            data_dir: Some("data".into()),
+        };
+        let before = configured_portable_data_dir(&config, &executable_dir).unwrap();
+        env::set_current_dir(env::temp_dir()).unwrap();
+        let after = configured_portable_data_dir(&config, &executable_dir).unwrap();
+        assert_eq!(after, before);
+        assert_eq!(after, Some(executable_dir.join("data")));
+        #[cfg(windows)]
+        assert!(configured_portable_data_dir(
+            &PortableConfig {
+                data_dir: Some("D:relative".into())
+            },
+            &executable_dir,
+        )
+        .is_err());
+    }
 }

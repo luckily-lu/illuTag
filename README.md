@@ -1,255 +1,108 @@
-# illuTag
+# illuTag 1.1.0
 
-illuTag 是一个面向二次元创作者、插画师、原型师、插画囤积癖等用户的参考图整理和本地图像管理工具。
+illuTag 是本地图片画廊与标签管理工具，使用 Vue 3、TypeScript、Tauri 2、Rust、SQLite 和 Python ONNX。图片处理和搜索在本机运行。
 
-它基于 Tauri、Vue 3、Rust、SQLite 和本地 ONNX 推理构建，重点是快速浏览本地图像、整理参考图、使用 Danbooru 风格标签管理图片，并通过本地模型提供自然语言搜图和以图搜图能力。用户图片不会上传到远程服务，主要功能都在本地运行。
+本轮界面采用浅色“无框画廊”：原比例虚拟瀑布流、固定搜索区、文字与图标次要操作、炭黑主按钮。信息面板按中文标签、英文原名、置信度分栏。
 
-> 演示视频：待补充
-## 下载
-在右边的Releases下载完整的包体，或克隆本仓库自行配置环境。
-## 说人话
+## 浏览、搜索和整理
 
-illuTag 可以管理你辛辛苦苦从x、pixiv、小红书等等地方存下来的图片，并为它们自动生成标签，例如“白色头发”“初音未来”“黑色丝袜”“蝴蝶结”“魔法少女”等。
+- 标签、文件名和自然语言可组合查询。结构化条件先筛选，自然语言在候选范围内精确排序，最多返回前 600 项。
+- 全部、随机、收藏、待分类、应用回收站，以及多级虚拟文件夹；虚拟分类不移动磁盘原图。
+- 拖拽分类、标签管理与字典、自动分类规则、批量操作和系统回收站。
+- 大图缩放平移、轮播、窗口置顶和复制原图。关闭查看器后恢复浏览状态。
+- DanbooruTagQuery 自动打标保留部署模型和预处理，生效通用/角色阈值为 0.2/0.2；目录名沿用 `wd-swinv2-tagger-v3`。
+- Chinese-CLIP 图片索引用于自然语言搜索，生成时读取原图。
 
-当你只输入“白色”时，它也可以联想出“白色头发”“白色背景”“白色连衣裙”等标签，防止你根本不知道图库里有什么标签。
+普通以图、配色和氛围相似搜索已移除。历史配色、氛围、参考板及托管图片数据保留，并继续进入完整备份。
 
-`selected_tags_full_translation.csv` 包含约 10000 条用于自动生成的标签。中文翻译一部分来自网络，一部分来自 ChatGPT 翻译；我校对了其中最为高频的2000条通用标签和2、3000条角色标签，基本上以donmai.moe的wiki为准。
+## 来源和任务
 
-如果要找的图片不好用标签描述，例如“夏日海滩边喝饮料的红发美少女”，可以直接使用自然语言搜索。结果越靠前，通常越接近描述。
+在“设置 → 图库与存储”登记磁盘来源后，到任务中心手动扫描或启动一键处理。登记来源、启动应用、切换缩略图显示不会自动开始后台任务。
 
-如果你不知道怎么描述，可以尝试以图搜图。
+一键处理顺序为：扫描来源 → 缩略图（启用时）→ 自然语言图片索引 → 自动打标。重任务串行排队；暂停/继续在当前进程内有效，取消保留已提交结果。重启后未完成任务标为已中断，由用户重新运行；有效历史结果继续复用。
 
-内置模型主要是成熟的开源模型，不一定认识最新角色。对于没有角色标签的图片，可以先用以图搜图找到相似图片，再批量添加自定义标签。自然语言搜索建议使用指向明确的描述，避免过于含糊或多义的句子。
+扫描失败停止一键流水线。独立后续阶段失败可继续其它阶段，任务最终显示部分完成。缺失文件清理是手动操作，离线来源不会被整盘清理，文件读取权限错误不会被当作缺失。
 
-如果想把图片当作参考，可以在大图模式下单击放大细品，配合窗口置顶与 ps、csp、zb 等软件一起使用。也可以从其他网站直接拖入图片，并进一步保存到本地图库。
+## 数据和备份
 
-如果你只想舔图，右上角点击“最大化”，然后滚动滚轮。我用了效率不是很高的瀑布流算法，但很好看。
+便携版包含 `illutag.portable.json`。其中相对 `dataDir` 以 EXE 所在目录解析，绝对路径保持不变。数据库文件为 `illutag.sqlite`，新数据版本为 schema 2。
 
-如果你不知道如何使用这个软件，可以长按拖拽一下，很多功能都通过拖拽来实现。
+“完整恢复包”使用 SQLite Backup API，包含数据库、偏好、窗口状态、必要配置及现存托管图片。外部来源原图不包含在恢复包内；模型由程序包提供，缩略图是可重建缓存。旧 JSON 仍可交换元数据，但不是完整恢复包。
 
-## 功能截图
+恢复和目录迁移先校验副本再切换，失败保留原库，成功后需要重启。schema 2 数据库不能交给旧 EXE；回滚需同时恢复旧程序、脚本、配置和 schema 1 数据库。
 
-### 界面概览
-
-![界面概览](./img/PixPin_2026-05-31_17-36-48.gif)
-
-### 导入本地图像
-
-支持按本地目录生成对应的文件夹分类。
-（为防止冲突，该功能仅在首次导入时可使用）
-
-![导入本地图像](./img/001.png)
-
-![文件夹分类](./img/005.png)
-
-### 虚拟化瀑布流浏览
-
-![虚拟化瀑布流](./img/002.png)
-
-### 自动标签
-
-支持为图片生成角色标签与通用标签。
-
-![自动标签](./img/004.png)
-
-### Chinese-CLIP 搜索
-
-支持自然语言搜图与以图搜图。
-
-![自然语言搜图](./img/clip.png)
-
-![以图搜图](./img/clip2.png)
-
-### 用户文件夹与规则
-
-可以根据标签规则将图片自动归类到文件夹。
-
-![文件夹规则](./img/003.png)
-
-### 批量操作
-
-支持喜爱图片、批量移动、批量添加标签等操作。
-
-![批量操作](./img/010.png)
-
-### 标签搜索与中文联想
-
-![标签搜索](./img/008.png)
-
-### 相似搜索
-
-支持配色相似、氛围相似等辅助搜索。
-
-![相似搜索](./img/009.png)
-
-## 功能概览
-
-- 本地图像图库索引（实测 80 万张图规模可用）
-- 虚拟化瀑布流浏览
-- 用户文件夹与文件夹规则
-- 软件内回收站与本地删除
-- 喜爱图片与批量操作
-- Danbooru 标签搜索与中文标签联想
-- 基于 DanbooruTagQuery 的自动打标
-- 基于 Chinese-CLIP 的自然语言搜图与以图搜图
-- 配色相似、氛围相似等辅助搜索
-- 分发版支持内置 Python runtime，解压即用
-
-## 当前状态
-
-项目仍在活跃开发中。图库、文件夹、标签、搜索和基础分发流程已经可用，但数据结构、打包方式和部分交互仍可能继续调整。（大概吧）
-
-## 本分支与上游的差异
-
-本仓库（luckily-lu/illuTag）在上游基础上做了以下主要改动：
-
-- 打标模型更换为 [DanbooruTagQuery](https://github.com/realphongha/danbooru-tag-query)（L16/448，官方推荐阈值 0.2，copyright 标签并入通用标签），目录名仍沿用 `wd-swinv2-tagger-v3` 以保持兼容
-- 移除了参考板与右侧栏功能、移除启动时的更新检查
-- 大规模图库性能优化（实测 80 万+ 张图）：
-  - 标签筛选与文件夹 scope 查询改写为 IN 子查询并新增覆盖索引
-  - 扫描写入批量化、打标流水线化（推理与预处理重叠）
-  - 启动路径移除 CLIP 向量缓存同步预热（809K×512 向量约 1.66GB），改为惰性加载，热启动到可交互 5.4s → 1.8s
-  - 重命令全部移出主线程
-  - 详见 [启动性能诊断报告](./docs/startup-perf/2026-09-25-startup-perf.md)
-- 修复标签浏览下回收站/还原操作后视图被清空、切换"全部/随机/文件夹"丢失搜索条件的问题
-
-## 仓库内容
-
-源码仓库不会包含大型运行资源。
-
-仓库包含：
-
-- Tauri / Vue / Rust 源码
-- 本地 ONNX 推理所需的 Python 服务脚本（`src-tauri/scripts/`）
-- `wd-swinv2-tagger-v3/selected_tags.csv`
-- `wd-swinv2-tagger-v3/selected_tags_full_translation.csv`
-- 便携版打包脚本（`scripts/package-portable.ps1`）
-- 启动性能基线采集工具（`scripts/startup-perf/`）
-
-仓库不包含：
-
-- ONNX 模型权重
-- Chinese-CLIP 模型文件
-- 内置 Python runtime
-- 便携版 release 压缩包
-- 本地数据库、缓存和用户数据
-
-## 开发运行
-
-安装依赖：
+## 开发和验证
 
 ```powershell
-npm install
+npm ci
+npm test
+npm run build
+cargo check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml --all-targets
 ```
 
-开发模式运行：
+浏览器界面预览：
 
 ```powershell
+npm run dev
+# 打开 http://127.0.0.1:1421/?preview=1，内容为测试素材。
+```
+
+真实 Tauri 开发测试必须显式隔离数据、WebView、素材和日志：
+
+```powershell
+$env:ILLUTAG_DATA_ROOT='D:\illuTag-test\data'
+$env:ILLUTAG_PROFILE_ROOT='D:\illuTag-test\profile'
+$env:ILLUTAG_ASSET_ROOT='D:\illuTag-test\assets'
+$env:ILLUTAG_LOG_ROOT='D:\illuTag-test\logs'
+$env:ILLUTAG_RESOURCE_ROOT='D:\illuTag-test\program'
 npm run tauri dev
 ```
 
-构建 release 可执行文件：
+隔离路径必须是有效绝对路径。资源目录必须提供完整 runtime、模型、字典、配置和脚本；错误配置直接失败。测试素材使用独立可写目录，勿通过源码模型 Junction 改写生产资源。
+
+正式 EXE 构建必须嵌入前端：
 
 ```powershell
-npm run tauri build
+npm run build
+cargo build --manifest-path src-tauri/Cargo.toml --release --features custom-protocol
 ```
 
-release 可执行文件通常会生成在：
+## 便携包
 
-```text
-src-tauri/target/release/
+准备完整资源目录后执行：
+
+```powershell
+.\scripts\package-portable.ps1 -ResourceRoot 'D:\illuTag-resources' -OutputRoot 'D:\illuTag-releases'
 ```
 
-## 本地数据
-
-illuTag 默认使用 Tauri 的应用数据目录保存用户数据。
-
-在 Windows 上通常是：
+脚本读取当前项目版本，不覆盖已存在的包。可用 `-Build` 先构建，用 `-ReleaseExe` 指定 EXE，用 `-SkipZip` 只生成文件夹。必须包含 `tagger_config.json`、`tag_groups.json` 和 `ort_runtime.py`。模型、脚本和字典优先从 EXE 同级加载，避免快捷方式工作目录影响资源选择。
 
 ```text
-%AppData%\com.sunriseworks.illutag
-```
-
-图库索引数据库会保存为：
-
-```text
-illutag.sqlite
-```
-
-删除或替换程序本体不会自动删除这个目录。
-
-## OnnxRuntime 与模型
-
-打标功能需要本地模型和运行环境，这些文件不会随源码仓库提供。打标模型使用 DanbooruTagQuery（目录名沿用 `wd-swinv2-tagger-v3`，由 `tagger_config.json` 描述预处理与阈值）。
-
-推荐的便携版目录结构：
-
-```text
-illuTag/
+illuTag-1.1.0/
   illutag.exe
-  runtime/
-    python/
-      python.exe
-      Lib/
-      ...
+  illutag.portable.json
+  model-manifest.json
+  release-manifest.json
+  runtime/python/
   scripts/
-    wd_tagger_service.py
-    chinese_clip_text_service.py
-    chinese_clip_image_service.py
   wd-swinv2-tagger-v3/
-    model.onnx
-    selected_tags.csv
-    selected_tags_full_translation.csv
-    tagger_config.json
-  model/
-    chinese-clip-vit-base-patch16/
-      vocab.txt
-      onnx/
-        chinese_clip_text_encoder.onnx
-        chinese_clip_image_encoder.onnx
+  model/chinese-clip-vit-base-patch16/
+  data/                         # 首次运行创建，不包含在程序包内
 ```
 
-程序会优先使用可执行文件同级的：
+源码不包含大型模型权重、Python runtime、用户数据库及原图。
 
-```text
-runtime/python/python.exe
-```
+## 维护结构
 
-如果没有找到内置 Python runtime，则会回退到系统 `PATH` 中的 `python`。
+前端按图库、搜索、文件夹、标签、查看器、任务和设置划分；共享 IPC 客户端、类型契约和基础控件位于 `src/shared`。状态通过 composable 与 typed provide/inject 组织。
 
-## 便携版打包
+Rust 入口负责装配、窗口和命令注册，业务与 SQLite、模型进程、任务、备份恢复分开。DTO 经 ts-rs 生成 TypeScript 契约。元数据修改返回局部变更和逐项失败；任务进度限频，终态即时通知；普通修改不重载全库。
 
-准备好 release 可执行文件、runtime、脚本和模型文件后，可以运行：
+`scripts/refactor` 包含隔离原生验收、完整恢复、模型回归、故障和性能脚本。性能比较必须使用同机、同一数据库快照、同窗口与模型配置；5 次热启动，每次观察 90 秒。历史启动数据只作参考。
 
-```powershell
-.\scripts\package-portable.ps1 -Version "0.1.0"
-```
+## 第三方资源
 
-也可以先构建再打包：
-
-```powershell
-.\scripts\package-portable.ps1 -Build -Version "0.1.0"
-```
-
-输出目录：
-
-```text
-release/portable/
-```
-
-## 第三方模型与致谢
-
-illuTag 可以使用以下开源模型：
-
-- [OFA-Sys/Chinese-CLIP](https://github.com/OFA-Sys/Chinese-CLIP)，许可证为 MIT License。
-- [realphongha/danbooru-tag-query](https://github.com/realphongha/danbooru-tag-query)（DanbooruTagQuery_l16_448x448），许可证请以模型仓库说明为准。
-
-这些项目不属于 illuTag。下载、使用或再分发相关模型文件时，请遵守它们各自的许可证和模型说明。
-
-仓库中包含的 Danbooru 风格标签词典文件用于本地标签检索和中文联想。第三方来源材料保留其各自权利与许可证。
-
-## 许可证
-
-illuTag 源码使用 MIT License 发布，详见 [LICENSE](LICENSE)。
-
-第三方模型、运行时、依赖库和数据集保留其各自许可证。
+- Chinese-CLIP：https://github.com/OFA-Sys/Chinese-CLIP
+- DanbooruTagQuery：https://github.com/realphongha/danbooru-tag-query
+- Lucide 图标的许可证随便携包提供。模型许可证以各模型仓库说明为准。

@@ -256,6 +256,85 @@ fn offline_source_cleanup_preserves_images() {
         0
     );
 }
+
+#[test]
+fn cleanup_removes_missing_files_and_keeps_accessible_files() {
+    let f = Fixture::new(3);
+    let existing = f.root.join("image-000000.png");
+    fs::write(&existing, b"existing fixture").unwrap();
+    assert_eq!(
+        cleanup_missing_library_images_batched(&f.state.database_path, 32).unwrap(),
+        2
+    );
+    let conn = open_database(&f.state.database_path).unwrap();
+    let remaining: String = conn
+        .query_row("SELECT path FROM images", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(remaining, existing.to_string_lossy());
+}
+
+#[test]
+fn cleanup_does_not_treat_metadata_errors_as_missing_files() {
+    let f = Fixture::new(1);
+    {
+        let conn = open_database(&f.state.database_path).unwrap();
+        conn.execute("UPDATE images SET path=?1", ["invalid\0path.png"])
+            .unwrap();
+    }
+    let error = cleanup_missing_library_images_batched(&f.state.database_path, 32).unwrap_err();
+    assert!(error.contains("已停止清理并保留索引"), "{error}");
+    let conn = open_database(&f.state.database_path).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM images", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn cleanup_worker_reports_failure_to_jobs_and_clears_it_on_retry() {
+    let f = Fixture::new(1);
+    {
+        let conn = open_database(&f.state.database_path).unwrap();
+        conn.execute("UPDATE images SET path=?1", ["invalid\0path.png"])
+            .unwrap();
+    }
+    assert!(start_startup_cleanup(&f.state).unwrap());
+    let wait_for_cleanup = || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while startup_cleanup_status(&f.state).unwrap().running {
+            assert!(Instant::now() < deadline, "cleanup worker did not finish");
+            thread::sleep(Duration::from_millis(5));
+        }
+    };
+    wait_for_cleanup();
+    let (failures, errors) = crate::jobs::cleanup_failures(&f.state).unwrap();
+    assert_eq!(failures, 1);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("已停止清理并保留索引"));
+    let existing = f.root.join("image-000000.png");
+    fs::write(&existing, b"existing fixture").unwrap();
+    {
+        let conn = open_database(&f.state.database_path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM images", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        conn.execute(
+            "UPDATE images SET path=?1",
+            [existing.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    }
+    assert!(start_startup_cleanup(&f.state).unwrap());
+    wait_for_cleanup();
+    let (failures, errors) = crate::jobs::cleanup_failures(&f.state).unwrap();
+    assert_eq!(failures, 0);
+    assert!(errors.is_empty());
+}
 #[test]
 fn dto_serialization_matches_generated_contract() {
     let q = serde_json::to_value(GalleryQuery::default()).unwrap();
@@ -345,4 +424,357 @@ fn malformed_model_json_is_rejected() {
     )
     .is_err());
     child.wait().unwrap();
+}
+
+#[test]
+fn sqlite_full_during_scan_batch_preserves_committed_images() {
+    let f = Fixture::new(1);
+    let mut conn = open_database(&f.state.database_path).unwrap();
+    let page_count: i64 = conn
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .unwrap();
+    conn.pragma_update(None, "max_page_count", page_count)
+        .unwrap();
+    let large_name = "x".repeat(128 * 1024);
+    let batch = vec![ScannedImage {
+        path: f.root.join("new.png").to_string_lossy().into(),
+        file_name: large_name,
+        ext: "png".into(),
+        width: 1,
+        height: 1,
+        file_size: 100,
+        modified_at: 0,
+        imported_at: 0,
+        unchanged: false,
+    }];
+    let mut known_paths = HashSet::new();
+    let mut new_ids = Vec::new();
+    let mut new_images = Vec::new();
+    let mut updated = 0;
+    let mut skipped = 0;
+    let error = flush_scanned_image_batch(
+        &mut conn,
+        1,
+        &batch,
+        &mut known_paths,
+        &mut new_ids,
+        &mut new_images,
+        &mut updated,
+        &mut skipped,
+    )
+    .unwrap_err();
+    assert!(error.contains("database or disk is full"), "{error}");
+    assert!(conn.is_autocommit());
+    assert!(known_paths.is_empty());
+    assert!(new_ids.is_empty());
+    assert!(new_images.is_empty());
+    assert_eq!((updated, skipped), (0, 0));
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM images", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    verify_database(&conn).unwrap();
+}
+
+fn scan_fixture(f: &Fixture) -> Result<ScanCollectResult, String> {
+    scan_all_folders_and_collect_new_images(
+        &f.state.database_path,
+        &f.state.foreground_queries,
+        &f.state.background_scan_progress,
+        &f.state.background_scan_pause_requested,
+        &f.state.background_scan_stop_requested,
+        false,
+        None,
+    )
+}
+
+#[test]
+fn exact_two_thousand_item_scan_write_failure_reaches_caller() {
+    let f = Fixture::new(1);
+    let assets = f.root.join("assets");
+    fs::create_dir(&assets).unwrap();
+    let first = assets.join("image-0000.png");
+    image::RgbaImage::from_pixel(1, 1, image::Rgba([20, 40, 60, 255]))
+        .save(&first)
+        .unwrap();
+    for i in 1..2000 {
+        let next = assets.join(format!("image-{i:04}.png"));
+        // NTFS allows only 1,024 links per file; use two tiny fixture inodes.
+        if i == 1000 {
+            fs::copy(&first, &next).unwrap();
+        } else {
+            let seed = if i < 1000 {
+                first.clone()
+            } else {
+                assets.join("image-1000.png")
+            };
+            fs::hard_link(seed, next).unwrap();
+        }
+    }
+    {
+        let conn = open_database(&f.state.database_path).unwrap();
+        conn.execute(
+            "UPDATE folders SET path=?1",
+            [assets.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_scan_image BEFORE INSERT ON images
+             BEGIN SELECT RAISE(ABORT, 'injected scan write failure'); END;",
+        )
+        .unwrap();
+    }
+    let error = scan_fixture(&f)
+        .err()
+        .expect("a failed full batch must abort scanning");
+    assert!(error.contains("injected scan write failure"), "{error}");
+    let conn = open_database(&f.state.database_path).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM images", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    let progress = f.state.background_scan_progress.lock().unwrap();
+    assert_eq!(progress.new_images, 0);
+    assert_eq!(progress.updated_images, 0);
+}
+
+#[test]
+fn offline_source_scan_reports_error_without_deleting_index() {
+    let f = Fixture::new(3);
+    let missing = f.root.join("disconnected-source");
+    {
+        let conn = open_database(&f.state.database_path).unwrap();
+        conn.execute(
+            "UPDATE folders SET path=?1",
+            [missing.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    }
+    let error = scan_fixture(&f)
+        .err()
+        .expect("offline source must be reported");
+    assert!(error.contains("来源目录不可访问"), "{error}");
+    let conn = open_database(&f.state.database_path).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM images", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+}
+
+#[test]
+fn directory_enumeration_failure_is_not_an_empty_success() {
+    let f = Fixture::new(0);
+    let mut visits = 0;
+    let error = scan_images(
+        &f.root.join("missing-directory"),
+        0,
+        &mut HashSet::new(),
+        &HashMap::new(),
+        &mut |_| {
+            visits += 1;
+            Ok(true)
+        },
+    )
+    .unwrap_err();
+    assert!(error.contains("无法扫描来源目录"), "{error}");
+    assert_eq!(visits, 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn source_file_access_failure_is_reported_without_inserting_image() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = Fixture::new(0);
+    let file = f.root.join("locked.png");
+    image::RgbaImage::from_pixel(1, 1, image::Rgba([20, 40, 60, 255]))
+        .save(&file)
+        .unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&file)
+        .unwrap();
+    let result = scan_fixture(&f);
+    drop(lock);
+    let error = result.err().expect("access failure must abort scanning");
+    assert!(error.contains("无法读取来源图片"), "{error}");
+    let conn = open_database(&f.state.database_path).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM images", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn inaccessible_windows_directory_is_reported_without_clearing_index() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = Fixture::new(1);
+    let assets = f.root.join("assets");
+    fs::create_dir(&assets).unwrap();
+    {
+        let conn = open_database(&f.state.database_path).unwrap();
+        conn.execute(
+            "UPDATE folders SET path=?1",
+            [assets.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    }
+    let directory_lock = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .custom_flags(0x02000000) // FILE_FLAG_BACKUP_SEMANTICS opens the directory itself.
+        .open(&assets)
+        .unwrap();
+    let result = scan_fixture(&f);
+    drop(directory_lock);
+    let error = result
+        .err()
+        .expect("inaccessible directory must fail scanning");
+    assert!(error.contains("无法扫描来源目录"), "{error}");
+    let conn = open_database(&f.state.database_path).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM images", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn missing_clip_model_is_rejected_without_starting_python() {
+    let f = Fixture::new(0);
+    let missing = f.root.join("missing-model");
+    let error = resolve_chinese_clip_model_dir(Some(missing.to_str().unwrap())).unwrap_err();
+    assert!(error.contains("missing ONNX files"), "{error}");
+    let incomplete = f.root.join("incomplete-model");
+    fs::create_dir(&incomplete).unwrap();
+    let error = resolve_chinese_clip_model_dir(Some(incomplete.to_str().unwrap())).unwrap_err();
+    assert!(error.contains("missing ONNX files"), "{error}");
+    assert!(f.state.clip_image_encoder_service.lock().unwrap().is_none());
+    assert!(f.state.clip_text_encoder_service.lock().unwrap().is_none());
+}
+
+#[cfg(windows)]
+#[test]
+fn readonly_database_rejects_mutation_and_preserves_image() {
+    let f = Fixture::new(1);
+    {
+        let conn = open_database(&f.state.database_path).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+            .unwrap();
+    }
+    let id = f
+        .root
+        .join("image-000000.png")
+        .to_string_lossy()
+        .to_string();
+    let mut permissions = fs::metadata(&f.state.database_path).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&f.state.database_path, permissions).unwrap();
+    let result = mutate_images(
+        ImageMutation {
+            action: "favorite".into(),
+            image_ids: vec![id.clone()],
+            favorite: Some(true),
+            folder_id: None,
+            custom_tags: vec![],
+            supplement_tags: vec![],
+        },
+        &f.state,
+    );
+    let mut permissions = fs::metadata(&f.state.database_path).unwrap().permissions();
+    permissions.set_readonly(false);
+    fs::set_permissions(&f.state.database_path, permissions).unwrap();
+    match result {
+        Ok(result) => {
+            assert!(result.successful_ids.is_empty());
+            assert!(result.images.is_empty());
+            assert_eq!(result.failures.len(), 1);
+            assert!(result.failures[0].message.contains("readonly"));
+        }
+        Err(error) => assert!(error.contains("readonly"), "{error}"),
+    }
+    assert!(!get_image_detail(id, &f.state).unwrap().image.is_favorite);
+}
+
+#[cfg(windows)]
+#[test]
+fn migration_copy_failure_keeps_source_and_does_not_promote_staging() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = Fixture::new(3);
+    fs::create_dir(f.root.join("managed")).unwrap();
+    let owned = f.root.join("managed/locked.png");
+    fs::write(&owned, b"managed fixture").unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&owned)
+        .unwrap();
+    let destination_fixture = Fixture::new(0);
+    let target = destination_fixture.root.join("new-data");
+    let result = prepare_data_directory_migration(&target, &f.state);
+    drop(lock);
+    assert!(result.is_err());
+    assert!(target.join("migration-staging/illutag.sqlite").is_file());
+    assert!(!target.join("illutag.sqlite").exists());
+    assert!(!f.state.maintenance.load(AtomicOrdering::SeqCst));
+    assert_eq!(fs::read(&owned).unwrap(), b"managed fixture");
+    let conn = open_database(&f.state.database_path).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM images", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    verify_database(&conn).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn restore_switch_failure_rolls_back_already_replaced_database() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let source = Fixture::new(1);
+    fs::create_dir(source.root.join("clipboard")).unwrap();
+    fs::write(source.root.join("clipboard/new.png"), b"new fixture").unwrap();
+    let packages = source.root.join("packages");
+    fs::create_dir(&packages).unwrap();
+    let package = create_restore_package(
+        packages.to_string_lossy().into(),
+        serde_json::json!({}),
+        &source.state,
+    )
+    .unwrap();
+    let target = Fixture::new(3);
+    fs::create_dir(target.root.join("clipboard")).unwrap();
+    let original = target.root.join("clipboard/locked.png");
+    fs::write(&original, b"original fixture").unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&original)
+        .unwrap();
+    let result = restore_package(package, vec![], &target.state);
+    drop(lock);
+    let error = result.unwrap_err();
+    assert!(error.contains("已回滚原数据"), "{error}");
+    assert!(!target.state.maintenance.load(AtomicOrdering::SeqCst));
+    assert_eq!(fs::read(&original).unwrap(), b"original fixture");
+    assert!(!target.root.join("clipboard/new.png").exists());
+    let conn = open_database(&target.state.database_path).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM images", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    verify_database(&conn).unwrap();
 }

@@ -77,7 +77,7 @@ pub(super) fn cleanup_missing_library_images_batched(
             break;
         }
 
-        let mut missing_ids = Vec::<String>::new();
+        let mut missing_ids = Vec::<(String, String)>::new();
         let mut next_rowid = last_rowid;
         for (rowid, image_id, path, folder_path) in rows {
             next_rowid = rowid;
@@ -93,13 +93,30 @@ pub(super) fn cleanup_missing_library_images_batched(
             if !root_online {
                 continue;
             }
-            if !Path::new(&path).exists() {
-                missing_ids.push(image_id);
+            match fs::metadata(&path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // A source may disconnect after the cached availability check.
+                    // Only remove a missing file while its registered root remains online.
+                    if Path::new(&folder_path).is_dir() {
+                        missing_ids.push((image_id, folder_path));
+                    } else {
+                        root_online_cache.insert(folder_path, false);
+                    }
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "无法确认图片是否缺失，已停止清理并保留索引：{path}：{error}"
+                    ));
+                }
             }
         }
         last_rowid = next_rowid;
 
-        for image_id in missing_ids {
+        for (image_id, folder_path) in missing_ids {
+            if !Path::new(&folder_path).is_dir() {
+                continue;
+            }
             conn.execute("DELETE FROM images WHERE id = ?1", params![image_id])
                 .map_err(|error| {
                     format!("Failed to delete missing image during startup cleanup: {error}")
@@ -145,11 +162,11 @@ pub(super) fn scan_all_folders_and_collect_new_images(
         folders.retain(|f| f.0 == id);
     }
     set_scan_progress_total_folders(progress, folders.len() as i64);
-    let _ = write_app_meta_value(&conn, "library_scan_in_progress", "1");
+    write_app_meta_value(&conn, "library_scan_in_progress", "1")?;
     for (_, folder_path) in &folders {
         yield_to_foreground(foreground, stop_requested);
         let folder_path = normalize_existing_or_stored_folder_path(folder_path);
-        let _ = ensure_library_root_user_folder(&conn, &folder_path, scanned_at);
+        ensure_library_root_user_folder(&conn, &folder_path, scanned_at)?;
     }
     let mut known_paths = load_known_paths(&conn)?;
     let existing_meta = load_existing_library_image_meta(&conn)?;
@@ -170,9 +187,9 @@ pub(super) fn scan_all_folders_and_collect_new_images(
         }
         let folder_path = normalize_existing_or_stored_folder_path(&folder_path);
         if !Path::new(&folder_path).is_dir() {
-            scanned_folders += 1;
-            set_scan_progress_scanned_folders(progress, scanned_folders);
-            continue;
+            return Err(format!(
+                "来源目录不可访问，请连接磁盘并确认访问权限：{folder_path}"
+            ));
         }
         let folder_id = upsert_folder(&conn, &folder_path, scanned_at)?;
         set_scan_progress_current_folder(progress, &folder_path);
@@ -190,7 +207,7 @@ pub(super) fn scan_all_folders_and_collect_new_images(
                 pending_batch.push(image);
                 let should_flush = pending_batch.len() >= 2000;
                 if should_flush {
-                    if let Err(error) = flush_scanned_image_batch(
+                    flush_scanned_image_batch(
                         &mut conn,
                         folder_id,
                         &pending_batch,
@@ -199,9 +216,7 @@ pub(super) fn scan_all_folders_and_collect_new_images(
                         &mut newly_found_images,
                         &mut updated_images,
                         &mut skipped_images,
-                    ) {
-                        eprintln!("[wd-scan] {error}");
-                    }
+                    )?;
                     pending_batch.clear();
                     set_scan_progress_new_images(progress, new_image_ids.len() as i64);
                     set_scan_progress_updated_images(progress, updated_images);
@@ -216,9 +231,9 @@ pub(super) fn scan_all_folders_and_collect_new_images(
                         "collecting",
                     );
                 }
-                !background_scan_stop_requested(stop_requested)
+                Ok(!background_scan_stop_requested(stop_requested))
             },
-        );
+        )?;
         if !pending_batch.is_empty() {
             flush_scanned_image_batch(
                 &mut conn,
@@ -308,7 +323,7 @@ pub(super) fn tag_images_with_wd_model(
         set_scan_progress_error(progress, &err);
         push_scan_progress_recent_error(progress, &err);
         eprintln!("[wd-tag] {err}");
-        return Ok(());
+        return Err(err);
     }
 
     let mut service_guard = wd_tagger_service

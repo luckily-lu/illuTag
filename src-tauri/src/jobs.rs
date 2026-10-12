@@ -307,7 +307,8 @@ fn run_stage(stage: &str, id: &str, state: &AppState, app: &AppHandle) -> Result
             }
             "cleanup" => {
                 let p = startup_cleanup_status(state)?;
-                (p.running, 0, 0, 0, vec![])
+                let (failures, errors) = cleanup_failures(state)?;
+                (p.running, 0, 0, failures, errors)
             }
             _ => unreachable!(),
         };
@@ -342,6 +343,15 @@ fn run_stage(stage: &str, id: &str, state: &AppState, app: &AppHandle) -> Result
         }
     }
     Ok(())
+}
+pub(crate) fn cleanup_failures(state: &AppState) -> Result<(i64, Vec<String>), String> {
+    let error = state
+        .startup_cleanup_error
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    let errors: Vec<String> = error.into_iter().collect();
+    Ok((errors.len() as i64, errors))
 }
 pub fn control_job(
     id: String,

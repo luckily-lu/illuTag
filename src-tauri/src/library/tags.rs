@@ -426,35 +426,34 @@ struct TagGroupsFile {
     tags: HashMap<String, String>,
 }
 
-pub(super) fn tagger_data_dir_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::<PathBuf>::new();
-    if let Ok(cwd) = env::current_dir() {
-        candidates.push(cwd.join("wd-swinv2-tagger-v3"));
-        candidates.push(cwd.join("..").join("wd-swinv2-tagger-v3"));
+pub(super) fn tagger_data_dir_candidates() -> Result<Vec<PathBuf>, String> {
+    if let Some(path) = explicit_resource_path("wd-swinv2-tagger-v3")? {
+        return path
+            .is_dir()
+            .then_some(vec![path.clone()])
+            .ok_or_else(|| format!("隔离标签资源缺失：{}", path.display()));
     }
-    if let Ok(exe_path) = env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(exe_dir.join("wd-swinv2-tagger-v3"));
-            candidates.push(exe_dir.join("..").join("wd-swinv2-tagger-v3"));
-            candidates.push(exe_dir.join("..").join("..").join("wd-swinv2-tagger-v3"));
-        }
-    }
+    let mut candidates = resource_candidates(
+        &["wd-swinv2-tagger-v3"],
+        &["wd-swinv2-tagger-v3", "../wd-swinv2-tagger-v3"],
+        &["../wd-swinv2-tagger-v3", "../../wd-swinv2-tagger-v3"],
+    );
     if let Ok(dictionary_path) = resolve_dictionary_source_path() {
         if let Some(parent) = dictionary_path.parent() {
             candidates.push(parent.to_path_buf());
         }
     }
-    candidates
+    Ok(candidates)
 }
 
-pub(super) fn find_tagger_data_file(file_name: &str) -> Option<PathBuf> {
-    for dir in tagger_data_dir_candidates() {
+pub(super) fn find_tagger_data_file(file_name: &str) -> Result<Option<PathBuf>, String> {
+    for dir in tagger_data_dir_candidates()? {
         let path = dir.join(file_name);
         if path.is_file() {
-            return Some(path);
+            return Ok(Some(path));
         }
     }
-    None
+    Ok(None)
 }
 
 pub(super) fn load_selected_tag_sort_index(path: &Path) -> Result<HashMap<String, i64>, String> {
@@ -546,15 +545,15 @@ pub(super) fn load_tag_dictionary_browser_meta() -> Result<
     ),
     String,
 > {
-    let sort_index = match find_tagger_data_file("selected_tags.csv") {
+    let sort_index = match find_tagger_data_file("selected_tags.csv")? {
         Some(path) => load_selected_tag_sort_index(&path)?,
         None => HashMap::new(),
     };
-    if let Some(path) = find_tagger_data_file("tag_groups.json") {
+    if let Some(path) = find_tagger_data_file("tag_groups.json")? {
         let (groups, group_by_tag) = load_tag_groups_file(&path)?;
         return Ok((groups, group_by_tag, sort_index));
     }
-    if let Some(path) = find_tagger_data_file("selected_tags.csv") {
+    if let Some(path) = find_tagger_data_file("selected_tags.csv")? {
         let (groups, group_by_tag) = load_fallback_groups_from_selected_tags(&path)?;
         return Ok((groups, group_by_tag, sort_index));
     }

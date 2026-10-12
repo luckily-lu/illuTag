@@ -68,7 +68,7 @@ $releaseRecords = foreach ($relative in @('illutag.exe','illutag.portable.json',
 }
 @{version=$version;schemaVersion=2;sourceCommit=(& git -C $repoRoot rev-parse HEAD);files=@($releaseRecords)} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $portableAppDir 'release-manifest.json') -Encoding utf8NoBOM
 @"
-illuTag $version portable candidate
+illuTag $version portable
 Keep all folders together. Start illutag.exe; data is stored in the sibling data directory.
 This package contains no user database or source images. Restore a complete backup into an independent directory for evaluation.
 Complete backups exclude external source originals. Models are supplied in this program package.
@@ -78,5 +78,5 @@ if (!$SkipZip) {
   Add-Type -AssemblyName System.IO.Compression.FileSystem
   [IO.Compression.ZipFile]::CreateFromDirectory($portableAppDir,$zipPath,[IO.Compression.CompressionLevel]::Optimal,$true)
 }
-Write-Output "Portable candidate: $portableAppDir"
+Write-Output "Portable program: $portableAppDir"
 if (!$SkipZip) { Write-Output "Archive: $zipPath" }

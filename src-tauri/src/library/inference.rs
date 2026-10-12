@@ -991,72 +991,143 @@ pub(super) fn lookup_cn_tag(dictionary: &HashMap<String, String>, tag_en: &str) 
     dictionary.get(&normalized).cloned()
 }
 
-pub(super) fn resolve_dictionary_source_path() -> Result<PathBuf, String> {
-    let mut candidates = Vec::<PathBuf>::new();
-    if let Ok(cwd) = env::current_dir() {
-        candidates.push(
-            cwd.join("wd-swinv2-tagger-v3")
-                .join("selected_tags_full_translation.csv"),
-        );
-        candidates.push(
-            cwd.join("..")
-                .join("wd-swinv2-tagger-v3")
-                .join("selected_tags_full_translation.csv"),
-        );
-        candidates.push(cwd.join("wd-swinv2-tagger-v3").join("dictionary01.xlsx"));
-        candidates.push(
-            cwd.join("..")
-                .join("wd-swinv2-tagger-v3")
-                .join("dictionary01.xlsx"),
-        );
+pub(super) fn prioritized_resource_candidates(
+    executable_dir: Option<&Path>,
+    working_dir: Option<&Path>,
+    bundled_paths: &[&str],
+    development_paths: &[&str],
+    executable_fallback_paths: &[&str],
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(dir) = executable_dir {
+        candidates.extend(bundled_paths.iter().map(|path| dir.join(path)));
     }
-    if let Ok(exe_path) = env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(
-                exe_dir
-                    .join("wd-swinv2-tagger-v3")
-                    .join("selected_tags_full_translation.csv"),
-            );
-            candidates.push(
-                exe_dir
-                    .join("..")
-                    .join("wd-swinv2-tagger-v3")
-                    .join("selected_tags_full_translation.csv"),
-            );
-            candidates.push(
-                exe_dir
-                    .join("..")
-                    .join("..")
-                    .join("wd-swinv2-tagger-v3")
-                    .join("selected_tags_full_translation.csv"),
-            );
-            candidates.push(
-                exe_dir
-                    .join("wd-swinv2-tagger-v3")
-                    .join("dictionary01.xlsx"),
-            );
-            candidates.push(
-                exe_dir
-                    .join("..")
-                    .join("wd-swinv2-tagger-v3")
-                    .join("dictionary01.xlsx"),
-            );
-            candidates.push(
-                exe_dir
-                    .join("..")
-                    .join("..")
-                    .join("wd-swinv2-tagger-v3")
-                    .join("dictionary01.xlsx"),
-            );
-        }
+    if let Some(dir) = working_dir {
+        candidates.extend(development_paths.iter().map(|path| dir.join(path)));
     }
+    if let Some(dir) = executable_dir {
+        candidates.extend(executable_fallback_paths.iter().map(|path| dir.join(path)));
+    }
+    candidates
+}
 
-    for candidate in candidates {
+pub(super) fn resource_candidates(
+    bundled_paths: &[&str],
+    development_paths: &[&str],
+    executable_fallback_paths: &[&str],
+) -> Vec<PathBuf> {
+    let executable = env::current_exe().ok();
+    let working_dir = env::current_dir().ok();
+    prioritized_resource_candidates(
+        executable.as_deref().and_then(Path::parent),
+        working_dir.as_deref(),
+        bundled_paths,
+        development_paths,
+        executable_fallback_paths,
+    )
+}
+
+pub(super) fn resource_path_from_root(
+    root: Option<&Path>,
+    relative_path: &str,
+) -> Result<Option<PathBuf>, String> {
+    match root {
+        Some(root) if !root.is_absolute() => Err("隔离资源根目录必须是绝对路径".into()),
+        Some(root) => Ok(Some(root.join(relative_path))),
+        None => Ok(None),
+    }
+}
+
+pub(super) fn explicit_resource_path(relative_path: &str) -> Result<Option<PathBuf>, String> {
+    let root = env::var_os("ILLUTAG_RESOURCE_ROOT").map(PathBuf::from);
+    resource_path_from_root(root.as_deref(), relative_path)
+}
+
+pub(super) fn resolve_resource_file_with_roots(
+    resource_root: Option<&Path>,
+    executable_dir: Option<&Path>,
+    working_dir: Option<&Path>,
+    bundled_path: &str,
+    development_paths: &[&str],
+    executable_fallback_paths: &[&str],
+) -> Result<PathBuf, String> {
+    if let Some(path) = resource_path_from_root(resource_root, bundled_path)? {
+        return path
+            .is_file()
+            .then_some(path.clone())
+            .ok_or_else(|| format!("隔离资源缺失：{}", path.display()));
+    }
+    prioritized_resource_candidates(
+        executable_dir,
+        working_dir,
+        &[bundled_path],
+        development_paths,
+        executable_fallback_paths,
+    )
+    .into_iter()
+    .find(|path| path.is_file())
+    .ok_or_else(|| format!("找不到程序资源：{bundled_path}"))
+}
+
+fn resolve_bundled_service_script(name: &str) -> Result<PathBuf, String> {
+    let root = env::var_os("ILLUTAG_RESOURCE_ROOT").map(PathBuf::from);
+    let executable = env::current_exe().ok();
+    let working_dir = env::current_dir().ok();
+    resolve_resource_file_with_roots(
+        root.as_deref(),
+        executable.as_deref().and_then(Path::parent),
+        working_dir.as_deref(),
+        &format!("scripts/{name}"),
+        &[
+            &format!("src-tauri/scripts/{name}"),
+            &format!("scripts/{name}"),
+        ],
+        &[
+            &format!("../scripts/{name}"),
+            &format!("../../src-tauri/scripts/{name}"),
+        ],
+    )
+}
+
+pub(super) fn resolve_dictionary_source_path() -> Result<PathBuf, String> {
+    let root = env::var_os("ILLUTAG_RESOURCE_ROOT").map(PathBuf::from);
+    let relative = [
+        "wd-swinv2-tagger-v3/selected_tags_full_translation.csv",
+        "wd-swinv2-tagger-v3/dictionary01.xlsx",
+    ];
+    if let Some(root) = root.as_deref() {
+        for name in relative {
+            let path = resource_path_from_root(Some(root), name)?.unwrap();
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
+        return Err(format!("隔离标签字典缺失：{}", root.display()));
+    }
+    let candidates = resource_candidates(
+        &relative,
+        &[
+            "wd-swinv2-tagger-v3/selected_tags_full_translation.csv",
+            "../wd-swinv2-tagger-v3/selected_tags_full_translation.csv",
+            "wd-swinv2-tagger-v3/dictionary01.xlsx",
+            "../wd-swinv2-tagger-v3/dictionary01.xlsx",
+        ],
+        &[
+            "../wd-swinv2-tagger-v3/selected_tags_full_translation.csv",
+            "../../wd-swinv2-tagger-v3/selected_tags_full_translation.csv",
+            "../wd-swinv2-tagger-v3/dictionary01.xlsx",
+            "../../wd-swinv2-tagger-v3/dictionary01.xlsx",
+        ],
+    );
+    for candidate in &candidates {
         if candidate.is_file() {
-            return Ok(candidate);
+            return Ok(candidate.clone());
         }
     }
-    Ok(PathBuf::from("selected_tags_full_translation.csv"))
+    Ok(candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| PathBuf::from(relative[0])))
 }
 
 pub(super) fn ensure_app_meta_table(conn: &Connection) -> Result<(), String> {
@@ -1527,300 +1598,73 @@ pub(super) fn wait_for_background_scan_resume(
 }
 
 pub(super) fn resolve_wd_tagger_model_dir(explicit_dir: Option<&str>) -> Result<PathBuf, String> {
-    if let Some(root) = env::var_os("ILLUTAG_RESOURCE_ROOT") {
-        let path = PathBuf::from(root).join("wd-swinv2-tagger-v3");
-        if path.is_dir() {
-            return Ok(path);
-        }
-        return Err(format!("隔离资源缺失：{}", path.display()));
+    let valid =
+        |path: &Path| path.join("model.onnx").is_file() && path.join("selected_tags.csv").is_file();
+    if let Some(path) = explicit_resource_path("wd-swinv2-tagger-v3")? {
+        return valid(&path)
+            .then_some(path.clone())
+            .ok_or_else(|| format!("隔离模型资源缺失：{}", path.display()));
     }
-    if let Some(path) = explicit_dir {
-        let dir = PathBuf::from(path);
-        if dir.is_dir() {
-            return Ok(dir);
-        }
-        return Err(format!(
-            "Configured model directory does not exist: {}",
-            dir.display()
-        ));
+    if let Some(value) = explicit_dir {
+        let path = PathBuf::from(value);
+        return valid(&path).then_some(path.clone()).ok_or_else(|| {
+            format!(
+                "Configured model directory is missing model.onnx or selected_tags.csv: {}",
+                path.display()
+            )
+        });
     }
-
-    let mut candidates = Vec::<PathBuf>::new();
-    if let Ok(cwd) = env::current_dir() {
-        candidates.push(cwd.join("wd-swinv2-tagger-v3"));
-        candidates.push(cwd.join("..").join("wd-swinv2-tagger-v3"));
-    }
-    if let Ok(exe_path) = env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(exe_dir.join("wd-swinv2-tagger-v3"));
-            candidates.push(exe_dir.join("..").join("wd-swinv2-tagger-v3"));
-            candidates.push(exe_dir.join("..").join("..").join("wd-swinv2-tagger-v3"));
-        }
-    }
-
-    for candidate in candidates {
-        if candidate.join("model.onnx").is_file() && candidate.join("selected_tags.csv").is_file() {
-            return Ok(candidate);
-        }
-    }
-
-    Err("Cannot find wd-swinv2-tagger-v3 (model.onnx + selected_tags.csv). Put it at project root or pass modelDir.".to_string())
+    resource_candidates(
+        &["wd-swinv2-tagger-v3"],
+        &["wd-swinv2-tagger-v3", "../wd-swinv2-tagger-v3"],
+        &["../wd-swinv2-tagger-v3", "../../wd-swinv2-tagger-v3"],
+    ).into_iter().find(|path| valid(path))
+        .ok_or_else(|| "Cannot find wd-swinv2-tagger-v3 (model.onnx + selected_tags.csv). Put it at project root or pass modelDir.".into())
 }
 
 pub(super) fn resolve_wd_tagger_script_path() -> Result<PathBuf, String> {
-    if let Some(root) = env::var_os("ILLUTAG_RESOURCE_ROOT") {
-        let path = PathBuf::from(root).join("scripts/wd_tagger_test.py");
-        if path.is_file() {
-            return Ok(path);
-        }
-        return Err(format!("隔离资源缺失：{}", path.display()));
-    }
-    let mut candidates = Vec::<PathBuf>::new();
-    if let Ok(cwd) = env::current_dir() {
-        candidates.push(
-            cwd.join("src-tauri")
-                .join("scripts")
-                .join("wd_tagger_test.py"),
-        );
-        candidates.push(cwd.join("scripts").join("wd_tagger_test.py"));
-    }
-    if let Ok(exe_path) = env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(exe_dir.join("scripts").join("wd_tagger_test.py"));
-            candidates.push(exe_dir.join("..").join("scripts").join("wd_tagger_test.py"));
-            candidates.push(
-                exe_dir
-                    .join("..")
-                    .join("..")
-                    .join("src-tauri")
-                    .join("scripts")
-                    .join("wd_tagger_test.py"),
-            );
-        }
-    }
-
-    for candidate in candidates {
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-
-    Err("Cannot find wd_tagger_test.py under src-tauri/scripts".to_string())
+    resolve_bundled_service_script("wd_tagger_test.py")
 }
 
 pub(super) fn resolve_wd_tagger_service_script_path() -> Result<PathBuf, String> {
-    if let Some(root) = env::var_os("ILLUTAG_RESOURCE_ROOT") {
-        let path = PathBuf::from(root).join("scripts/wd_tagger_service.py");
-        if path.is_file() {
-            return Ok(path);
-        }
-        return Err(format!("隔离资源缺失：{}", path.display()));
-    }
-    let mut candidates = Vec::<PathBuf>::new();
-    if let Ok(cwd) = env::current_dir() {
-        candidates.push(
-            cwd.join("src-tauri")
-                .join("scripts")
-                .join("wd_tagger_service.py"),
-        );
-        candidates.push(cwd.join("scripts").join("wd_tagger_service.py"));
-    }
-    if let Ok(exe_path) = env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(exe_dir.join("scripts").join("wd_tagger_service.py"));
-            candidates.push(
-                exe_dir
-                    .join("..")
-                    .join("scripts")
-                    .join("wd_tagger_service.py"),
-            );
-            candidates.push(
-                exe_dir
-                    .join("..")
-                    .join("..")
-                    .join("src-tauri")
-                    .join("scripts")
-                    .join("wd_tagger_service.py"),
-            );
-        }
-    }
-
-    for candidate in candidates {
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-
-    Err("Cannot find wd_tagger_service.py under src-tauri/scripts".to_string())
+    resolve_bundled_service_script("wd_tagger_service.py")
 }
 
 pub(super) fn resolve_chinese_clip_model_dir(
     explicit_dir: Option<&str>,
 ) -> Result<PathBuf, String> {
-    if let Some(root) = env::var_os("ILLUTAG_RESOURCE_ROOT") {
-        let path = PathBuf::from(root).join("model/chinese-clip-vit-base-patch16");
-        if path.is_dir() {
-            return Ok(path);
-        }
-        return Err(format!("隔离资源缺失：{}", path.display()));
+    let valid = |path: &Path| {
+        path.join("onnx/chinese_clip_text_encoder.onnx").is_file()
+            && path.join("onnx/chinese_clip_image_encoder.onnx").is_file()
+    };
+    if let Some(path) = explicit_resource_path("model/chinese-clip-vit-base-patch16")? {
+        return valid(&path)
+            .then_some(path.clone())
+            .ok_or_else(|| format!("隔离模型资源缺失：{}", path.display()));
     }
-    if let Some(path) = explicit_dir {
-        let dir = PathBuf::from(path);
-        if dir.is_dir() {
-            let text_onnx = dir.join("onnx").join("chinese_clip_text_encoder.onnx");
-            let image_onnx = dir.join("onnx").join("chinese_clip_image_encoder.onnx");
-            if text_onnx.is_file() && image_onnx.is_file() {
-                return Ok(dir);
-            }
-            return Err(format!(
-                "Configured model directory is missing ONNX files: {} and {}",
-                text_onnx.display(),
-                image_onnx.display()
-            ));
-        }
-        return Err(format!(
-            "Configured model directory does not exist: {}",
-            dir.display()
-        ));
+    if let Some(value) = explicit_dir {
+        let path = PathBuf::from(value);
+        return valid(&path).then_some(path.clone()).ok_or_else(|| {
+            format!(
+                "Configured model directory is missing ONNX files: {}",
+                path.display()
+            )
+        });
     }
-
-    let mut candidates = Vec::<PathBuf>::new();
-    if let Ok(cwd) = env::current_dir() {
-        candidates.push(cwd.join("model").join("chinese-clip-vit-base-patch16"));
-        candidates.push(
-            cwd.join("..")
-                .join("model")
-                .join("chinese-clip-vit-base-patch16"),
-        );
-    }
-    if let Ok(exe_path) = env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(exe_dir.join("model").join("chinese-clip-vit-base-patch16"));
-            candidates.push(
-                exe_dir
-                    .join("..")
-                    .join("model")
-                    .join("chinese-clip-vit-base-patch16"),
-            );
-            candidates.push(
-                exe_dir
-                    .join("..")
-                    .join("..")
-                    .join("model")
-                    .join("chinese-clip-vit-base-patch16"),
-            );
-        }
-    }
-
-    for candidate in candidates {
-        let text_onnx = candidate
-            .join("onnx")
-            .join("chinese_clip_text_encoder.onnx");
-        let image_onnx = candidate
-            .join("onnx")
-            .join("chinese_clip_image_encoder.onnx");
-        if text_onnx.is_file() && image_onnx.is_file() {
-            return Ok(candidate);
-        }
-    }
-
-    Err("Cannot find Chinese-CLIP ONNX model directory (expected model/chinese-clip-vit-base-patch16/onnx)".to_string())
+    resource_candidates(
+        &["model/chinese-clip-vit-base-patch16"],
+        &["model/chinese-clip-vit-base-patch16", "../model/chinese-clip-vit-base-patch16"],
+        &["../model/chinese-clip-vit-base-patch16", "../../model/chinese-clip-vit-base-patch16"],
+    ).into_iter().find(|path| valid(path))
+        .ok_or_else(|| "Cannot find Chinese-CLIP ONNX model directory (expected model/chinese-clip-vit-base-patch16/onnx)".into())
 }
 
 pub(super) fn resolve_chinese_clip_image_service_script_path() -> Result<PathBuf, String> {
-    if let Some(root) = env::var_os("ILLUTAG_RESOURCE_ROOT") {
-        let path = PathBuf::from(root).join("scripts/chinese_clip_image_service.py");
-        if path.is_file() {
-            return Ok(path);
-        }
-        return Err(format!("隔离资源缺失：{}", path.display()));
-    }
-    let mut candidates = Vec::<PathBuf>::new();
-    if let Ok(cwd) = env::current_dir() {
-        candidates.push(
-            cwd.join("src-tauri")
-                .join("scripts")
-                .join("chinese_clip_image_service.py"),
-        );
-        candidates.push(cwd.join("scripts").join("chinese_clip_image_service.py"));
-    }
-    if let Ok(exe_path) = env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(
-                exe_dir
-                    .join("scripts")
-                    .join("chinese_clip_image_service.py"),
-            );
-            candidates.push(
-                exe_dir
-                    .join("..")
-                    .join("scripts")
-                    .join("chinese_clip_image_service.py"),
-            );
-            candidates.push(
-                exe_dir
-                    .join("..")
-                    .join("..")
-                    .join("src-tauri")
-                    .join("scripts")
-                    .join("chinese_clip_image_service.py"),
-            );
-        }
-    }
-
-    for candidate in candidates {
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-
-    Err("Cannot find chinese_clip_image_service.py under src-tauri/scripts".to_string())
+    resolve_bundled_service_script("chinese_clip_image_service.py")
 }
 
 pub(super) fn resolve_chinese_clip_text_service_script_path() -> Result<PathBuf, String> {
-    if let Some(root) = env::var_os("ILLUTAG_RESOURCE_ROOT") {
-        let path = PathBuf::from(root).join("scripts/chinese_clip_text_service.py");
-        if path.is_file() {
-            return Ok(path);
-        }
-        return Err(format!("隔离资源缺失：{}", path.display()));
-    }
-    let mut candidates = Vec::<PathBuf>::new();
-    if let Ok(cwd) = env::current_dir() {
-        candidates.push(
-            cwd.join("src-tauri")
-                .join("scripts")
-                .join("chinese_clip_text_service.py"),
-        );
-        candidates.push(cwd.join("scripts").join("chinese_clip_text_service.py"));
-    }
-    if let Ok(exe_path) = env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(exe_dir.join("scripts").join("chinese_clip_text_service.py"));
-            candidates.push(
-                exe_dir
-                    .join("..")
-                    .join("scripts")
-                    .join("chinese_clip_text_service.py"),
-            );
-            candidates.push(
-                exe_dir
-                    .join("..")
-                    .join("..")
-                    .join("src-tauri")
-                    .join("scripts")
-                    .join("chinese_clip_text_service.py"),
-            );
-        }
-    }
-
-    for candidate in candidates {
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-
-    Err("Cannot find chinese_clip_text_service.py under src-tauri/scripts".to_string())
+    resolve_bundled_service_script("chinese_clip_text_service.py")
 }
 
 pub(super) fn upsert_folder(
@@ -2010,21 +1854,32 @@ pub(super) fn flush_scanned_image_batch(
     let tx = conn
         .transaction()
         .map_err(|error| format!("Failed to open scan upsert transaction: {error}"))?;
+    let mut committed_new_paths = HashSet::new();
+    let mut committed_new_images = Vec::new();
+    let mut committed_updates = 0;
+    let mut committed_skips = 0;
     for image in batch {
-        let is_new = known_paths.insert(image.path.clone());
+        let is_new =
+            !known_paths.contains(&image.path) && committed_new_paths.insert(image.path.clone());
         if is_new {
             upsert_image(&tx, folder_id, image)?;
-            new_image_ids.push(image.path.clone());
-            newly_found_images.push(image.clone());
+            committed_new_images.push(image.clone());
         } else if image.unchanged {
-            *skipped_images += 1;
+            committed_skips += 1;
         } else {
             upsert_image(&tx, folder_id, image)?;
-            *updated_images += 1;
+            committed_updates += 1;
         }
     }
     tx.commit()
         .map_err(|error| format!("Failed to commit scan upsert transaction: {error}"))?;
+    // Publish queue and progress changes only after the whole batch is durable.
+    // A failed transaction must not make a retry believe uncommitted paths exist.
+    known_paths.extend(committed_new_paths);
+    new_image_ids.extend(committed_new_images.iter().map(|image| image.path.clone()));
+    newly_found_images.extend(committed_new_images);
+    *updated_images += committed_updates;
+    *skipped_images += committed_skips;
     Ok(())
 }
 
@@ -2033,22 +1888,22 @@ pub(super) fn scan_images(
     imported_at: i64,
     seen_paths: &mut HashSet<String>,
     existing_meta: &HashMap<String, ExistingImageMeta>,
-    on_image: &mut dyn FnMut(ScannedImage) -> bool,
-) {
-    for entry in WalkDir::new(folder_path)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-    {
+    on_image: &mut dyn FnMut(ScannedImage) -> Result<bool, String>,
+) -> Result<(), String> {
+    for entry in WalkDir::new(folder_path).follow_links(false) {
+        let entry = entry
+            .map_err(|error| format!("无法扫描来源目录 {}：{error}", folder_path.display()))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
         let path = entry.path();
         if !is_supported_image(path) {
             continue;
         }
 
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("无法读取图片属性 {}：{error}", path.display()))?;
         let modified_at = metadata
             .modified()
             .ok()
@@ -2067,20 +1922,26 @@ pub(super) fn scan_images(
                 // 与索引一致：跳过尺寸读取；仅当之前被标记缺失时需要回写清除 missing
                 (meta.width, meta.height, meta.missing == 0)
             } else {
-                let Ok(reader) = ImageReader::open(path) else {
-                    continue;
-                };
-                let Ok((width, height)) = reader.into_dimensions() else {
-                    continue;
+                let reader = ImageReader::open(path)
+                    .map_err(|error| format!("无法读取来源图片 {}：{error}", path.display()))?;
+                let (width, height) = match reader.into_dimensions() {
+                    Ok(dimensions) => dimensions,
+                    Err(image::ImageError::IoError(error)) => {
+                        return Err(format!("无法读取来源图片 {}：{error}", path.display()));
+                    }
+                    Err(_) => continue,
                 };
                 (width, height, false)
             }
         } else {
-            let Ok(reader) = ImageReader::open(path) else {
-                continue;
-            };
-            let Ok((width, height)) = reader.into_dimensions() else {
-                continue;
+            let reader = ImageReader::open(path)
+                .map_err(|error| format!("无法读取来源图片 {}：{error}", path.display()))?;
+            let (width, height) = match reader.into_dimensions() {
+                Ok(dimensions) => dimensions,
+                Err(image::ImageError::IoError(error)) => {
+                    return Err(format!("无法读取来源图片 {}：{error}", path.display()));
+                }
+                Err(_) => continue,
             };
             (width, height, false)
         };
@@ -2102,10 +1963,11 @@ pub(super) fn scan_images(
             imported_at,
             unchanged,
         };
-        if !on_image(image) {
+        if !on_image(image)? {
             break;
         }
     }
+    Ok(())
 }
 
 pub(super) fn normalize_folder_path(folder_path: &str) -> Result<String, String> {
@@ -2157,5 +2019,120 @@ pub(super) fn yield_to_foreground(
             break;
         }
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod resource_path_tests {
+    use super::*;
+
+    struct ResourceFixture(PathBuf);
+    impl ResourceFixture {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = env::temp_dir().join(format!(
+                "illutag-resource-paths-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+        fn file(&self, relative: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"resource fixture").unwrap();
+            path
+        }
+    }
+    impl Drop for ResourceFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn bundled_resources_win_over_a_different_working_directory() {
+        let fixture = ResourceFixture::new();
+        let executable_dir = fixture.0.join("program");
+        let working_dir = fixture.0.join("old-project");
+        for relative in [
+            "scripts/wd_tagger_service.py",
+            "scripts/chinese_clip_text_service.py",
+            "model/chinese-clip-vit-base-patch16/onnx/chinese_clip_image_encoder.onnx",
+            "wd-swinv2-tagger-v3/model.onnx",
+            "wd-swinv2-tagger-v3/selected_tags_full_translation.csv",
+            "wd-swinv2-tagger-v3/tagger_config.json",
+            "wd-swinv2-tagger-v3/tag_groups.json",
+        ] {
+            let expected = fixture.file(&format!("program/{relative}"));
+            fixture.file(&format!("old-project/{relative}"));
+            assert_eq!(
+                resolve_resource_file_with_roots(
+                    None,
+                    Some(&executable_dir),
+                    Some(&working_dir),
+                    relative,
+                    &[relative],
+                    &[]
+                )
+                .unwrap(),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn source_working_directory_remains_a_development_fallback() {
+        let fixture = ResourceFixture::new();
+        let executable_dir = fixture.0.join("target/debug");
+        let working_dir = fixture.0.join("project");
+        let expected = fixture.file("project/src-tauri/scripts/wd_tagger_service.py");
+        assert_eq!(
+            resolve_resource_file_with_roots(
+                None,
+                Some(&executable_dir),
+                Some(&working_dir),
+                "scripts/wd_tagger_service.py",
+                &[
+                    "src-tauri/scripts/wd_tagger_service.py",
+                    "scripts/wd_tagger_service.py"
+                ],
+                &[]
+            )
+            .unwrap(),
+            expected,
+        );
+    }
+
+    #[test]
+    fn explicit_resource_root_is_exclusive_and_rejects_missing_resources() {
+        let fixture = ResourceFixture::new();
+        let executable_dir = fixture.0.join("program");
+        let working_dir = fixture.0.join("old-project");
+        let resource_root = fixture.0.join("isolated-resources");
+        let relative = "scripts/wd_tagger_service.py";
+        fixture.file(&format!("program/{relative}"));
+        fixture.file(&format!("old-project/{relative}"));
+        let resolve = |root: &Path| {
+            resolve_resource_file_with_roots(
+                Some(root),
+                Some(&executable_dir),
+                Some(&working_dir),
+                relative,
+                &[relative],
+                &[],
+            )
+        };
+        assert!(resolve(&resource_root)
+            .unwrap_err()
+            .contains("隔离资源缺失"));
+        assert!(resolve(Path::new("relative-resource-root"))
+            .unwrap_err()
+            .contains("绝对路径"));
+        let expected = fixture.file(&format!("isolated-resources/{relative}"));
+        assert_eq!(resolve(&resource_root).unwrap(), expected);
     }
 }
