@@ -4,7 +4,7 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 const [executable,workspace]=process.argv.slice(2);
 if(!workspace?.includes('illuTag-refactor-work'))throw Error('Explicit isolated workspace required');
-const program=path.join(workspace,'validation/fault-program'),root=path.join(workspace,'validation/model-fault-qa');
+const program=path.join(workspace,'validation/fault-program'),root=path.join(workspace,'validation',`model-fault-qa-${Date.now()}`);
 fs.mkdirSync(path.join(program,'runtime/python'),{recursive:true});
 fs.mkdirSync(path.join(program,'scripts'),{recursive:true});
 fs.mkdirSync(path.join(program,'wd-swinv2-tagger-v3'),{recursive:true});
@@ -13,7 +13,7 @@ fs.copyFileSync(executable,path.join(program,'illutag.exe'));
 fs.writeFileSync(path.join(program,'illutag.portable.json'),'{}');
 const resources=path.dirname(executable);
 for(const file of fs.readdirSync(path.join(resources,'runtime/python'),{withFileTypes:true}).filter(e=>e.isFile()))fs.copyFileSync(path.join(resources,'runtime/python',file.name),path.join(program,'runtime/python',file.name));
-for(const file of ['selected_tags.csv','selected_tags_full_translation.csv'])fs.copyFileSync(path.join(resources,'wd-swinv2-tagger-v3',file),path.join(program,'wd-swinv2-tagger-v3',file));
+for(const file of ['selected_tags.csv','selected_tags_full_translation.csv','tagger_config.json','tag_groups.json'])fs.copyFileSync(path.join(resources,'wd-swinv2-tagger-v3',file),path.join(program,'wd-swinv2-tagger-v3',file));
 fs.writeFileSync(path.join(program,'wd-swinv2-tagger-v3/model.onnx'),'fault fixture');
 fs.writeFileSync(path.join(program,'scripts/wd_tagger_service.py'),`import sys,json,os,pathlib
 r=json.loads(sys.stdin.readline())
@@ -31,6 +31,6 @@ try{
  const requests=fs.readFileSync(path.join(root,'logs/requests.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
  const attempts={};for(const r of requests)attempts[r.image_id]=(attempts[r.image_id]??0)+1;
  assert.equal(Object.keys(attempts).length,3);assert.deepEqual(Object.values(attempts),[2,2,2]);
- const outcome={passed:true,check:'exited model receives one retry per image, reaches partial terminal state, advances across prefetch queue',attempts,result};
+ const outcome={passed:true,root,check:'exited model receives one retry per image, reaches partial terminal state, advances across prefetch queue',attempts,result};
  fs.writeFileSync(path.join(root,'logs/model-fault-qa.json'),JSON.stringify(outcome,null,2));console.log(JSON.stringify(outcome));
 }finally{await session.close();}

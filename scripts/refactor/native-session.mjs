@@ -37,7 +37,7 @@ async function requireFreePort(port) {
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve) })
   await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
 }
-async function connectDebugging(port) {
+export async function connectDebugging(port) {
   const version = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(500) }).then(response => response.json())
   const endpoint = new URL(version.webSocketDebuggerUrl)
   if (endpoint.protocol !== 'ws:' || !['127.0.0.1', 'localhost'].includes(endpoint.hostname) || Number(endpoint.port) !== port)
