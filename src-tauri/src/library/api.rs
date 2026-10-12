@@ -150,6 +150,18 @@ pub fn get_navigation(state: &AppState) -> Result<NavigationMetadata, String> {
     })
 }
 
+/// Mutations invalidate the legacy snapshot instead of rebuilding all image
+/// memberships. A bounded navigation/detail response must never become that cache.
+pub(super) fn invalidate_library_metadata(state: &AppState) -> Result<i64, String> {
+    *state.library.lock().map_err(|e| e.to_string())? = None;
+    let mut revision = state
+        .startup_cleanup_generation
+        .lock()
+        .map_err(|e| e.to_string())?;
+    *revision += 1;
+    Ok(*revision)
+}
+
 struct ForegroundGuard<'a>(&'a std::sync::atomic::AtomicUsize);
 impl Drop for ForegroundGuard<'_> {
     fn drop(&mut self) {
@@ -344,19 +356,14 @@ pub fn mutate_images(request: ImageMutation, state: &AppState) -> Result<Mutatio
         .iter()
         .filter_map(|id| load_image_record(&conn, id).ok())
         .collect();
-    *state.library.lock().map_err(|e| e.to_string())? = None;
+    let revision = invalidate_library_metadata(state)?;
     if ["trash", "restore", "systemTrash"].contains(&request.action.as_str()) {
         invalidate_all_similarity_caches(state);
     }
-    let mut revision = state
-        .startup_cleanup_generation
-        .lock()
-        .map_err(|e| e.to_string())?;
-    *revision += 1;
     Ok(MutationResult {
         images,
         successful_ids,
         failures,
-        revision: *revision,
+        revision,
     })
 }

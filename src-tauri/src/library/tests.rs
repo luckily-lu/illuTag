@@ -125,6 +125,306 @@ fn mutations_report_item_failure_and_keep_valid_results() {
     assert!(result.images[0].is_favorite);
     assert_eq!(result.images.len(), 1);
 }
+
+fn metadata_fixture() -> (Fixture, LibraryStore) {
+    let f = Fixture::new(5001);
+    let conn = open_database(&f.state.database_path).unwrap();
+    conn.execute("INSERT INTO user_folders(id,name,sort_order,created_at,updated_at) VALUES(1,'已有归属',0,0,0),(2,'规则分类',1,0,0),(3,'补充分类',2,0,0)", []).unwrap();
+    conn.execute(
+        "INSERT INTO image_user_folders SELECT id,1,0 FROM images",
+        [],
+    )
+    .unwrap();
+    // Simulate an already populated legacy snapshot, including every membership.
+    let cached = build_data_migration_backup(&conn, serde_json::json!({}))
+        .unwrap()
+        .library;
+    drop(conn);
+    assert_eq!(cached.images.len(), 5001);
+    assert_eq!(cached.image_folders.len(), 5001);
+    (f, cached)
+}
+
+fn assert_metadata_write<T: Serialize>(
+    f: &Fixture,
+    cached: &LibraryStore,
+    work: impl FnOnce(&AppState) -> Result<T, String>,
+) -> T {
+    *f.state.library.lock().unwrap() = Some(cached.clone());
+    let previous_revision = *f.state.startup_cleanup_generation.lock().unwrap();
+    let response = work(&f.state).unwrap();
+    assert!(serde_json::to_vec(&response).unwrap().len() < 1024);
+    assert!(f.state.library.lock().unwrap().is_none());
+    let navigation = get_navigation(&f.state).unwrap();
+    let json = serde_json::to_value(navigation).unwrap();
+    assert!(json.get("images").is_none());
+    assert!(json.get("imageFolders").is_none());
+    assert!(serde_json::to_vec(&json).unwrap().len() < 4096);
+    // Reading a bounded response must not replace the legacy cache with a partial store.
+    assert!(f.state.library.lock().unwrap().is_none());
+    assert!(*f.state.startup_cleanup_generation.lock().unwrap() > previous_revision);
+    response
+}
+
+#[test]
+fn metadata_writes_do_not_reload_or_return_gallery_memberships() {
+    let (f, cached) = metadata_fixture();
+    let response = assert_metadata_write(&f, &cached, |state| {
+        create_user_folder(None, "新分类".into(), state)
+    });
+    assert_eq!(serde_json::to_string(&response).unwrap(), "null");
+    let folder_id = get_navigation(&f.state)
+        .unwrap()
+        .user_folders
+        .iter()
+        .find(|folder| folder.name == "新分类")
+        .unwrap()
+        .id;
+    assert_metadata_write(&f, &cached, |state| {
+        rename_user_folder(folder_id, "重命名分类".into(), state)
+    });
+    assert_metadata_write(&f, &cached, |state| {
+        reorder_user_folder(folder_id, 2, state)
+    });
+    assert!(get_navigation(&f.state)
+        .unwrap()
+        .user_folders
+        .iter()
+        .any(|folder| folder.id == folder_id && folder.name == "重命名分类"));
+    assert_metadata_write(&f, &cached, |state| {
+        save_user_folder_rule(
+            2,
+            vec![UserFolderRuleCondition {
+                logic: "AND".into(),
+                source: "custom".into(),
+                keyword: "分类标签".into(),
+            }],
+            false,
+            state,
+        )
+    });
+    assert_eq!(
+        get_user_folder_rule(2, &f.state)
+            .unwrap()
+            .unwrap()
+            .conditions[0]
+            .keyword,
+        "分类标签"
+    );
+    let id = f
+        .root
+        .join("image-005000.png")
+        .to_string_lossy()
+        .to_string();
+    assert_metadata_write(&f, &cached, |state| {
+        assign_image_to_user_folder(id.clone(), 2, state)
+    });
+    assert!(get_image_detail(id.clone(), &f.state)
+        .unwrap()
+        .folder_ids
+        .contains(&2));
+    assert_metadata_write(&f, &cached, |state| {
+        remove_image_from_user_folder(id.clone(), 2, state)
+    });
+    assert_eq!(get_image_detail(id, &f.state).unwrap().folder_ids, vec![1]);
+    assert_metadata_write(&f, &cached, |state| delete_user_folder(folder_id, state));
+    let source = f.root.join("registered-source");
+    fs::create_dir(&source).unwrap();
+    let source_path = source.to_string_lossy().to_string();
+    assert_metadata_write(&f, &cached, |state| {
+        add_gallery_folder(source_path.clone(), state)
+    });
+    let registered = get_navigation(&f.state).unwrap().folders;
+    assert_eq!(registered.len(), 2);
+    assert!(registered
+        .iter()
+        .all(|source| source.last_scanned_at.is_none()));
+    assert_metadata_write(&f, &cached, |state| {
+        remove_gallery_folder(source_path, state)
+    });
+    assert_eq!(get_navigation(&f.state).unwrap().folders.len(), 1);
+    let conn = open_database(&f.state.database_path).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM image_user_folders", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        5001
+    );
+    assert!(f.state.library.lock().unwrap().is_none());
+}
+
+#[test]
+fn single_image_tags_return_local_data_and_keep_tag_manager_contract() {
+    let (f, cached) = metadata_fixture();
+    let id = f
+        .root
+        .join("image-005000.png")
+        .to_string_lossy()
+        .to_string();
+    *f.state.clip_vector_cache.lock().unwrap() = Some(ClipImageVectorCache {
+        model_id: CHINESE_CLIP_MODEL_ID.into(),
+        model_version: CHINESE_CLIP_MODEL_VERSION.into(),
+        dimension: 2,
+        vectors: HashMap::from([(id.clone(), vec![1.0, 0.0])]),
+    });
+    save_user_folder_rule(
+        2,
+        vec![UserFolderRuleCondition {
+            logic: "AND".into(),
+            source: "custom".into(),
+            keyword: "分类标签".into(),
+        }],
+        false,
+        &f.state,
+    )
+    .unwrap();
+    save_user_folder_rule(
+        3,
+        vec![UserFolderRuleCondition {
+            logic: "AND".into(),
+            source: "danbooru".into(),
+            keyword: "blue_eyes".into(),
+        }],
+        false,
+        &f.state,
+    )
+    .unwrap();
+    let custom = assert_metadata_write(&f, &cached, |state| {
+        add_image_user_custom_tag(id.clone(), "分类标签".into(), state)
+    });
+    assert_eq!(custom.image_id, id);
+    assert_eq!(custom.custom_tags.len(), 1);
+    assert_eq!(custom.custom_tags[0].tag_text, "分类标签");
+    assert!(get_image_detail(id.clone(), &f.state)
+        .unwrap()
+        .folder_ids
+        .contains(&2));
+    let supplement = assert_metadata_write(&f, &cached, |state| {
+        add_image_user_supplement_tag(id.clone(), "blue_eyes".into(), Some("蓝眼睛".into()), state)
+    });
+    assert_eq!(supplement.image_id, id);
+    assert_eq!(supplement.supplement_tags.len(), 1);
+    assert!(get_image_detail(id.clone(), &f.state)
+        .unwrap()
+        .folder_ids
+        .contains(&3));
+    let removed = assert_metadata_write(&f, &cached, |state| {
+        remove_image_user_custom_tag(id.clone(), "分类标签".into(), state)
+    });
+    assert!(removed.custom_tags.is_empty());
+    let removed = assert_metadata_write(&f, &cached, |state| {
+        remove_image_user_supplement_tag(id.clone(), "blue_eyes".into(), state)
+    });
+    assert!(removed.supplement_tags.is_empty());
+    let folder = create_user_tag_folder("标签分类".into(), &f.state).unwrap();
+    let tag_folder_id = folder.folders[0].id;
+    let created = create_user_custom_tag("共享标签".into(), &f.state).unwrap();
+    assert!(created.unclassified_tags.contains(&"共享标签".into()));
+    let assigned = assign_user_tag_to_folder(tag_folder_id, "共享标签".into(), &f.state).unwrap();
+    assert_eq!(assigned.folders[0].tags, vec!["共享标签"]);
+    let renamed = rename_user_tag_folder(tag_folder_id, "新标签分类".into(), &f.state).unwrap();
+    assert_eq!(renamed.folders[0].name, "新标签分类");
+    let unassigned = unassign_user_tag_from_folder("共享标签".into(), &f.state).unwrap();
+    assert!(unassigned.unclassified_tags.contains(&"共享标签".into()));
+    assert!(delete_user_tag_folder(tag_folder_id, &f.state)
+        .unwrap()
+        .folders
+        .is_empty());
+    let conn = open_database(&f.state.database_path).unwrap();
+    conn.execute(
+        "INSERT INTO image_user_custom_tags SELECT id,'共享标签',0,0 FROM images",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let deleted = assert_metadata_write(&f, &cached, |state| {
+        delete_user_custom_tag("共享标签".into(), state)
+    });
+    assert!(!deleted.unclassified_tags.contains(&"共享标签".into()));
+    let conn = open_database(&f.state.database_path).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM image_user_custom_tags WHERE tag_text='共享标签'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM image_user_folders", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        5003
+    );
+    assert_eq!(
+        f.state
+            .clip_vector_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .vectors
+            .get(&id),
+        Some(&vec![1.0, 0.0])
+    );
+}
+
+#[test]
+fn failed_tag_rule_application_rolls_back_local_tag_write() {
+    let f = Fixture::new(1);
+    let conn = open_database(&f.state.database_path).unwrap();
+    conn.execute("INSERT INTO user_folders(id,name,sort_order,created_at,updated_at) VALUES(1,'规则写入失败',0,0,0)", []).unwrap();
+    let rule = serde_json::to_string(&vec![UserFolderRuleCondition {
+        logic: "AND".into(),
+        source: "custom".into(),
+        keyword: "不能部分保存".into(),
+    }])
+    .unwrap();
+    conn.execute("INSERT INTO user_folder_rules VALUES(1,?1,0)", [rule])
+        .unwrap();
+    conn.execute_batch("CREATE TRIGGER reject_rule_assignment BEFORE INSERT ON image_user_folders BEGIN SELECT RAISE(ABORT,'fixture assignment fault'); END;").unwrap();
+    drop(conn);
+    let id = f
+        .root
+        .join("image-000000.png")
+        .to_string_lossy()
+        .to_string();
+    assert!(add_image_user_custom_tag(id.clone(), "不能部分保存".into(), &f.state).is_err());
+    assert!(list_image_user_tags(id, &f.state)
+        .unwrap()
+        .custom_tags
+        .is_empty());
+    let conn = open_database(&f.state.database_path).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM user_custom_tags", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let rule = serde_json::to_string(&vec![UserFolderRuleCondition {
+        logic: "AND".into(),
+        source: "danbooru".into(),
+        keyword: "failed_supplement".into(),
+    }])
+    .unwrap();
+    conn.execute("UPDATE user_folder_rules SET rule_json=?1", [rule])
+        .unwrap();
+    drop(conn);
+    let id = f
+        .root
+        .join("image-000000.png")
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        add_image_user_supplement_tag(id.clone(), "failed_supplement".into(), None, &f.state)
+            .is_err()
+    );
+    assert!(list_image_user_tags(id, &f.state)
+        .unwrap()
+        .supplement_tags
+        .is_empty());
+}
 #[test]
 fn backup_restore_retains_vectors_historical_references_and_beyond_first_page() {
     let f = Fixture::new(5001);

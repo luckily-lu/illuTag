@@ -150,15 +150,15 @@ pub(super) async fn dev_cleanup_stress_test_data_command(
 pub(super) async fn add_gallery_folder_command(
     app: tauri::AppHandle,
     folder_path: String,
-) -> Result<LibraryStore, String> {
-    off_main(app, move |state| add_gallery_folder(folder_path, &state)).await
+) -> Result<(), String> {
+    off_main_write(app, move |state| add_gallery_folder(folder_path, &state)).await
 }
 
 #[tauri::command]
 pub(super) async fn remove_gallery_folder_command(
     folder_path: String,
     app: tauri::AppHandle,
-) -> Result<LibraryStore, String> {
+) -> Result<(), String> {
     off_main_write(app, move |state| remove_gallery_folder(folder_path, &state)).await
 }
 
@@ -654,7 +654,7 @@ pub(super) async fn create_user_folder_command(
     parent_id: Option<i64>,
     name: String,
     app: tauri::AppHandle,
-) -> Result<LibraryStore, String> {
+) -> Result<(), String> {
     off_main_write(app, move |state| {
         create_user_folder(parent_id, name, &state)
     })
@@ -666,7 +666,7 @@ pub(super) async fn rename_user_folder_command(
     folder_id: i64,
     name: String,
     app: tauri::AppHandle,
-) -> Result<LibraryStore, String> {
+) -> Result<(), String> {
     off_main_write(app, move |state| {
         rename_user_folder(folder_id, name, &state)
     })
@@ -677,7 +677,7 @@ pub(super) async fn rename_user_folder_command(
 pub(super) async fn delete_user_folder_command(
     folder_id: i64,
     app: tauri::AppHandle,
-) -> Result<LibraryStore, String> {
+) -> Result<(), String> {
     off_main_write(app, move |state| delete_user_folder(folder_id, &state)).await
 }
 
@@ -686,7 +686,7 @@ pub(super) async fn reorder_user_folder_command(
     folder_id: i64,
     target_folder_id: i64,
     app: tauri::AppHandle,
-) -> Result<LibraryStore, String> {
+) -> Result<(), String> {
     off_main_write(app, move |state| {
         reorder_user_folder(folder_id, target_folder_id, &state)
     })
@@ -707,7 +707,7 @@ pub(super) async fn save_user_folder_rule_command(
     conditions: Vec<UserFolderRuleCondition>,
     apply_now: bool,
     app: tauri::AppHandle,
-) -> Result<LibraryStore, String> {
+) -> Result<(), String> {
     off_main_write(app, move |state| {
         save_user_folder_rule(folder_id, conditions, apply_now, &state)
     })
@@ -719,7 +719,7 @@ pub(super) async fn assign_image_to_user_folder_command(
     image_id: String,
     folder_id: i64,
     app: tauri::AppHandle,
-) -> Result<LibraryStore, String> {
+) -> Result<(), String> {
     off_main_write(app, move |state| {
         assign_image_to_user_folder(image_id, folder_id, &state)
     })
@@ -743,7 +743,7 @@ pub(super) async fn remove_image_from_user_folder_command(
     image_id: String,
     folder_id: i64,
     app: tauri::AppHandle,
-) -> Result<LibraryStore, String> {
+) -> Result<(), String> {
     off_main_write(app, move |state| {
         remove_image_from_user_folder(image_id, folder_id, &state)
     })

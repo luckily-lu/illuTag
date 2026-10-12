@@ -405,11 +405,7 @@ pub fn save_user_folder_rule(
     conditions: Vec<UserFolderRuleCondition>,
     apply_now: bool,
     state: &AppState,
-) -> Result<LibraryStore, String> {
-    let mut library = state
-        .library
-        .lock()
-        .map_err(|_| "Library state is locked".to_string())?;
+) -> Result<(), String> {
     let mut conn = open_database(&state.database_path)?;
     if !user_folder_exists(&conn, folder_id)? {
         return Err("User folder not found".to_string());
@@ -450,25 +446,20 @@ pub fn save_user_folder_rule(
     tx.commit()
         .map_err(|error| format!("Failed to commit folder rule transaction: {error}"))?;
 
-    let store = load_store(&conn)?;
-    *library = Some(store.clone());
-    Ok(store)
+    invalidate_library_metadata(state)?;
+    Ok(())
 }
 
 pub fn create_user_folder(
     parent_id: Option<i64>,
     name: String,
     state: &AppState,
-) -> Result<LibraryStore, String> {
+) -> Result<(), String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("请输入文件夹名称".to_string());
     }
 
-    let mut library = state
-        .library
-        .lock()
-        .map_err(|_| "图库状态被占用，请稍后再试".to_string())?;
     let conn = open_database(&state.database_path)?;
     let now = now_ms();
     let sort_order = next_user_folder_sort_order(&conn, parent_id)?;
@@ -482,25 +473,16 @@ pub fn create_user_folder(
     )
     .map_err(|error| format!("创建文件夹失败：{error}"))?;
 
-    let store = load_store(&conn)?;
-    *library = Some(store.clone());
-    Ok(store)
+    invalidate_library_metadata(state)?;
+    Ok(())
 }
 
-pub fn rename_user_folder(
-    folder_id: i64,
-    name: String,
-    state: &AppState,
-) -> Result<LibraryStore, String> {
+pub fn rename_user_folder(folder_id: i64, name: String, state: &AppState) -> Result<(), String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("请输入文件夹名称".to_string());
     }
 
-    let mut library = state
-        .library
-        .lock()
-        .map_err(|_| "图库状态被占用，请稍后再试".to_string())?;
     let conn = open_database(&state.database_path)?;
     conn.execute(
         "UPDATE user_folders SET name = ?1, updated_at = ?2 WHERE id = ?3",
@@ -508,24 +490,19 @@ pub fn rename_user_folder(
     )
     .map_err(|error| format!("重命名文件夹失败：{error}"))?;
 
-    let store = load_store(&conn)?;
-    *library = Some(store.clone());
-    Ok(store)
+    invalidate_library_metadata(state)?;
+    Ok(())
 }
 
 pub fn reorder_user_folder(
     folder_id: i64,
     target_folder_id: i64,
     state: &AppState,
-) -> Result<LibraryStore, String> {
+) -> Result<(), String> {
     if folder_id == target_folder_id {
-        return list_library_from_state(state);
+        return Ok(());
     }
 
-    let mut library = state
-        .library
-        .lock()
-        .map_err(|_| "图库状态被占用，请稍后再试".to_string())?;
     let mut conn = open_database(&state.database_path)?;
 
     let dragged_parent = user_folder_parent_id(&conn, folder_id)?;
@@ -561,16 +538,11 @@ pub fn reorder_user_folder(
     tx.commit()
         .map_err(|error| format!("保存文件夹排序失败：{error}"))?;
 
-    let store = load_store(&conn)?;
-    *library = Some(store.clone());
-    Ok(store)
+    invalidate_library_metadata(state)?;
+    Ok(())
 }
 
-pub fn delete_user_folder(folder_id: i64, state: &AppState) -> Result<LibraryStore, String> {
-    let mut library = state
-        .library
-        .lock()
-        .map_err(|_| "图库状态被占用，请稍后再试".to_string())?;
+pub fn delete_user_folder(folder_id: i64, state: &AppState) -> Result<(), String> {
     let conn = open_database(&state.database_path)?;
 
     conn.execute("PRAGMA foreign_keys = ON", [])
@@ -578,9 +550,8 @@ pub fn delete_user_folder(folder_id: i64, state: &AppState) -> Result<LibrarySto
     conn.execute("DELETE FROM user_folders WHERE id = ?1", params![folder_id])
         .map_err(|error| format!("删除文件夹失败：{error}"))?;
 
-    let store = load_store(&conn)?;
-    *library = Some(store.clone());
-    Ok(store)
+    invalidate_library_metadata(state)?;
+    Ok(())
 }
 
 pub(super) fn next_user_folder_sort_order(
@@ -664,11 +635,7 @@ pub fn assign_image_to_user_folder(
     image_id: String,
     folder_id: i64,
     state: &AppState,
-) -> Result<LibraryStore, String> {
-    let mut library = state
-        .library
-        .lock()
-        .map_err(|_| "图库状态被占用，请稍后再试".to_string())?;
+) -> Result<(), String> {
     let conn = open_database(&state.database_path)?;
 
     let has_children: i64 = conn
@@ -697,20 +664,15 @@ pub fn assign_image_to_user_folder(
     )
     .map_err(|error| format!("添加到文件夹失败：{error}"))?;
 
-    let store = load_store(&conn)?;
-    *library = Some(store.clone());
-    Ok(store)
+    invalidate_library_metadata(state)?;
+    Ok(())
 }
 
 pub fn remove_image_from_user_folder(
     image_id: String,
     folder_id: i64,
     state: &AppState,
-) -> Result<LibraryStore, String> {
-    let mut library = state
-        .library
-        .lock()
-        .map_err(|_| "图库状态被占用，请稍后再试".to_string())?;
+) -> Result<(), String> {
     let conn = open_database(&state.database_path)?;
 
     conn.execute(
@@ -722,9 +684,8 @@ pub fn remove_image_from_user_folder(
     )
     .map_err(|error| format!("从文件夹移除图片失败：{error}"))?;
 
-    let store = load_store(&conn)?;
-    *library = Some(store.clone());
-    Ok(store)
+    invalidate_library_metadata(state)?;
+    Ok(())
 }
 
 pub fn reapply_rules_batch(after: i64, state: &AppState) -> Result<(i64, i64, i64), String> {

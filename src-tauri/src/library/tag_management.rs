@@ -70,6 +70,7 @@ pub fn delete_user_custom_tag(
     .map_err(|error| format!("Failed to delete user custom tag row: {error}"))?;
     tx.commit()
         .map_err(|error| format!("Failed to commit user custom tag delete transaction: {error}"))?;
+    invalidate_library_metadata(state)?;
     load_tag_management_state(&conn)
 }
 

@@ -139,15 +139,6 @@ pub(super) fn load_image_user_tag_summary(
     })
 }
 
-pub(super) fn refresh_library_cache_best_effort(state: &AppState, conn: &Connection) {
-    let Ok(store) = load_store(conn) else {
-        return;
-    };
-    if let Ok(mut cache) = state.library.lock() {
-        *cache = Some(store);
-    }
-}
-
 pub fn list_image_user_tags(
     image_id: String,
     state: &AppState,
@@ -166,9 +157,12 @@ pub fn add_image_user_custom_tag(
     if normalized.is_empty() {
         return Err("Tag text cannot be empty".to_string());
     }
-    let conn = open_database(&state.database_path)?;
+    let mut conn = open_database(&state.database_path)?;
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("Failed to open custom user tag transaction: {error}"))?;
     let now = now_ms();
-    conn.execute(
+    tx.execute(
         "
         INSERT INTO image_user_custom_tags (
           image_id, tag_text, created_at, updated_at
@@ -180,9 +174,11 @@ pub fn add_image_user_custom_tag(
         params![image_id, normalized, now],
     )
     .map_err(|error| format!("Failed to add custom user tag: {error}"))?;
-    upsert_user_custom_tag(&conn, &normalized)?;
-    apply_matching_user_folder_rules_for_image(&conn, &image_id)?;
-    refresh_library_cache_best_effort(state, &conn);
+    upsert_user_custom_tag(&tx, &normalized)?;
+    apply_matching_user_folder_rules_for_image(&tx, &image_id)?;
+    tx.commit()
+        .map_err(|error| format!("Failed to commit custom user tag transaction: {error}"))?;
+    invalidate_library_metadata(state)?;
     load_image_user_tag_summary(&conn, &image_id)
 }
 
@@ -201,6 +197,7 @@ pub fn remove_image_user_custom_tag(
         params![image_id, normalized],
     )
     .map_err(|error| format!("Failed to remove custom user tag: {error}"))?;
+    invalidate_library_metadata(state)?;
     load_image_user_tag_summary(&conn, &image_id)
 }
 
@@ -215,9 +212,12 @@ pub fn add_image_user_supplement_tag(
         return Err("Tag text cannot be empty".to_string());
     }
     let normalized_tag_zh = normalize_optional_tag_text(tag_zh);
-    let conn = open_database(&state.database_path)?;
+    let mut conn = open_database(&state.database_path)?;
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("Failed to open supplement user tag transaction: {error}"))?;
     let now = now_ms();
-    conn.execute(
+    tx.execute(
         "
         INSERT INTO image_user_supplement_tags (
           image_id, tag_en, tag_zh, created_at, updated_at
@@ -230,8 +230,10 @@ pub fn add_image_user_supplement_tag(
         params![image_id, normalized_tag_en, normalized_tag_zh, now],
     )
     .map_err(|error| format!("Failed to add supplement user tag: {error}"))?;
-    apply_matching_user_folder_rules_for_image(&conn, &image_id)?;
-    refresh_library_cache_best_effort(state, &conn);
+    apply_matching_user_folder_rules_for_image(&tx, &image_id)?;
+    tx.commit()
+        .map_err(|error| format!("Failed to commit supplement user tag transaction: {error}"))?;
+    invalidate_library_metadata(state)?;
     load_image_user_tag_summary(&conn, &image_id)
 }
 
@@ -250,6 +252,7 @@ pub fn remove_image_user_supplement_tag(
         params![image_id, normalized_tag_en],
     )
     .map_err(|error| format!("Failed to remove supplement user tag: {error}"))?;
+    invalidate_library_metadata(state)?;
     load_image_user_tag_summary(&conn, &image_id)
 }
 

@@ -44,20 +44,40 @@ export async function connectDebugging(port) {
     throw Error('Unexpected validation debugging endpoint')
   const socket = new WebSocket(endpoint, { handshakeTimeout: 1000 })
   let closed = false
+  const diagnostics = []
   const transport = {
-    send(message) { socket.send(JSON.stringify(message)) },
+    send(message) {
+      // Tauri IPC uses HTTP POST. CDP must not copy a full legacy ID array into
+      // Network.requestWillBeSent; the application still sends its original body.
+      if (message.method === 'Network.enable') {
+        message = { ...message, params: { ...message.params, maxPostDataSize: 1 } }
+        diagnostics.push({ event: 'networkPostDataCaptureLimit', at: new Date().toISOString(), maxPostDataSize: 1 })
+      }
+      socket.send(JSON.stringify(message))
+    },
     close() { if (closed) return; closed = true; socket.terminate(); transport.onclose?.() },
   }
-  socket.on('error', () => {})
-  socket.on('close', () => { if (!closed) { closed = true; transport.onclose?.() } })
-  socket.on('message', data => { transport.onmessage?.(JSON.parse(data.toString())) })
+  socket.on('error', error => {
+    diagnostics.push({ event: 'socketError', at: new Date().toISOString(), name: error.name, code: error.code, message: error.message })
+  })
+  socket.on('close', (code, reason) => {
+    diagnostics.push({ event: 'socketClose', at: new Date().toISOString(), code, reason: reason.toString(), closedByClient: closed })
+    if (!closed) { closed = true; transport.onclose?.() }
+  })
+  socket.on('message', data => {
+    try { transport.onmessage?.(JSON.parse(data.toString())) }
+    catch (error) {
+      diagnostics.push({ event: 'invalidMessage', at: new Date().toISOString(), message: error.message, bytes: data.length })
+      transport.close()
+    }
+  })
   try {
     await bounded(new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject) }), 1500, 'Debugging socket open')
     // This public transport interface lets us release the owned socket even if
     // WebView2 fails to finish Playwright's ordinary connection shutdown.
     const browser = await chromium.connectOverCDP(transport, { timeout: 5000 })
-    return { browser, transport }
-  } catch (error) { transport.close(); throw error }
+    return { browser, transport, diagnostics }
+  } catch (error) { error.debuggingDiagnostics = diagnostics; transport.close(); throw error }
 }
 export async function launch(executable, root, port = 9781) {
   executable = isolatedPath(executable, 'program')
@@ -78,7 +98,7 @@ export async function launch(executable, root, port = 9781) {
     WEBVIEW2_USER_DATA_FOLDER: path.join(root, 'profile'),
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port} --remote-allow-origins=*`,
   } })
-  let spawnError, browser, transport, page, closing
+  let spawnError, browser, transport, page, closing, diagnostics = []
   child.once('error', error => { spawnError = error })
   const alive = () => child.exitCode === null && child.signalCode === null && !spawnError
   const invoke = (command, args = {}) => page.evaluate(({ command, args }) => window.__TAURI_INTERNALS__.invoke(command, args), { command, args })
@@ -111,14 +131,15 @@ export async function launch(executable, root, port = 9781) {
     for (let i = 0; i < 160; i++) {
       if (spawnError) throw spawnError
       if (!alive()) throw Error('Application exited before CDP connected')
-      try { const connected = await connectDebugging(port); browser = connected.browser; transport = connected.transport; break }
+      try { const connected = await connectDebugging(port); browser = connected.browser; transport = connected.transport; diagnostics = connected.diagnostics; break }
       catch { await sleep(100) }
     }
     if (!browser) throw Error('Independent WebView2 debugging endpoint unavailable')
     page = browser.contexts().flatMap(context => context.pages()).find(p => p.url().includes('tauri')) ?? browser.contexts()[0]?.pages()[0]
     if (!page) throw Error('Independent WebView2 page unavailable')
     await page.waitForFunction(() => window.__TAURI_INTERNALS__?.invoke, { timeout: 30000 })
-    return { child, browser, page, invoke, started, close, logPath, root, executable }
+    const getDiagnostics = () => ({ pid: child.pid, exitCode: child.exitCode, signalCode: child.signalCode, killed: child.killed, connected: browser.isConnected(), events: diagnostics.slice() })
+    return { child, browser, page, invoke, started, close, logPath, root, executable, getDiagnostics }
   } catch (error) {
     await close().catch(closeError => console.error(`Validation cleanup failed: ${closeError.message}`))
     throw error

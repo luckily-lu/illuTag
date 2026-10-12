@@ -246,13 +246,9 @@ pub fn list_gallery_images_by_ids_page(
     })
 }
 
-pub fn add_gallery_folder(folder_path: String, state: &AppState) -> Result<LibraryStore, String> {
+pub fn add_gallery_folder(folder_path: String, state: &AppState) -> Result<(), String> {
     let folder_path = normalize_folder_path(&folder_path)?;
     let scanned_at = now_ms();
-    let mut library = state
-        .library
-        .lock()
-        .map_err(|_| "图库状态被占用，请稍后再试".to_string())?;
     let mut conn = open_database(&state.database_path)?;
 
     let tx = conn
@@ -263,20 +259,12 @@ pub fn add_gallery_folder(folder_path: String, state: &AppState) -> Result<Libra
     tx.commit()
         .map_err(|error| format!("保存图库索引失败：{error}"))?;
 
-    let store = load_store(&conn)?;
-    *library = Some(store.clone());
-    Ok(store)
+    invalidate_library_metadata(state)?;
+    Ok(())
 }
 
-pub fn remove_gallery_folder(
-    folder_path: String,
-    state: &AppState,
-) -> Result<LibraryStore, String> {
+pub fn remove_gallery_folder(folder_path: String, state: &AppState) -> Result<(), String> {
     let folder_path = normalize_existing_or_stored_folder_path(&folder_path);
-    let mut library = state
-        .library
-        .lock()
-        .map_err(|_| "图库状态被占用，请稍后再试".to_string())?;
     let mut conn = open_database(&state.database_path)?;
 
     let tx = conn
@@ -305,10 +293,9 @@ pub fn remove_gallery_folder(
     tx.commit()
         .map_err(|error| format!("保存图库索引失败：{error}"))?;
 
-    let store = load_store(&conn)?;
-    *library = Some(store.clone());
+    invalidate_library_metadata(state)?;
     invalidate_all_similarity_caches(state);
-    Ok(store)
+    Ok(())
 }
 
 pub(super) fn sync_user_folder_tree_for_library_directory(
