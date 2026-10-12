@@ -64,7 +64,7 @@ try {
         for (const section of ['外观与窗口', '图库与存储', '备份与导出']) { await page.getByRole('button', { name: section, exact: true }).click(); await overflow(); }
       }
       if (width === 1280) {
-        // Capture the settled 300ms control state, rather than an intermediate shadow.
+        // Capture the settled control state after navigation.
         await page.waitForTimeout(350);
         await page.screenshot({ path: `${output}/ui-${label}-updated.png` });
       }
@@ -74,6 +74,7 @@ try {
   assert.equal(await page.locator('select').count(), 0);
   const scrollbar = await page.locator('.page-content').evaluate(n => ({ width: getComputedStyle(n, '::-webkit-scrollbar').width, thumb: getComputedStyle(n, '::-webkit-scrollbar-thumb').backgroundColor, arrow: getComputedStyle(n, '::-webkit-scrollbar-button').display }));
   assert.equal(scrollbar.width, '12px'); assert.equal(scrollbar.arrow, 'none');
+  assert.ok(['rgb(184, 186, 182)', 'rgb(146, 150, 143)'].includes(scrollbar.thumb), 'scrollbar thumb uses the neutral default or hover color');
   checks.push('global scrollbars and hidden native arrows', 'all native selects replaced');
   fs.writeFileSync(`${output}/ui-detail-qa.json`, JSON.stringify({ passed: true, checks, scrollbar }, null, 2));
   console.log(JSON.stringify({ passed: true, checks }));

@@ -396,7 +396,7 @@ onUnmounted(() => {
               <AppIcon name="menu" /></button
             ><SearchBar :scope-label="scopeName" /><button
               v-if="preferences.immersive.value"
-              class="soft-button"
+              class="text-button"
               @click="preferences.immersive.value = false"
             >
               退出沉浸
@@ -542,7 +542,7 @@ onUnmounted(() => {
             </button>
           </div>
           <button
-            class="soft-button"
+            class="text-button"
             type="button"
             @click="
               ruleConditions.push({
@@ -565,9 +565,9 @@ onUnmounted(() => {
       </form>
       <p v-if="error" class="error-text">{{ error }}</p>
       <template #actions
-        ><button class="soft-button" @click="dialog = null">取消</button
+        ><button class="text-button" @click="dialog = null">取消</button
         ><button
-          class="soft-button accent"
+          class="soft-button primary"
           form="workspace-dialog"
           type="submit"
           :disabled="busy"

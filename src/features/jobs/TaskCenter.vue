@@ -33,7 +33,7 @@ const states: Record<string, string> = {
         <h1>任务中心</h1>
         <p>按需处理你的图片。任务在切换页面后继续运行。</p>
       </div>
-      <button class="soft-button accent" @click="emit('start', 'pipeline')">
+      <button class="soft-button primary" @click="emit('start', 'pipeline')">
         一键处理
       </button>
     </header>

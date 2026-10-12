@@ -44,7 +44,7 @@ onUnmounted(() => window.removeEventListener("resize", resize));
     ><span class="spacer" />
     <template v-if="active">
       <span>已选 {{ count }}</span
-      ><button class="soft-button compact" @click="emit('selectAll')">
+      ><button class="text-button" @click="emit('selectAll')">
         选择当前已加载结果
       </button>
       <div class="batch-actions">
@@ -97,15 +97,15 @@ onUnmounted(() => window.removeEventListener("resize", resize));
           更多操作
         </button>
       </div>
-      <button class="soft-button compact" @click="emit('done')">完成</button>
+      <button class="text-button" @click="emit('done')">完成</button>
     </template>
     <template v-else
-      ><button class="soft-button compact" @click="emit('select')">选择</button
-      ><button class="soft-button compact" @click="emit('immersive')">
+      ><button class="text-button" @click="emit('select')">选择</button
+      ><button class="text-button" @click="emit('immersive')">
         沉浸浏览</button
       ><button
         v-if="scope === 'random'"
-        class="soft-button compact"
+        class="text-button"
         @click="emit('random')"
       >
         换一组

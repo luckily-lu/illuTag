@@ -141,7 +141,7 @@ function submit() {
         </div>
       </div>
       <button
-        class="soft-button accent search-submit"
+        class="soft-button primary search-submit"
         :disabled="gallery.loading.value"
         @click="submit"
       >

@@ -239,7 +239,7 @@ onMounted(() => {
     <p v-if="error" role="alert" class="error-text">{{ error }}</p>
     <p v-if="message" role="status" class="notice">{{ message }}</p>
     <div v-if="section === 'appearance'" class="panel settings-panel">
-      <h2>浅色画廊工作台</h2>
+      <h2>无框画廊</h2>
       <p>界面跟随窗口宽度调整。图库保持图片原始比例。</p>
       <label class="setting-row"
         ><span>隐藏窗口标题栏（移动到顶端显示）</span
@@ -321,7 +321,7 @@ onMounted(() => {
         包含数据库、偏好、窗口状态、必要配置及现存托管图片。外部来源目录中的原图不包含在内。模型由便携程序包提供，缩略图可以重新生成。
       </p>
       <div class="button-row">
-        <button class="soft-button accent" :disabled="busy" @click="backup">
+        <button class="soft-button" :disabled="busy" @click="backup">
           创建完整恢复包</button
         ><button class="soft-button" :disabled="busy" @click="restore">
           恢复完整包
@@ -361,9 +361,9 @@ onMounted(() => {
         </label>
       </div>
       <template #actions
-        ><button class="soft-button" @click="confirm = null">取消</button
+        ><button class="text-button" @click="confirm = null">取消</button
         ><button
-          class="soft-button accent"
+          class="soft-button primary"
           @click="
             const c = confirm;
             confirm = null;

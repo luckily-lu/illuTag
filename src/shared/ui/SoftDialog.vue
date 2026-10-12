@@ -51,7 +51,7 @@ onUnmounted(() => {
       <header>
         <h2>{{ title }}</h2>
         <button
-          class="soft-button compact"
+          class="icon-button"
           aria-label="关闭"
           @click="emit('close')"
         >

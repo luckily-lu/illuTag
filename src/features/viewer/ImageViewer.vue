@@ -179,7 +179,7 @@ onUnmounted(() => {
   >
     <header class="viewer-toolbar">
       <button
-        class="soft-button"
+        class="icon-button"
         @click="emit('close')"
         aria-label="关闭查看器"
       >
@@ -228,7 +228,7 @@ onUnmounted(() => {
         />
         <div class="viewer-pagination">
           <button
-            class="soft-button"
+            class="icon-button"
             @pointerdown.stop
             @click.stop="step(-1)"
             aria-label="上一张"
@@ -237,7 +237,7 @@ onUnmounted(() => {
           ><button class="soft-button" @pointerdown.stop @click.stop="reset">
             {{ Math.round(scale * 100) }}% · 适应</button
           ><button
-            class="soft-button"
+            class="icon-button"
             @pointerdown.stop
             @click.stop="step(1)"
             aria-label="下一张"
