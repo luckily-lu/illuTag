@@ -45,9 +45,18 @@ try {
     catch { await sleep(100) }
   }
   assert.ok(browser, 'Production WebView2 endpoint unavailable')
-  page = browser.contexts().flatMap(context => context.pages()).find(item => item.url().includes('tauri'))
-  assert.ok(page)
-  await page.waitForFunction(() => window.__TAURI_INTERNALS__?.invoke)
+  // The existing production WebView profile can expose its debugging endpoint
+  // before the application page is created or navigated from about:blank.
+  for (let attempt = 0; attempt < 300; attempt++) {
+    assert.ok(alive(), 'Production application exited before its page was ready')
+    const pages = browser.contexts().flatMap(context => context.pages())
+    page = pages.find(item => item.url().startsWith('http://tauri.localhost/')) ?? pages[0]
+    if (page) break
+    await sleep(100)
+  }
+  assert.ok(page, 'Production WebView2 page unavailable')
+  await page.waitForURL('http://tauri.localhost/**', { timeout: 30000 })
+  await page.waitForFunction(() => window.__TAURI_INTERNALS__?.invoke, { timeout: 30000 })
   const data = await invoke('data_directory_info_command')
   assert.equal(normalize(data.dataDir), normalize(root))
   assert.equal(data.usingFallback, false)
@@ -73,7 +82,7 @@ try {
   assert.equal(visual.theme, '#fafafa')
   assert.equal(visual.overflow, false)
   checks.push('frameless gallery embedded in production executable')
-  outcome = { passed: true, startedAt, root, executable, sha256: digest, sourceCommit: manifest.sourceCommit, visibleImages: bootstrap.page.totalImageCount, firstPageCount: bootstrap.page.images.length, lastPageCount: last.images.length, sourceCount: bootstrap.folders.length, jobsAtStartup: jobs.length, visual, checks }
+  outcome = { passed: true, startedAt, root, executable, sha256: digest, sourceCommit: manifest.sourceCommit, pageUrl: page.url(), visibleImages: bootstrap.page.totalImageCount, firstPageCount: bootstrap.page.images.length, lastPageCount: last.images.length, sourceCount: bootstrap.folders.length, jobsAtStartup: jobs.length, visual, checks }
 } catch (error) {
   failure = error
   outcome = { passed: false, startedAt, root, checks, error: error.stack ?? String(error) }
