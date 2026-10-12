@@ -9,6 +9,7 @@ $RollbackRoot = 'D:\Ai\illuTag-danbooru-tag-query.rollback-20261012-1.0.7'
 $PackageRoot = 'D:\Ai\illuTag-refactor-work\release-stable\illuTag-1.1.0'
 $LegacyExeSha256 = 'aee1814a8eafc011219ca26228004066ccdf0119ae01c21971dfe3091c7fed4f'
 $DisabledExeName = 'illutag.exe.rollback-disabled'
+$AfterDisabledExeName = 'illutag.exe.after-rollback-disabled'
 
 function Get-NormalizedPath([string]$Path) {
     if (!$Path) { throw 'Path must not be empty' }
@@ -132,12 +133,16 @@ print(json.dumps({'schemaVersion': version, 'imageCount': images, 'bytes': p.sta
 }
 
 function Invoke-RollbackSwitch([string]$Live, [string]$Rollback, [string]$After, [string]$DisabledName) {
+    $afterDisabledName = 'illutag.exe.after-rollback-disabled'
     $newMoved = $false
+    $newExeDisabled = $false
     $oldMoved = $false
     $oldExeEnabled = $false
     try {
         [IO.Directory]::Move($Live, $After)
         $newMoved = $true
+        [IO.File]::Move((Join-Path $After 'illutag.exe'), (Join-Path $After $afterDisabledName))
+        $newExeDisabled = $true
         [IO.Directory]::Move($Rollback, $Live)
         $oldMoved = $true
         [IO.File]::Move((Join-Path $Live $DisabledName), (Join-Path $Live 'illutag.exe'))
@@ -151,8 +156,15 @@ function Invoke-RollbackSwitch([string]$Live, [string]$Rollback, [string]$After,
         if ($oldMoved) {
             try { [IO.Directory]::Move($Live, $Rollback) } catch { $recoveryErrors.Add($_.Exception.Message) }
         }
+        $newRestored = !$newMoved
         if ($newMoved) {
-            try { [IO.Directory]::Move($After, $Live) } catch { $recoveryErrors.Add($_.Exception.Message) }
+            try {
+                [IO.Directory]::Move($After, $Live)
+                $newRestored = $true
+            } catch { $recoveryErrors.Add($_.Exception.Message) }
+        }
+        if ($newExeDisabled -and $newRestored) {
+            try { [IO.File]::Move((Join-Path $Live $afterDisabledName), (Join-Path $Live 'illutag.exe')) } catch { $recoveryErrors.Add($_.Exception.Message) }
         }
         if ($recoveryErrors.Count) { throw "Rollback failed and recovery needs attention. Keep all directories and do not launch either EXE. Cause: $originalError; recovery: $($recoveryErrors -join ' | ')" }
         throw "Rollback failed; new production directory restored: $originalError"
@@ -164,6 +176,7 @@ $null = Assert-Path $LiveRoot 'D:\Ai' -MustExist
 $null = Assert-Path $RollbackRoot 'D:\Ai' -MustExist
 $null = Assert-Path $AfterRoot 'D:\Ai' -MustBeAbsent
 Assert-NoInstallationProcesses @($LiveRoot,$RollbackRoot,$AfterRoot)
+if (Test-Path -LiteralPath (Join-Path $LiveRoot $AfterDisabledExeName)) { throw 'Live directory already contains an after-rollback disabled EXE; resolve manually' }
 Assert-PortableDataRoot $LiveRoot
 Assert-PortableDataRoot $RollbackRoot
 $currentRelease = Get-Content -LiteralPath (Join-Path $LiveRoot 'release-manifest.json') -Raw | ConvertFrom-Json
@@ -184,5 +197,5 @@ if (!$Execute) {
 Assert-NoInstallationProcesses @($LiveRoot,$RollbackRoot,$AfterRoot)
 $null = Assert-Path $AfterRoot 'D:\Ai' -MustBeAbsent
 Invoke-RollbackSwitch $LiveRoot $RollbackRoot $AfterRoot $DisabledExeName
-Write-Output ([ordered]@{validated=$true;executed=$true;live=$LiveRoot;after=$AfterRoot;imageCount=$oldDb.imageCount;schemaVersion=1} | ConvertTo-Json)
-Write-Output 'Original program, schema 1 database and resources restored. New data is retained in after. The existing Windows WebView profile was left untouched; its safety backup is available if preference restoration is needed. No EXE was launched.'
+Write-Output ([ordered]@{validated=$true;executed=$true;live=$LiveRoot;after=$AfterRoot;newExeDisabled=(Join-Path $AfterRoot $AfterDisabledExeName);imageCount=$oldDb.imageCount;schemaVersion=1} | ConvertTo-Json)
+Write-Output 'Original program, schema 1 database and resources restored. New data is retained in after with its EXE disabled, so opening the archive cannot upgrade the restored live library. The existing Windows WebView profile was left untouched; its safety backup is available if preference restoration is needed. No EXE was launched.'

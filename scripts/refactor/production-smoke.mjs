@@ -27,11 +27,19 @@ const env = { ...process.env }
 for (const key of Object.keys(env)) if (key.startsWith('ILLUTAG_') || key.startsWith('WEBVIEW2_')) delete env[key]
 env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = `--remote-debugging-port=${port} --remote-allow-origins=*`
 const child = spawn(executable, [], { cwd: root, windowsHide: true, stdio: 'ignore', env })
-let browser, transport, page, passed = false
+let browser, transport, page, outcome, failure, spawnError
+child.once('error', error => { spawnError = error })
 const checks = [], startedAt = new Date().toISOString()
 const invoke = (command, args = {}) => page.evaluate(({ command, args }) => window.__TAURI_INTERNALS__.invoke(command, args), { command, args })
+async function bounded(promise, milliseconds, label) {
+  let timer
+  try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(Error(`${label} timed out`)), milliseconds) })]) }
+  finally { clearTimeout(timer) }
+}
+const alive = () => child.exitCode === null && child.signalCode === null && !spawnError
 try {
   for (let attempt = 0; attempt < 160; attempt++) {
+    if (spawnError) throw spawnError
     assert.equal(child.exitCode, null, 'Production application exited before connecting')
     try { ({ browser, transport } = await connectDebugging(port)); break }
     catch { await sleep(100) }
@@ -65,17 +73,37 @@ try {
   assert.equal(visual.theme, '#fafafa')
   assert.equal(visual.overflow, false)
   checks.push('frameless gallery embedded in production executable')
-  passed = true
-  fs.writeFileSync(reportPath, JSON.stringify({ passed, startedAt, completedAt: new Date().toISOString(), root, executable, sha256: digest, sourceCommit: manifest.sourceCommit, visibleImages: bootstrap.page.totalImageCount, firstPageCount: bootstrap.page.images.length, lastPageCount: last.images.length, sourceCount: bootstrap.folders.length, jobsAtStartup: jobs.length, visual, checks }, null, 2))
-  console.log(JSON.stringify({ passed, visibleImages: bootstrap.page.totalImageCount, checks }))
+  outcome = { passed: true, startedAt, root, executable, sha256: digest, sourceCommit: manifest.sourceCommit, visibleImages: bootstrap.page.totalImageCount, firstPageCount: bootstrap.page.images.length, lastPageCount: last.images.length, sourceCount: bootstrap.folders.length, jobsAtStartup: jobs.length, visual, checks }
 } catch (error) {
-  fs.writeFileSync(reportPath, JSON.stringify({ passed: false, startedAt, failedAt: new Date().toISOString(), root, checks, error: error.stack ?? String(error) }, null, 2))
-  throw error
+  failure = error
+  outcome = { passed: false, startedAt, root, checks, error: error.stack ?? String(error) }
 } finally {
-  if (page && child.exitCode === null) await invoke('window_close_command').catch(() => {})
-  for (let attempt = 0; attempt < 150 && child.exitCode === null; attempt++) await sleep(100)
-  if (child.exitCode === null) child.kill()
-  const closing = browser?.close().catch(() => {})
-  transport?.close()
-  if (closing) await closing
+  let forced = false
+  try {
+    if (page && alive()) await bounded(invoke('window_close_command'), 2000, 'Normal production close').catch(() => {})
+    for (let attempt = 0; attempt < 150 && alive(); attempt++) await sleep(100)
+    if (alive()) {
+      forced = true
+      child.kill()
+      for (let attempt = 0; attempt < 30 && alive(); attempt++) await sleep(100)
+    }
+    assert.equal(alive(), false, 'Production smoke process did not exit')
+    const closing = browser?.close().catch(() => {})
+    transport?.close()
+    if (closing) await bounded(closing, 5000, 'Production debugging disconnect')
+    assert.equal(browser?.isConnected() ?? false, false, 'Debugging connection remained open')
+    assert.equal(forced, false, 'Production window required forced termination')
+    assert.equal(child.exitCode, 0, 'Production application did not close normally')
+  } catch (error) {
+    transport?.close()
+    failure ??= error
+    outcome ??= { startedAt, root, checks }
+    outcome.cleanupError = error.stack ?? String(error)
+  }
+  outcome.passed = !failure
+  outcome.completedAt = new Date().toISOString()
+  outcome.close = { forced, exitCode: child.exitCode, signalCode: child.signalCode, disconnected: !(browser?.isConnected() ?? false) }
+  fs.writeFileSync(reportPath, JSON.stringify(outcome, null, 2))
 }
+if (failure) throw failure
+console.log(JSON.stringify({ passed: true, visibleImages: outcome.visibleImages, checks, close: outcome.close }))
