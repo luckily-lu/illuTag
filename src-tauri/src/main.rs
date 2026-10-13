@@ -66,8 +66,11 @@ fn capture_window_memory_state(window: &WebviewWindow) -> Result<WindowMemorySta
         .outer_position()
         .map_err(|error| format!("failed to read window position: {error}"))?;
     let size = window
-        .outer_size()
+        .inner_size()
         .map_err(|error| format!("failed to read window size: {error}"))?;
+    if size.width < 500 || size.height < 500 || window.is_minimized().map_err(|e|e.to_string())? {
+        return Err("跳过最小化或关闭期间的无效窗口尺寸".into());
+    }
     let is_maximized = window
         .is_maximized()
         .map_err(|error| format!("failed to read window maximized state: {error}"))?;
@@ -588,6 +591,7 @@ fn main() {
             let main_window = window_builder.build()?;
             let _data_lease = acquire_data_lease(&data_dir)?;
             app.manage(_data_lease);
+            illutag_core::library::compact::check_pending_switch(&data_dir)?;
             let window_memory_state_path = data_dir.join(WINDOW_MEMORY_FILE_NAME);
 
             if let Some(window) = app.get_webview_window("main") {

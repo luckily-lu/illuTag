@@ -332,8 +332,8 @@ pub(super) fn apply_matching_user_folder_rules_for_image(
         let affected = conn
             .execute(
                 "
-                INSERT OR IGNORE INTO image_user_folders (image_id, folder_id, assigned_at)
-                VALUES (?1, ?2, ?3)
+                INSERT OR IGNORE INTO storage_image_user_folders (image_id, folder_id, assigned_at)
+                VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3)
                 ",
                 params![image_id, folder_id, now],
             )
@@ -378,8 +378,8 @@ pub(super) fn apply_user_folder_rule_to_library_images(
         let affected = conn
             .execute(
                 "
-                INSERT OR IGNORE INTO image_user_folders (image_id, folder_id, assigned_at)
-                VALUES (?1, ?2, ?3)
+                INSERT OR IGNORE INTO storage_image_user_folders (image_id, folder_id, assigned_at)
+                VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3)
                 ",
                 params![image_id, folder_id, now],
             )
@@ -657,8 +657,8 @@ pub fn assign_image_to_user_folder(
 
     conn.execute(
         "
-        INSERT OR IGNORE INTO image_user_folders (image_id, folder_id, assigned_at)
-        VALUES (?1, ?2, ?3)
+        INSERT OR IGNORE INTO storage_image_user_folders (image_id, folder_id, assigned_at)
+        VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3)
         ",
         params![image_id, folder_id, now_ms()],
     )
@@ -677,8 +677,8 @@ pub fn remove_image_from_user_folder(
 
     conn.execute(
         "
-        DELETE FROM image_user_folders
-        WHERE image_id = ?1 AND folder_id = ?2
+        DELETE FROM storage_image_user_folders
+        WHERE image_id = (SELECT image_pk FROM images WHERE id=?1) AND folder_id = ?2
         ",
         params![image_id, folder_id],
     )

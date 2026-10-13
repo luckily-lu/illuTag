@@ -164,10 +164,10 @@ pub fn add_image_user_custom_tag(
     let now = now_ms();
     tx.execute(
         "
-        INSERT INTO image_user_custom_tags (
+        INSERT INTO storage_image_user_custom_tags (
           image_id, tag_text, created_at, updated_at
         )
-        VALUES (?1, ?2, ?3, ?3)
+        VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3, ?3)
         ON CONFLICT(image_id, tag_text) DO UPDATE SET
           updated_at = excluded.updated_at
         ",
@@ -193,7 +193,7 @@ pub fn remove_image_user_custom_tag(
     }
     let conn = open_database(&state.database_path)?;
     conn.execute(
-        "DELETE FROM image_user_custom_tags WHERE image_id = ?1 AND tag_text = ?2",
+        "DELETE FROM storage_image_user_custom_tags WHERE image_id = (SELECT image_pk FROM images WHERE id=?1) AND tag_text = ?2",
         params![image_id, normalized],
     )
     .map_err(|error| format!("Failed to remove custom user tag: {error}"))?;
@@ -219,12 +219,12 @@ pub fn add_image_user_supplement_tag(
     let now = now_ms();
     tx.execute(
         "
-        INSERT INTO image_user_supplement_tags (
+        INSERT INTO storage_image_user_supplement_tags (
           image_id, tag_en, tag_zh, created_at, updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?4)
+        VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3, ?4, ?4)
         ON CONFLICT(image_id, tag_en) DO UPDATE SET
-          tag_zh = COALESCE(excluded.tag_zh, image_user_supplement_tags.tag_zh),
+          tag_zh = COALESCE(excluded.tag_zh, storage_image_user_supplement_tags.tag_zh),
           updated_at = excluded.updated_at
         ",
         params![image_id, normalized_tag_en, normalized_tag_zh, now],
@@ -248,7 +248,7 @@ pub fn remove_image_user_supplement_tag(
     }
     let conn = open_database(&state.database_path)?;
     conn.execute(
-        "DELETE FROM image_user_supplement_tags WHERE image_id = ?1 AND tag_en = ?2",
+        "DELETE FROM storage_image_user_supplement_tags WHERE image_id = (SELECT image_pk FROM images WHERE id=?1) AND tag_en = ?2",
         params![image_id, normalized_tag_en],
     )
     .map_err(|error| format!("Failed to remove supplement user tag: {error}"))?;

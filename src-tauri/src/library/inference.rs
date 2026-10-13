@@ -497,6 +497,7 @@ pub(super) fn dot_product(left: &[f32], right: &[f32]) -> f32 {
         .fold(0f32, |acc, (lv, rv)| acc + lv * rv)
 }
 
+#[cfg(test)]
 pub(super) fn legacy_model_name_to_model_id(legacy: &str) -> &str {
     let normalized = legacy.trim().to_lowercase();
     if normalized.contains("chinese-clip") || normalized.contains("cn_clip") {
@@ -549,7 +550,7 @@ pub(super) fn clear_thumbnail_for_missing_image(
         .flatten();
 
     conn.execute(
-        "DELETE FROM image_thumbnails WHERE image_id = ?1",
+        "DELETE FROM storage_image_thumbnails WHERE image_id = (SELECT image_pk FROM images WHERE id=?1)",
         params![image_id],
     )
     .map_err(|error| format!("Failed to clear stale thumbnail: {error}"))?;
@@ -564,7 +565,7 @@ pub(super) fn clear_thumbnail_cache_storage(
     conn: &Connection,
     database_path: &Path,
 ) -> Result<(), String> {
-    conn.execute("DELETE FROM image_thumbnails", [])
+    conn.execute("DELETE FROM storage_image_thumbnails", [])
         .map_err(|error| format!("Failed to clear thumbnail table: {error}"))?;
     let thumb_root = ensure_thumbnail_root_dir(database_path)?;
     if thumb_root.exists() {
@@ -753,10 +754,10 @@ pub(super) fn upsert_thumbnail_record(
 ) -> Result<(), String> {
     conn.execute(
         "
-        INSERT INTO image_thumbnails (
+        INSERT INTO storage_image_thumbnails (
           image_id, thumb_path, source_modified_at, source_file_size, updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5)
+        VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3, ?4, ?5)
         ON CONFLICT(image_id) DO UPDATE SET
           thumb_path = excluded.thumb_path,
           source_modified_at = excluded.source_modified_at,

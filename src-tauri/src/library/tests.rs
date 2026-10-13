@@ -48,15 +48,18 @@ impl Drop for Fixture {
 fn migration_only_moves_forward() {
     let f = Fixture::new(1);
     let conn = Connection::open(&f.state.database_path).unwrap();
-    conn.pragma_update(None, "user_version", 1).unwrap();
+    conn.pragma_update(None, "user_version", 2).unwrap();
     drop(conn);
-    let conn = open_database(&f.state.database_path).unwrap();
+    assert!(open_database(&f.state.database_path)
+        .unwrap_err()
+        .contains("离线存储升级"));
+    let conn = Connection::open(&f.state.database_path).unwrap();
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
         2
     );
-    conn.pragma_update(None, "user_version", 3).unwrap();
+    conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
     assert!(open_database(&f.state.database_path)
         .unwrap_err()
@@ -65,7 +68,193 @@ fn migration_only_moves_forward() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
+    );
+}
+
+#[test]
+fn compact_tags_preserve_translation_and_distinct_image_statistics() {
+    let f = Fixture::new(1);
+    let conn = open_database(&f.state.database_path).unwrap();
+    let id = f
+        .root
+        .join("image-000000.png")
+        .to_string_lossy()
+        .into_owned();
+    compact::upsert_auto_tag(
+        &conn,
+        &id,
+        "general",
+        "same",
+        None,
+        0.123456789123,
+        "model",
+        17,
+    )
+    .unwrap();
+    compact::upsert_auto_tag(&conn, &id, "character", "same", Some(""), 0.9, "model", 18).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT image_count FROM known_image_tags", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    let values = conn
+        .prepare("SELECT category,tag_zh,confidence FROM image_auto_tags ORDER BY category")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, f64>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(values[0].1, Some(String::new()));
+    assert_eq!(values[1].1, None);
+    assert_eq!(values[1].2.to_bits(), 0.123456789123_f64.to_bits());
+    let pk = conn
+        .query_row("SELECT image_pk FROM images", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    conn.execute(
+        "UPDATE images SET path='D:/new-location.png' WHERE id=?1",
+        [&id],
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT image_pk FROM images", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        pk
+    );
+    conn.execute("DELETE FROM storage_auto_tags WHERE category_pk=(SELECT string_pk FROM storage_strings WHERE value='general')",[]).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT image_count FROM known_image_tags", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    conn.execute("DELETE FROM images WHERE id=?1", [&id])
+        .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM storage_auto_tags", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM known_image_tags", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn exact_ranking_retains_path_tie_break_and_top_600_boundaries() {
+    for count in [599usize,600,601] {
+        let mut cache=ClipImageVectorCache {model_id:CHINESE_CLIP_MODEL_ID.into(),model_version:CHINESE_CLIP_MODEL_VERSION.into(),dimension:2,vectors:HashMap::new()};
+        let ids=(0..count).map(|n|format!("D:/image-{n:05}.png")).collect::<Vec<_>>();
+        for id in ids.iter().rev() { cache.vectors.insert(id.clone(),vec![1.0,0.0]); }
+        assert_eq!(rank_clip_candidates(&cache,&[1.0,0.0],None),ids[..count.min(600)]);
+        let selected=HashSet::from([ids[count-1].clone()]);
+        assert_eq!(rank_clip_candidates(&cache,&[1.0,0.0],Some(&selected)),vec![ids[count-1].clone()]);
+        assert!(rank_clip_candidates(&cache,&[1.0,0.0],Some(&HashSet::new())).is_empty());
+    }
+}
+
+#[test]
+fn compact_search_combines_model_supplement_custom_and_filename_filters() {
+    let f=Fixture::new(3);
+    let ids=(0..3).map(|n|f.root.join(format!("image-{n:06}.png")).to_string_lossy().into_owned()).collect::<Vec<_>>();
+    let conn=open_database(&f.state.database_path).unwrap();
+    compact::upsert_auto_tag(&conn,&ids[0],"general","1girl",Some("女孩"),0.8,WD_TAGGER_MODEL_NAME,17).unwrap();
+    compact::upsert_auto_tag(&conn,&ids[0],"general","blue_hair",None,0.7,WD_TAGGER_MODEL_NAME,17).unwrap();
+    drop(conn);
+    add_image_user_supplement_tag(ids[1].clone(),"1girl".into(),None,&f.state).unwrap();
+    add_image_user_custom_tag(ids[2].clone(),"1girl".into(),&f.state).unwrap();
+    let page=query_gallery(GalleryQuery{tags:vec!["1girl".into()],..Default::default()},&f.state).unwrap();
+    assert_eq!(page.images.iter().map(|i|i.id.clone()).collect::<Vec<_>>(),ids.iter().rev().cloned().collect::<Vec<_>>());
+    let page=query_gallery(GalleryQuery{tags:vec!["1girl".into(),"blue_hair".into()],..Default::default()},&f.state).unwrap();
+    assert_eq!(page.images.len(),1);assert_eq!(page.images[0].id,ids[0]);
+    let page=query_gallery(GalleryQuery{tags:vec!["1girl".into()],file_name:"000001".into(),..Default::default()},&f.state).unwrap();
+    assert_eq!(page.images.len(),1);assert_eq!(page.images[0].id,ids[1]);
+    let page=query_gallery(GalleryQuery{english_query:"1girl".into(),..Default::default()},&f.state).unwrap();
+    assert_eq!(page.images.iter().map(|i|i.id.clone()).collect::<Vec<_>>(),vec![ids[1].clone(),ids[0].clone()]);
+}
+
+#[test]
+fn old_schema_conversion_preserves_exact_vectors_and_historical_translation() {
+    let f = Fixture::new(0);
+    let legacy = f.root.join("legacy.sqlite");
+    let conn = Connection::open(&legacy).unwrap();
+    migrate_database(&conn).unwrap();
+    conn.execute_batch("CREATE TABLE task_runs(id TEXT PRIMARY KEY,kind TEXT NOT NULL,state TEXT NOT NULL,payload TEXT NOT NULL,updated_at INTEGER NOT NULL); PRAGMA user_version=2;").unwrap();
+    conn.execute(
+        "INSERT INTO folders(id,path,added_at) VALUES(1,'D:/old',0)",
+        [],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO images(id,path,file_name,ext,width,height,file_size,modified_at,imported_at,folder_id) VALUES('historic-id','D:/old/a.png','a.png','png',1,1,1,2,3,1)",[]).unwrap();
+    conn.execute("INSERT INTO image_auto_tags VALUES('historic-id','general','term',NULL,0.123456789123,'legacy-model',19)",[]).unwrap();
+    conn.execute("INSERT INTO image_auto_tags VALUES('historic-id','character','term','',0.5,'legacy-model',20)",[]).unwrap();
+    conn.execute("INSERT INTO image_auto_tags VALUES('historic-id','unknown-category','other','历史译名',0.6,'other-model',21)",[]).unwrap();
+    let blob = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    conn.execute(
+        "INSERT INTO image_clip_embeddings VALUES('historic-id','clip','version',2,0,?1,27,29)",
+        [&blob],
+    )
+    .unwrap();
+    drop(conn);
+    let before = fs::read(&legacy).unwrap();
+    let target = f.root.join("converted.sqlite");
+    compact::convert_staged(&legacy, &target).unwrap();
+    assert_eq!(fs::read(&legacy).unwrap(), before);
+    let old = Connection::open(&legacy).unwrap();
+    let new = open_database(&target).unwrap();
+    let logical = |c: &Connection| {
+        c.prepare("SELECT * FROM image_auto_tags ORDER BY image_id,category,tag_en,model_name")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, f64>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(logical(&old), logical(&new));
+    assert_eq!(
+        new.query_row("SELECT vector_blob FROM image_clip_embeddings", [], |r| r
+            .get::<_, Vec<
+            u8,
+        >>(
+            0
+        ))
+        .unwrap(),
+        blob
+    );
+    assert_eq!(
+        new.query_row("SELECT normalized FROM image_clip_embeddings", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        new.query_row("SELECT id,path FROM images", [], |r| Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?
+        )))
+        .unwrap(),
+        ("historic-id".into(), "D:/old/a.png".into())
     );
 }
 #[test]
@@ -131,7 +320,7 @@ fn metadata_fixture() -> (Fixture, LibraryStore) {
     let conn = open_database(&f.state.database_path).unwrap();
     conn.execute("INSERT INTO user_folders(id,name,sort_order,created_at,updated_at) VALUES(1,'已有归属',0,0,0),(2,'规则分类',1,0,0),(3,'补充分类',2,0,0)", []).unwrap();
     conn.execute(
-        "INSERT INTO image_user_folders SELECT id,1,0 FROM images",
+        "INSERT INTO storage_image_user_folders SELECT image_pk,1,0 FROM images",
         [],
     )
     .unwrap();
@@ -332,7 +521,7 @@ fn single_image_tags_return_local_data_and_keep_tag_manager_contract() {
         .is_empty());
     let conn = open_database(&f.state.database_path).unwrap();
     conn.execute(
-        "INSERT INTO image_user_custom_tags SELECT id,'共享标签',0,0 FROM images",
+        "INSERT INTO storage_image_user_custom_tags SELECT image_pk,'共享标签',0,0 FROM images",
         [],
     )
     .unwrap();
@@ -383,7 +572,7 @@ fn failed_tag_rule_application_rolls_back_local_tag_write() {
     .unwrap();
     conn.execute("INSERT INTO user_folder_rules VALUES(1,?1,0)", [rule])
         .unwrap();
-    conn.execute_batch("CREATE TRIGGER reject_rule_assignment BEFORE INSERT ON image_user_folders BEGIN SELECT RAISE(ABORT,'fixture assignment fault'); END;").unwrap();
+    conn.execute_batch("CREATE TRIGGER reject_rule_assignment BEFORE INSERT ON storage_image_user_folders BEGIN SELECT RAISE(ABORT,'fixture assignment fault'); END;").unwrap();
     drop(conn);
     let id = f
         .root
@@ -435,23 +624,22 @@ fn backup_restore_retains_vectors_historical_references_and_beyond_first_page() 
         .to_string();
     let conn = open_database(&f.state.database_path).unwrap();
     conn.execute(
-        "INSERT INTO image_clip_embeddings VALUES(?1,?2,?3,2,1,?4,0,0)",
+        "INSERT INTO storage_clip_embeddings VALUES((SELECT image_pk FROM images WHERE id=?1),?2,2,1,?3,0,0)",
         params![
             id,
-            CHINESE_CLIP_MODEL_ID,
-            CHINESE_CLIP_MODEL_VERSION,
+            compact::clip_model(&conn, CHINESE_CLIP_MODEL_ID, CHINESE_CLIP_MODEL_VERSION).unwrap(),
             vec![0u8; 8]
         ],
     )
     .unwrap();
     conn.execute("INSERT INTO reference_boards(id,name,created_at,updated_at,sort_order) VALUES(1,'history',0,0,0)",[]).unwrap();
     conn.execute(
-        "INSERT INTO reference_board_items(id,board_id,image_id,created_at) VALUES(1,1,?1,0)",
+        "INSERT INTO storage_reference_board_items(id,board_id,image_id,created_at) VALUES(1,1,(SELECT image_pk FROM images WHERE id=?1),0)",
         [&id],
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO image_color_signatures VALUES(?1,0,100,?2,0)",
+        "INSERT INTO storage_image_color_signatures VALUES((SELECT image_pk FROM images WHERE id=?1),0,100,?2,0)",
         params![id, vec![1u8; 8]],
     )
     .unwrap();
@@ -651,7 +839,7 @@ fn classified_export_is_complete_beyond_first_page() {
     let conn = open_database(&f.state.database_path).unwrap();
     conn.execute("INSERT INTO user_folders(id,name,sort_order,created_at,updated_at) VALUES(1,'全部分类',0,0,0)", []).unwrap();
     conn.execute(
-        "INSERT INTO image_user_folders SELECT id,1,0 FROM images",
+        "INSERT INTO storage_image_user_folders SELECT image_pk,1,0 FROM images",
         [],
     )
     .unwrap();

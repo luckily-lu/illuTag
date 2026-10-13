@@ -104,7 +104,7 @@ const USER_FOLDER_SOURCE_KIND_LIBRARY_DIR: &str = "library_dir";
 const TAG_DICTIONARY_SOURCE_SCHEMA_VERSION: &str = "csv-col2-col5-v1";
 const BATCH_SQL_VARIABLE_LIMIT_SAFE: usize = 900;
 // Bump when migrate_database() changes; gates the one-time schema setup via PRAGMA user_version.
-const SCHEMA_USER_VERSION: i64 = 2;
+const SCHEMA_USER_VERSION: i64 = 3;
 const LARGE_LIBRARY_IMAGE_THRESHOLD: i64 = 30_000;
 const LARGE_LIBRARY_INITIAL_IMAGE_LIMIT: i64 = 5_000;
 const TAG_SAVE_BATCH_SIZE: usize = 100;
@@ -212,6 +212,8 @@ pub use folders::*;
 
 mod legacy_boards;
 pub use legacy_boards::*;
+
+pub mod compact;
 
 mod storage;
 use storage::*;

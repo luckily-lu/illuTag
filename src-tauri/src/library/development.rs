@@ -93,8 +93,8 @@ pub fn dev_create_fake_gallery_data(
             let assigned_folder_id = user_folder_ids[seed as usize % user_folder_ids.len()];
             tx.execute(
                 "
-                INSERT OR IGNORE INTO image_user_folders (image_id, folder_id, assigned_at)
-                VALUES (?1, ?2, ?3)
+                INSERT OR IGNORE INTO storage_image_user_folders (image_id, folder_id, assigned_at)
+                VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3)
                 ",
                 params![image_id, assigned_folder_id, now],
             )
@@ -108,29 +108,23 @@ pub fn dev_create_fake_gallery_data(
                 3 => "dev_character",
                 _ => "dev_landscape",
             };
-            tx.execute(
-                "
-                INSERT OR REPLACE INTO image_auto_tags (
-                  image_id, category, tag_en, tag_zh, confidence, model_name, updated_at
-                )
-                VALUES (?1, 'general', ?2, ?2, ?3, ?4, ?5)
-                ",
-                params![
-                    image_id,
-                    tag,
-                    0.5 + ((seed % 45) as f64 / 100.0),
-                    WD_TAGGER_MODEL_NAME,
-                    now
-                ],
-            )
-            .map_err(|error| format!("Failed to insert dev fake tag: {error}"))?;
+            compact::upsert_auto_tag(
+                &tx,
+                &image_id,
+                "general",
+                tag,
+                Some(tag),
+                0.5 + ((seed % 45) as f64 / 100.0),
+                WD_TAGGER_MODEL_NAME,
+                now,
+            )?;
         }
         tx.execute(
             "
-            INSERT INTO image_thumbnails (
+            INSERT INTO storage_image_thumbnails (
               image_id, thumb_path, source_modified_at, source_file_size, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3, ?4, ?5)
             ON CONFLICT(image_id) DO UPDATE SET
               thumb_path = excluded.thumb_path,
               source_modified_at = excluded.source_modified_at,

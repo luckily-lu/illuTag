@@ -614,7 +614,7 @@ pub(super) fn flush_wd_tag_saves(
 
     for (image_id, result) in batch {
         tx.execute(
-            "DELETE FROM image_auto_tags WHERE image_id = ?1 AND model_name = ?2",
+            "DELETE FROM storage_auto_tags WHERE image_pk=(SELECT image_pk FROM images WHERE id=?1) AND model_pk=(SELECT string_pk FROM storage_strings WHERE value=?2)",
             params![image_id, model_name],
         )
         .map_err(|error| format!("Failed to clear old image tags: {error}"))?;
@@ -676,21 +676,16 @@ pub(super) fn upsert_image_auto_tag(
         .map_err(|error| format!("Failed to upsert tag dictionary: {error}"))?;
     }
 
-    conn.execute(
-        "
-        INSERT INTO image_auto_tags (
-          image_id, category, tag_en, tag_zh, confidence, model_name, updated_at
-        )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        ON CONFLICT(image_id, category, tag_en, model_name) DO UPDATE SET
-          tag_zh = excluded.tag_zh,
-          confidence = excluded.confidence,
-          updated_at = excluded.updated_at
-        ",
-        params![image_id, category, tag_en, tag_zh, confidence, model_name, updated_at],
+    compact::upsert_auto_tag(
+        conn,
+        image_id,
+        category,
+        tag_en,
+        tag_zh.as_deref(),
+        f64::from(confidence),
+        model_name,
+        updated_at,
     )
-    .map_err(|error| format!("Failed to save image auto tag: {error}"))?;
-    Ok(())
 }
 
 pub(super) fn collect_pending_tag_image_ids(conn: &Connection) -> Result<Vec<String>, String> {
@@ -701,10 +696,10 @@ pub(super) fn collect_pending_tag_image_ids(conn: &Connection) -> Result<Vec<Str
         FROM images
         WHERE images.source = 'library'
           AND COALESCE(images.trashed, 0) = 0
-          AND images.id NOT IN (
-            SELECT image_id
-            FROM image_auto_tags
-            WHERE model_name = ?1
+          AND NOT EXISTS (
+            SELECT 1 FROM storage_auto_tags t
+            WHERE t.image_pk=images.image_pk
+              AND t.model_pk=(SELECT string_pk FROM storage_strings WHERE value=?1)
           )
         ORDER BY images.imported_at DESC, images.id ASC
         ",

@@ -30,34 +30,15 @@ pub(super) fn open_database(database_path: &Path) -> Result<Connection, String> 
     if schema_version > SCHEMA_USER_VERSION {
         return Err(format!("数据库版本 {schema_version} 高于此程序支持的版本 {SCHEMA_USER_VERSION}，请使用匹配的新版本"));
     }
-    if schema_version < SCHEMA_USER_VERSION && !readonly {
-        conn.execute_batch("PRAGMA journal_mode=WAL; BEGIN IMMEDIATE;")
-            .map_err(|e| e.to_string())?;
-        let result = (|| -> Result<(), String> {
-            if schema_version < 1 {
-                migrate_database(&conn)?;
-            }
-            if schema_version < 2 {
-                conn.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS task_runs (
-                    id TEXT PRIMARY KEY, kind TEXT NOT NULL, state TEXT NOT NULL,
-                    payload TEXT NOT NULL, updated_at INTEGER NOT NULL);",
-                )
-                .map_err(|e| e.to_string())?;
-            }
-            conn.pragma_update(None, "user_version", SCHEMA_USER_VERSION)
-                .map_err(|e| e.to_string())?;
-            conn.execute_batch("COMMIT;").map_err(|e| e.to_string())?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = conn.execute_batch("ROLLBACK;");
-        }
-        result?;
+    if schema_version == 0 && !readonly {
+        compact::initialize(&conn)?;
+    } else if schema_version < SCHEMA_USER_VERSION {
+        return Err("此图库需要离线存储升级，请先运行存储优化工具；原数据库未修改".into());
     }
     Ok(conn)
 }
 
+#[cfg(test)]
 pub(super) fn migrate_database(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
@@ -418,6 +399,7 @@ pub(super) fn migrate_database(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn ensure_known_image_tags_bootstrap(conn: &Connection) -> Result<(), String> {
     let known_count = conn
         .query_row("SELECT COUNT(*) FROM known_image_tags", [], |row| {
@@ -438,6 +420,7 @@ pub(super) fn ensure_known_image_tags_bootstrap(conn: &Connection) -> Result<(),
     rebuild_known_image_tags(conn)
 }
 
+#[cfg(test)]
 pub(super) fn rebuild_known_image_tags(conn: &Connection) -> Result<(), String> {
     let now = now_ms();
     conn.execute("DELETE FROM known_image_tags", [])
@@ -463,6 +446,7 @@ pub(super) fn rebuild_known_image_tags(conn: &Connection) -> Result<(), String> 
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn ensure_library_columns(conn: &Connection) -> Result<(), String> {
     if !table_has_column(conn, "folders", "hidden")? {
         conn.execute(
@@ -495,6 +479,7 @@ pub(super) fn ensure_library_columns(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn ensure_thumbnail_table(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
@@ -515,6 +500,7 @@ pub(super) fn ensure_thumbnail_table(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn ensure_clip_embedding_table(conn: &Connection) -> Result<(), String> {
     if !table_exists(conn, "image_clip_embeddings")? {
         conn.execute_batch(
@@ -655,6 +641,7 @@ pub(super) fn ensure_clip_embedding_table(conn: &Connection) -> Result<(), Strin
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, String> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -665,6 +652,7 @@ pub(super) fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, 
     .map_err(|error| format!("Failed to inspect table existence: {error}"))
 }
 
+#[cfg(test)]
 pub(super) fn table_has_column(
     conn: &Connection,
     table_name: &str,
@@ -681,6 +669,7 @@ pub(super) fn table_has_column(
     Ok(columns.iter().any(|column| column == column_name))
 }
 
+#[cfg(test)]
 pub(super) fn ensure_reference_board_items_allow_duplicates(
     conn: &Connection,
 ) -> Result<(), String> {
@@ -733,6 +722,7 @@ pub(super) fn ensure_reference_board_items_allow_duplicates(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn ensure_reference_board_item_flip_columns(conn: &Connection) -> Result<(), String> {
     if !table_has_column(conn, "reference_board_items", "flip_x")? {
         conn.execute(
@@ -751,6 +741,7 @@ pub(super) fn ensure_reference_board_item_flip_columns(conn: &Connection) -> Res
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn ensure_user_folder_sort_order(conn: &Connection) -> Result<(), String> {
     let has_sort_order = conn
         .prepare("PRAGMA table_info(user_folders)")
@@ -773,6 +764,7 @@ pub(super) fn ensure_user_folder_sort_order(conn: &Connection) -> Result<(), Str
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn ensure_user_folder_source_metadata(conn: &Connection) -> Result<(), String> {
     if !table_has_column(conn, "user_folders", "source_kind")? {
         conn.execute(

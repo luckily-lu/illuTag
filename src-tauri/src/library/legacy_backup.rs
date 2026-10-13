@@ -626,8 +626,8 @@ pub(super) fn import_image_user_folders_from_backup(
     for assignment in &backup.library.image_folders {
         conn.execute(
             "
-            INSERT OR IGNORE INTO image_user_folders (image_id, folder_id, assigned_at)
-            VALUES (?1, ?2, ?3)
+            INSERT OR IGNORE INTO storage_image_user_folders (image_id, folder_id, assigned_at)
+            VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3)
             ",
             params![assignment.image_id, assignment.folder_id, now_ms()],
         )
@@ -655,8 +655,8 @@ pub(super) fn import_user_tags_from_backup(
     for tag in &backup.image_user_custom_tags {
         conn.execute(
             "
-            INSERT INTO image_user_custom_tags (image_id, tag_text, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4)
+            INSERT INTO storage_image_user_custom_tags (image_id, tag_text, created_at, updated_at)
+            VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3, ?4)
             ON CONFLICT(image_id, tag_text) DO UPDATE SET
               updated_at = excluded.updated_at
             ",
@@ -667,10 +667,10 @@ pub(super) fn import_user_tags_from_backup(
     for tag in &backup.image_user_supplement_tags {
         conn.execute(
             "
-            INSERT INTO image_user_supplement_tags (image_id, tag_en, tag_zh, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO storage_image_user_supplement_tags (image_id, tag_en, tag_zh, created_at, updated_at)
+            VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3, ?4, ?5)
             ON CONFLICT(image_id, tag_en) DO UPDATE SET
-              tag_zh = COALESCE(excluded.tag_zh, image_user_supplement_tags.tag_zh),
+              tag_zh = COALESCE(excluded.tag_zh, storage_image_user_supplement_tags.tag_zh),
               updated_at = excluded.updated_at
             ",
             params![tag.image_id, tag.tag_en, tag.tag_zh, tag.created_at, tag.updated_at],
@@ -792,10 +792,10 @@ pub(super) fn import_reference_boards_from_backup(
     for item in &backup.library.reference_board_items {
         conn.execute(
             "
-            INSERT INTO reference_board_items (
+            INSERT INTO storage_reference_board_items (
               id, board_id, image_id, x, y, width, height, rotation, flip_x, flip_y, z_index, created_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            VALUES (?1, ?2,(SELECT image_pk FROM images WHERE id=?3), ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(id) DO UPDATE SET
               board_id = excluded.board_id,
               image_id = excluded.image_id,

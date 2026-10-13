@@ -95,10 +95,10 @@ pub fn add_image_to_reference_board(
 
     conn.execute(
         "
-        INSERT OR IGNORE INTO reference_board_items (
+        INSERT OR IGNORE INTO storage_reference_board_items (
           board_id, image_id, x, y, width, height, rotation, flip_x, flip_y, z_index, created_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, ?7, ?8)
+        VALUES (?1,(SELECT image_pk FROM images WHERE id=?2), ?3, ?4, ?5, ?6, 0, 0, 0, ?7, ?8)
         ",
         params![
             board_id,
@@ -211,10 +211,10 @@ pub fn paste_image_to_reference_board(
 
     tx.execute(
         "
-        INSERT INTO reference_board_items (
+        INSERT INTO storage_reference_board_items (
           board_id, image_id, x, y, width, height, rotation, flip_x, flip_y, z_index, created_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, ?7, ?8)
+        VALUES (?1,(SELECT image_pk FROM images WHERE id=?2), ?3, ?4, ?5, ?6, 0, 0, 0, ?7, ?8)
         ",
         params![
             board_id,
@@ -360,10 +360,10 @@ pub fn paste_images_to_reference_board(
 
         tx.execute(
             "
-            INSERT INTO reference_board_items (
+            INSERT INTO storage_reference_board_items (
               board_id, image_id, x, y, width, height, rotation, flip_x, flip_y, z_index, created_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, ?7, ?8)
+            VALUES (?1,(SELECT image_pk FROM images WHERE id=?2), ?3, ?4, ?5, ?6, 0, 0, 0, ?7, ?8)
             ",
             params![
                 board_id,
@@ -606,7 +606,7 @@ pub fn remove_reference_board_item(item_id: i64, state: &AppState) -> Result<Lib
         .map_err(|_| "图库状态被占用，请稍后再试".to_string())?;
     let conn = open_database(&state.database_path)?;
     conn.execute(
-        "DELETE FROM reference_board_items WHERE id = ?1",
+        "DELETE FROM storage_reference_board_items WHERE id = ?1",
         params![item_id],
     )
     .map_err(|error| format!("移除参考图失败：{error}"))?;
@@ -636,7 +636,7 @@ pub fn update_reference_board_item_layout(
     let conn = open_database(&state.database_path)?;
     conn.execute(
         "
-        UPDATE reference_board_items
+        UPDATE storage_reference_board_items
         SET x = ?1, y = ?2, width = ?3, height = ?4, rotation = ?5, flip_x = ?6, flip_y = ?7
         WHERE id = ?8
         ",
@@ -671,7 +671,7 @@ pub fn bring_reference_board_item_to_front(
     let next_index = next_reference_board_z_index(&conn, item.board_id)?;
     conn.execute(
         "
-        UPDATE reference_board_items
+        UPDATE storage_reference_board_items
         SET z_index = ?1
         WHERE id = ?2
         ",
@@ -699,10 +699,10 @@ pub fn duplicate_reference_board_item(
     let next_index = next_reference_board_z_index(&conn, item.board_id)?;
     conn.execute(
         "
-        INSERT INTO reference_board_items (
+        INSERT INTO storage_reference_board_items (
           board_id, image_id, x, y, width, height, rotation, flip_x, flip_y, z_index, created_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        VALUES (?1,(SELECT image_pk FROM images WHERE id=?2), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         ",
         params![
             item.board_id,
@@ -745,10 +745,10 @@ pub fn restore_reference_board_item(
     let conn = open_database(&state.database_path)?;
     conn.execute(
         "
-        INSERT INTO reference_board_items (
+        INSERT INTO storage_reference_board_items (
           board_id, image_id, x, y, width, height, rotation, flip_x, flip_y, z_index, created_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        VALUES (?1,(SELECT image_pk FROM images WHERE id=?2), ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         ",
         params![
             board_id,
@@ -853,7 +853,7 @@ pub fn import_reference_board_item_to_library(
     )
     .map_err(|error| format!("保存图库图片索引失败：{error}"))?;
     tx.execute(
-        "UPDATE reference_board_items SET image_id = ?1 WHERE id = ?2",
+        "UPDATE storage_reference_board_items SET image_id = (SELECT image_pk FROM images WHERE id=?1) WHERE id = ?2",
         params![target_path_text, item_id],
     )
     .map_err(|error| format!("更新参考图索引失败：{error}"))?;
@@ -894,7 +894,7 @@ pub fn auto_arrange_reference_board(
         }
         tx.execute(
             "
-            UPDATE reference_board_items
+            UPDATE storage_reference_board_items
             SET x = ?1, y = ?2, rotation = 0
             WHERE id = ?3
             ",

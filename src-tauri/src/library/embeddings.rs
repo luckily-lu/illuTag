@@ -166,13 +166,14 @@ pub(super) fn upsert_image_clip_embedding(
         .map_err(|_| "CLIP embedding dimension overflow".to_string())?;
     let vector_blob = encode_f32_blob(&normalized_vector);
     let now = now_ms();
+    let model_pk = compact::clip_model(conn, CHINESE_CLIP_MODEL_ID, CHINESE_CLIP_MODEL_VERSION)?;
     conn.execute(
         "
-        INSERT INTO image_clip_embeddings (
-          image_id, model_id, model_version, dimension, normalized, vector_blob, source_modified_at, updated_at
+        INSERT INTO storage_clip_embeddings (
+          image_id, model_pk, dimension, normalized, vector_blob, source_modified_at, updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7)
-        ON CONFLICT(image_id, model_id, model_version) DO UPDATE SET
+        VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3, 1, ?4, ?5, ?6)
+        ON CONFLICT(image_id, model_pk) DO UPDATE SET
           dimension = excluded.dimension,
           normalized = excluded.normalized,
           vector_blob = excluded.vector_blob,
@@ -181,8 +182,7 @@ pub(super) fn upsert_image_clip_embedding(
         ",
         params![
             image_id,
-            CHINESE_CLIP_MODEL_ID,
-            CHINESE_CLIP_MODEL_VERSION,
+            model_pk,
             dim,
             vector_blob,
             source_modified_at,

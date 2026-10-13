@@ -194,19 +194,19 @@ pub fn search_gallery_image_ids(
     for tag_en in zh_tags {
         sql.push_str(
             "
-            AND images.id IN (
-              SELECT t.image_id
-              FROM image_auto_tags t
-              WHERE t.model_name = ?
-                AND t.tag_en = ?
+            AND images.image_pk IN (
+              SELECT t.image_pk
+              FROM storage_auto_tags t
+              WHERE t.model_pk = (SELECT string_pk FROM storage_strings WHERE value=?)
+                AND t.tag_pk = (SELECT string_pk FROM storage_strings WHERE value=?)
                 AND t.confidence BETWEEN ? AND ?
               UNION
               SELECT ust.image_id
-              FROM image_user_supplement_tags ust
+              FROM storage_image_user_supplement_tags ust
               WHERE ust.tag_en = ?
               UNION
               SELECT uct.image_id
-              FROM image_user_custom_tags uct
+              FROM storage_image_user_custom_tags uct
               WHERE uct.tag_text = ?
             )
             ",
@@ -224,21 +224,21 @@ pub fn search_gallery_image_ids(
     for token in english_tokens {
         sql.push_str(
             "
-            AND images.id IN (
-              SELECT t.image_id
-              FROM image_auto_tags t
-              WHERE t.model_name = ?
-                AND t.tag_en IN (
-                  SELECT k.tag_en
-                  FROM known_image_tags k
+            AND images.image_pk IN (
+              SELECT t.image_pk
+              FROM storage_auto_tags t
+              WHERE t.model_pk = (SELECT string_pk FROM storage_strings WHERE value=?)
+                AND t.tag_pk IN (
+                  SELECT s.string_pk
+                  FROM known_image_tags k JOIN storage_strings s ON s.value=k.tag_en
                   WHERE k.model_name = ?
-                    AND LOWER(REPLACE(k.tag_en, '_', ' ')) LIKE ? ESCAPE '\'
+                    AND LOWER(REPLACE(k.tag_en, '_', ' ')) LIKE ? ESCAPE '\\'
                 )
                 AND t.confidence BETWEEN ? AND ?
               UNION
               SELECT ust.image_id
-              FROM image_user_supplement_tags ust
-              WHERE LOWER(REPLACE(ust.tag_en, '_', ' ')) LIKE ? ESCAPE '\'
+              FROM storage_image_user_supplement_tags ust
+              WHERE LOWER(REPLACE(ust.tag_en, '_', ' ')) LIKE ? ESCAPE '\\'
             )
             ",
         );
@@ -256,9 +256,9 @@ pub fn search_gallery_image_ids(
             "
             AND EXISTS (
               SELECT 1
-              FROM image_auto_tags t
-              WHERE t.image_id = images.id
-                AND t.model_name = ?
+              FROM storage_auto_tags t
+              WHERE t.image_pk = images.image_pk
+                AND t.model_pk = (SELECT string_pk FROM storage_strings WHERE value=?)
                 AND t.confidence BETWEEN ? AND ?
             )
             ",

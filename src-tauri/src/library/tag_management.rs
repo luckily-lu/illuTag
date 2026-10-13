@@ -54,7 +54,7 @@ pub fn delete_user_custom_tag(
         .transaction()
         .map_err(|error| format!("Failed to open user custom tag delete transaction: {error}"))?;
     tx.execute(
-        "DELETE FROM image_user_custom_tags WHERE tag_text = ?1",
+        "DELETE FROM storage_image_user_custom_tags WHERE tag_text = ?1",
         params![normalized_tag.clone()],
     )
     .map_err(|error| format!("Failed to delete image custom tag rows: {error}"))?;

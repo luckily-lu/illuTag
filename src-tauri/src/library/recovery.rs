@@ -143,14 +143,23 @@ pub fn verify_database(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 fn table_counts(conn: &Connection) -> Result<std::collections::BTreeMap<String, i64>, String> {
-    let names=conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").map_err(|e|e.to_string())?
+    let compact = conn
+        .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?
+        == 3;
+    let names=conn.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'storage_%' ORDER BY name").map_err(|e|e.to_string())?
         .query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
     names
         .into_iter()
         .map(|name| {
+            let physical = if compact {
+                compact::physical_name(&name)
+            } else {
+                name.clone()
+            };
             let count = conn
                 .query_row(
-                    &format!("SELECT COUNT(*) FROM \"{}\"", name.replace('"', "\"\"")),
+                    &format!("SELECT COUNT(*) FROM \"{}\"", physical.replace('"', "\"\"")),
                     [],
                     |r| r.get(0),
                 )
@@ -317,6 +326,10 @@ pub fn inspect_restore_package(package_dir: String) -> Result<RestoreManifest, S
 }
 pub fn remap_database_paths(path: &Path, mappings: &[BackupPathMapping]) -> Result<(), String> {
     let mut conn = Connection::open(path).map_err(|e| e.to_string())?;
+    let compact = conn
+        .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?
+        == 3;
     conn.execute_batch("PRAGMA foreign_keys=OFF;")
         .map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -325,6 +338,11 @@ pub fn remap_database_paths(path: &Path, mappings: &[BackupPathMapping]) -> Resu
         ("user_folders", "source_path"),
         ("image_thumbnails", "thumb_path"),
     ] {
+        let table = if compact {
+            compact::physical_name(table)
+        } else {
+            table.to_string()
+        };
         let sql = format!("SELECT rowid,{column} FROM {table} WHERE {column} IS NOT NULL");
         let rows = tx
             .prepare(&sql)
@@ -344,43 +362,56 @@ pub fn remap_database_paths(path: &Path, mappings: &[BackupPathMapping]) -> Resu
             }
         }
     }
-    let rows = tx
-        .prepare("SELECT id,path FROM images")
-        .map_err(|e| e.to_string())?
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    for (id, path) in rows {
-        let next_id = remap_backup_path(&id, mappings);
-        let next_path = remap_backup_path(&path, mappings);
-        if next_id != id {
-            for table in [
-                "reference_board_items",
-                "image_thumbnails",
-                "image_clip_embeddings",
-                "image_atmosphere_signatures",
-                "image_color_signatures",
-                "image_user_folders",
-                "image_auto_tags",
-                "image_user_custom_tags",
-                "image_user_supplement_tags",
-                "image_tags",
-                "image_ai_state",
-            ] {
+    let mut after = 0i64;
+    loop {
+        let rows = tx
+            .prepare("SELECT rowid,id,path FROM images WHERE rowid>?1 ORDER BY rowid LIMIT 1000")
+            .map_err(|e| e.to_string())?
+            .query_map([after], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        if rows.is_empty() {
+            break;
+        }
+        after = rows.last().unwrap().0;
+        for (_, id, path) in rows {
+            let next_id = remap_backup_path(&id, mappings);
+            let next_path = remap_backup_path(&path, mappings);
+            if next_id != id && !compact {
+                for table in [
+                    "reference_board_items",
+                    "image_thumbnails",
+                    "image_clip_embeddings",
+                    "image_atmosphere_signatures",
+                    "image_color_signatures",
+                    "image_user_folders",
+                    "image_auto_tags",
+                    "image_user_custom_tags",
+                    "image_user_supplement_tags",
+                    "image_tags",
+                    "image_ai_state",
+                ] {
+                    tx.execute(
+                        &format!("UPDATE {table} SET image_id=?1 WHERE image_id=?2"),
+                        params![next_id, id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            if next_id != id || next_path != path {
                 tx.execute(
-                    &format!("UPDATE {table} SET image_id=?1 WHERE image_id=?2"),
-                    params![next_id, id],
+                    "UPDATE images SET id=?1,path=?2 WHERE id=?3",
+                    params![next_id, next_path, id],
                 )
                 .map_err(|e| e.to_string())?;
             }
-        }
-        if next_id != id || next_path != path {
-            tx.execute(
-                "UPDATE images SET id=?1,path=?2 WHERE id=?3",
-                params![next_id, next_path, id],
-            )
-            .map_err(|e| e.to_string())?;
         }
     }
     tx.commit().map_err(|e| e.to_string())?;
@@ -397,11 +428,20 @@ pub fn restore_package(
     let staged = state.data_dir.join(format!("restore-staging-{}", now_ms()));
     fs::create_dir(&staged).map_err(|e| e.to_string())?;
     for file in &manifest.files {
+        if file.path == "illutag.sqlite" && manifest.schema_version < 3 {
+            continue;
+        }
         let target = staged.join(&file.path);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         fs::copy(package.join(&file.path), target).map_err(|e| e.to_string())?;
+    }
+    if manifest.schema_version < 3 {
+        compact::convert_staged(
+            &package.join("illutag.sqlite"),
+            &staged.join("illutag.sqlite"),
+        )?;
     }
     path_mappings.push(BackupPathMapping {
         from: manifest.source_data_dir.clone(),

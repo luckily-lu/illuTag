@@ -21,7 +21,7 @@ pub(super) fn generate_thumbnails_once(
               t.source_modified_at,
               t.source_file_size
             FROM images i
-            LEFT JOIN image_thumbnails t ON t.image_id = i.id
+            LEFT JOIN storage_image_thumbnails t ON t.image_id = i.image_pk
             WHERE i.source = 'library'
               AND COALESCE(i.trashed, 0) = 0
             ORDER BY i.modified_at DESC, i.id ASC

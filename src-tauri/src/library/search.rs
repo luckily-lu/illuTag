@@ -41,6 +41,18 @@ pub fn search_gallery_image_ids_by_natural_language(
         return Ok(Vec::new());
     }
 
+    Ok(rank_clip_candidates(
+        cache,
+        &text_embedding,
+        candidate_filter.as_ref(),
+    ))
+}
+
+pub(super) fn rank_clip_candidates(
+    cache: &ClipImageVectorCache,
+    text_embedding: &[f32],
+    candidate_filter: Option<&HashSet<String>>,
+) -> Vec<String> {
     let top_k = NATURAL_LANGUAGE_SEARCH_DEFAULT_TOP_K.max(1);
     let mut heap = BinaryHeap::<NaturalLanguageSearchHeapEntry>::new();
     for (image_id, vector) in &cache.vectors {
@@ -75,5 +87,5 @@ pub fn search_gallery_image_ids_by_natural_language(
             .unwrap_or(Ordering::Equal)
             .then_with(|| a.image_id.cmp(&b.image_id))
     });
-    Ok(ranked.into_iter().map(|entry| entry.image_id).collect())
+    ranked.into_iter().map(|entry| entry.image_id).collect()
 }

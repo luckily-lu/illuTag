@@ -53,12 +53,12 @@ pub(super) fn gallery_scope_where_sql(
             Cow::Owned(format!(
                 "
                 {active_where}
-                AND {alias}.id IN (
+                AND {alias}.image_pk IN (
                   SELECT direct.image_id
-                  FROM image_user_folders direct
+                  FROM storage_image_user_folders direct
                   WHERE direct.folder_id = ?1
                 )
-                AND {alias}.id NOT IN (
+                AND {alias}.image_pk NOT IN (
                   WITH RECURSIVE descendants(id) AS (
                     SELECT uf.id FROM user_folders uf WHERE uf.parent_id = ?1
                     UNION ALL
@@ -66,7 +66,7 @@ pub(super) fn gallery_scope_where_sql(
                     JOIN descendants d ON uf.parent_id = d.id
                   )
                   SELECT child_assignment.image_id
-                  FROM image_user_folders child_assignment
+                  FROM storage_image_user_folders child_assignment
                   JOIN descendants d ON d.id = child_assignment.folder_id
                 )
                 "
@@ -79,7 +79,7 @@ pub(super) fn gallery_scope_where_sql(
             Cow::Owned(format!(
                 "
                 {active_where}
-                AND {alias}.id IN (
+                AND {alias}.image_pk IN (
                   WITH RECURSIVE folder_scope(id) AS (
                     SELECT ?1
                     UNION ALL
@@ -87,7 +87,7 @@ pub(super) fn gallery_scope_where_sql(
                     JOIN folder_scope fs ON uf.parent_id = fs.id
                   )
                   SELECT assignment.image_id
-                  FROM image_user_folders assignment
+                  FROM storage_image_user_folders assignment
                   JOIN folder_scope fs ON fs.id = assignment.folder_id
                 )
                 "
@@ -104,7 +104,7 @@ pub(super) fn gallery_scope_where_sql(
         "trash" => (Cow::Owned(trashed_where), Vec::new()),
         "unclassified" => (
             Cow::Owned(format!(
-                "{active_where} AND NOT EXISTS (SELECT 1 FROM image_user_folders a WHERE a.image_id = {alias}.id)"
+                "{active_where} AND NOT EXISTS (SELECT 1 FROM storage_image_user_folders a WHERE a.image_id = {alias}.image_pk)"
             )),
             Vec::new(),
         ),
@@ -373,8 +373,8 @@ pub(super) fn sync_user_folder_tree_for_library_directory(
             };
             tx.execute(
                 "
-                INSERT OR IGNORE INTO image_user_folders (image_id, folder_id, assigned_at)
-                VALUES (?1, ?2, ?3)
+                INSERT OR IGNORE INTO storage_image_user_folders (image_id, folder_id, assigned_at)
+                VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3)
                 ",
                 params![image.path, target_folder_id, now],
             )
@@ -464,8 +464,8 @@ pub(super) fn assign_scanned_images_to_nearest_synced_parent_folder(
 
         tx.execute(
             "
-            INSERT OR IGNORE INTO image_user_folders (image_id, folder_id, assigned_at)
-            VALUES (?1, ?2, ?3)
+            INSERT OR IGNORE INTO storage_image_user_folders (image_id, folder_id, assigned_at)
+            VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3)
             ",
             params![image.path, folder_id, now],
         )
@@ -594,8 +594,8 @@ pub(super) fn remove_synced_folder_assignments_for_image(
 ) -> Result<(), String> {
     conn.execute(
         "
-        DELETE FROM image_user_folders
-        WHERE image_id = ?1
+        DELETE FROM storage_image_user_folders
+        WHERE image_id = (SELECT image_pk FROM images WHERE id=?1)
           AND folder_id IN (
             SELECT id FROM user_folders WHERE source_kind = ?2
           )
@@ -1147,8 +1147,8 @@ pub fn assign_images_to_user_folder(
     for image_id in &image_ids {
         tx.execute(
             "
-            INSERT OR IGNORE INTO image_user_folders (image_id, folder_id, assigned_at)
-            VALUES (?1, ?2, ?3)
+            INSERT OR IGNORE INTO storage_image_user_folders (image_id, folder_id, assigned_at)
+            VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3)
             ",
             params![image_id, folder_id, now],
         )
@@ -1192,8 +1192,8 @@ pub fn move_images_to_user_folder(
     for image_id in &image_ids {
         tx.execute(
             "
-            INSERT OR IGNORE INTO image_user_folders (image_id, folder_id, assigned_at)
-            VALUES (?1, ?2, ?3)
+            INSERT OR IGNORE INTO storage_image_user_folders (image_id, folder_id, assigned_at)
+            VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3)
             ",
             params![image_id, target_folder_id, now],
         )
@@ -1204,8 +1204,8 @@ pub fn move_images_to_user_folder(
         for image_id in &image_ids {
             tx.execute(
                 "
-                DELETE FROM image_user_folders
-                WHERE image_id = ?1 AND folder_id = ?2
+                DELETE FROM storage_image_user_folders
+                WHERE image_id = (SELECT image_pk FROM images WHERE id=?1) AND folder_id = ?2
                 ",
                 params![image_id, from_folder_id],
             )
@@ -1248,9 +1248,9 @@ pub fn remove_images_from_user_folder(
         let placeholders = build_in_placeholders(chunk.len());
         let sql = format!(
             "
-            DELETE FROM image_user_folders
+            DELETE FROM storage_image_user_folders
             WHERE folder_id = ?1
-              AND image_id IN ({placeholders})
+              AND image_id IN (SELECT image_pk FROM images WHERE id IN ({placeholders}))
             "
         );
         let mut params_values = Vec::<Value>::with_capacity(1 + chunk.len());
@@ -1333,10 +1333,10 @@ pub fn add_images_user_tags(
         for tag_text in &normalized_custom_tags {
             tx.execute(
                 "
-                INSERT INTO image_user_custom_tags (
+                INSERT INTO storage_image_user_custom_tags (
                   image_id, tag_text, created_at, updated_at
                 )
-                VALUES (?1, ?2, ?3, ?3)
+                VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3, ?3)
                 ON CONFLICT(image_id, tag_text) DO UPDATE SET
                   updated_at = excluded.updated_at
                 ",
@@ -1348,12 +1348,12 @@ pub fn add_images_user_tags(
         for (tag_en, tag_zh) in &normalized_supplement_tags {
             tx.execute(
                 "
-                INSERT INTO image_user_supplement_tags (
+                INSERT INTO storage_image_user_supplement_tags (
                   image_id, tag_en, tag_zh, created_at, updated_at
                 )
-                VALUES (?1, ?2, ?3, ?4, ?4)
+                VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3, ?4, ?4)
                 ON CONFLICT(image_id, tag_en) DO UPDATE SET
-                  tag_zh = COALESCE(excluded.tag_zh, image_user_supplement_tags.tag_zh),
+                  tag_zh = COALESCE(excluded.tag_zh, storage_image_user_supplement_tags.tag_zh),
                   updated_at = excluded.updated_at
                 ",
                 params![image_id, tag_en, tag_zh, now],

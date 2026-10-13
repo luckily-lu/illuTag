@@ -313,19 +313,19 @@ pub fn mutate_images(request: ImageMutation, state: &AppState) -> Result<Mutatio
                     }
                     if ["move", "moveFolder"].contains(&request.action.as_str()) {
                         tx.execute(
-                            "DELETE FROM image_user_folders WHERE image_id=?1",
+                            "DELETE FROM storage_image_user_folders WHERE image_id = (SELECT image_pk FROM images WHERE id=?1)",
                             [&image_id],
                         )
                         .map_err(|e| e.to_string())?;
                     }
                     if ["remove", "removeFolder"].contains(&request.action.as_str()) {
                         tx.execute(
-                            "DELETE FROM image_user_folders WHERE image_id=?1 AND folder_id=?2",
+                            "DELETE FROM storage_image_user_folders WHERE image_id = (SELECT image_pk FROM images WHERE id=?1) AND folder_id=?2",
                             params![image_id, folder_id],
                         )
                         .map_err(|e| e.to_string())?;
                     } else {
-                        tx.execute("INSERT OR IGNORE INTO image_user_folders(image_id,folder_id,assigned_at) VALUES(?1,?2,?3)", params![image_id,folder_id,now_ms()]).map_err(|e| e.to_string())?;
+                        tx.execute("INSERT OR IGNORE INTO storage_image_user_folders(image_id,folder_id,assigned_at) VALUES((SELECT image_pk FROM images WHERE id=?1),?2,?3)", params![image_id,folder_id,now_ms()]).map_err(|e| e.to_string())?;
                     }
                 }
                 "addTags" => {
@@ -335,10 +335,10 @@ pub fn mutate_images(request: ImageMutation, state: &AppState) -> Result<Mutatio
                             continue;
                         }
                         upsert_user_custom_tag(&tx, tag)?;
-                        tx.execute("INSERT OR IGNORE INTO image_user_custom_tags(image_id,tag_text,created_at,updated_at) VALUES(?1,?2,?3,?3)", params![image_id,tag,now_ms()]).map_err(|e| e.to_string())?;
+                        tx.execute("INSERT OR IGNORE INTO storage_image_user_custom_tags(image_id,tag_text,created_at,updated_at) VALUES((SELECT image_pk FROM images WHERE id=?1),?2,?3,?3)", params![image_id,tag,now_ms()]).map_err(|e| e.to_string())?;
                     }
                     for tag in &request.supplement_tags {
-                        tx.execute("INSERT OR IGNORE INTO image_user_supplement_tags(image_id,tag_en,tag_zh,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)", params![image_id,tag.tag_en,tag.tag_zh,now_ms()]).map_err(|e| e.to_string())?;
+                        tx.execute("INSERT OR IGNORE INTO storage_image_user_supplement_tags(image_id,tag_en,tag_zh,created_at,updated_at) VALUES((SELECT image_pk FROM images WHERE id=?1),?2,?3,?4,?4)", params![image_id,tag.tag_en,tag.tag_zh,now_ms()]).map_err(|e| e.to_string())?;
                     }
                     apply_matching_user_folder_rules_for_image(&tx, &image_id)?;
                 }

@@ -53,26 +53,27 @@ foreach ($relative in $required | Where-Object { !$_.StartsWith('runtime\') }) {
   New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
   Copy-Item -LiteralPath (Join-Path $ResourceRoot $relative) -Destination $destination
 }
-$scriptNames = @('wd_tagger_service.py','wd_tagger_test.py','chinese_clip_text_service.py','chinese_clip_image_service.py','ort_runtime.py')
+$scriptNames = @('wd_tagger_service.py','wd_tagger_test.py','chinese_clip_text_service.py','chinese_clip_image_service.py','ort_runtime.py','storage_optimize.py','storage_cutover.py')
 New-Item -ItemType Directory -Path (Join-Path $portableAppDir 'scripts') | Out-Null
 foreach ($name in $scriptNames) { Copy-Item -LiteralPath (Join-Path $repoRoot "src-tauri\scripts\$name") -Destination (Join-Path $portableAppDir "scripts\$name") }
+foreach ($name in @('compact_schema.sql','compact_indexes.sql')) { Copy-Item -LiteralPath (Join-Path $repoRoot "src-tauri\src\library\$name") -Destination (Join-Path $portableAppDir "scripts\$name") }
 Set-Content -LiteralPath (Join-Path $portableAppDir 'illutag.portable.json') -Value '{"dataDir":"data"}' -Encoding utf8NoBOM
 $records = foreach ($relative in $required | Where-Object { !$_.StartsWith('runtime\') }) {
   $file = Get-Item -LiteralPath (Join-Path $portableAppDir $relative)
   @{path=$relative.Replace('\','/');bytes=$file.Length;sha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
 }
 @{appVersion=$version;chineseClip='onnx_v1';wdTagger='wd-swinv2-tagger-v3';files=@($records)} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $portableAppDir 'model-manifest.json') -Encoding utf8NoBOM
-$releaseRecords = foreach ($relative in @('illutag.exe','illutag.portable.json','model-manifest.json','LICENSE-Lucide.txt') + ($scriptNames | ForEach-Object {"scripts\$_"})) {
+$releaseRecords = foreach ($relative in @('illutag.exe','illutag.portable.json','model-manifest.json','LICENSE-Lucide.txt') + (($scriptNames + @('compact_schema.sql','compact_indexes.sql')) | ForEach-Object {"scripts\$_"})) {
   $file = Get-Item -LiteralPath (Join-Path $portableAppDir $relative)
   @{path=$relative.Replace('\','/');bytes=$file.Length;sha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
 }
-@{version=$version;schemaVersion=2;sourceCommit=(& git -C $repoRoot rev-parse HEAD);files=@($releaseRecords)} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $portableAppDir 'release-manifest.json') -Encoding utf8NoBOM
+@{version=$version;schemaVersion=3;sourceCommit=(& git -C $repoRoot rev-parse HEAD);files=@($releaseRecords)} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $portableAppDir 'release-manifest.json') -Encoding utf8NoBOM
 @"
 illuTag $version portable
 Keep all folders together. Start illutag.exe; data is stored in the sibling data directory.
 This package contains no user database or source images. Restore a complete backup into an independent directory for evaluation.
 Complete backups exclude external source originals. Models are supplied in this program package.
-Schema 2 databases must never be opened with the old executable. Roll back the executable, scripts, configuration and schema 1 database as one saved set.
+Schema 3 databases must never be opened with the old executable. Roll back the executable, scripts, configuration and matching original database as one saved set.
 "@ | Set-Content -LiteralPath (Join-Path $portableAppDir 'README-portable.txt') -Encoding utf8NoBOM
 if (!$SkipZip) {
   Add-Type -AssemblyName System.IO.Compression.FileSystem
