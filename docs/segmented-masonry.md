@@ -1,15 +1,39 @@
-# Continuous Masonry Layout
+# 当前瀑布流布局
 
-This gallery mode keeps browsing compact by always appending the next image to the current
-shortest column.
+本文件保留旧名称以兼容历史链接。illuTag 1.2.0 的实际实现是
+`src/features/gallery/masonry.ts` 与 `GalleryWall.vue`，不再使用旧
+`SegmentedMasonry` 组件。
 
-The input image list should already be sorted by the active gallery order, usually `imported_at desc`.
+## 几何与分页
 
-1. Keep one running height for each visible column.
-2. For each image in sorted order, place it into the currently shortest column.
-3. Increase that column height by the rendered image height plus the gap.
+输入数组保持当前查询的排序。每张图片放入当前最短列；高度完全依据真实宽高比，
+不裁剪、没有高度上限。尺寸未知时暂用正方形占位。
 
-This keeps the masonry surface continuous. Images stay in the source order for placement decisions,
-but later images can appear higher than earlier images when they fit into a shorter column.
+默认目标列宽为 224 CSS px，间距为 16px：
 
-The layout result is derived from image dimensions and viewport settings. It should be cached by query, sort, viewport width, column width, gap, and height clamp settings, but it should not be stored as permanent image metadata.
+```text
+列数 = max(1, floor((可用宽度 + 间距) / (224 + 间距)))
+实际列宽 = (可用宽度 - 间距 × (列数 - 1)) / 列数
+图片高度 = 实际列宽 × 原图高度 / 原图宽度
+```
+
+可用宽度由内容容器测量并扣除左右 padding，与显示器物理分辨率无关。
+短列策略决定放置顺序；各列图片的视觉纵向顺序不等于逐行排序。
+
+宽度不变、已加载列表的 ID/宽高前缀不变时，仅计算追加页的几何；列表前缀或宽度
+变化时重建布局。缩略图地址可以单独更新，不改变几何。布局仅存在于前端内存，
+不写入图片元数据。更新时仍检查列表前缀并刷新地址，不应声称所有更新都只访问
+新增项目。
+
+## 虚拟化与交互
+
+每列按纵坐标保存项目。滚动时，对各列二分查找第一个相交项目，再收集可见区间，
+避免扫描全部布局。预渲染缓冲为 `max(480px, 视口高度 × 0.8)`；距离布局末尾
+1200px 以内时请求下一页。
+
+查询状态和分页防过期响应由 `useGallery.ts` / `queryState.ts` 管理。浏览位置由
+图墙按 scope/folder 保存，大图查看器独立显示，关闭不会销毁图墙。选择、收藏和
+拖拽使用原图片 ID，不能用可见数组下标代替。
+
+关键布局与状态测试在 `src/features/gallery/state.test.ts`，开发命令和隔离要求见
+[维护指南](maintenance.md)。
