@@ -277,9 +277,13 @@ pub fn mutate_images(request: ImageMutation, state: &AppState) -> Result<Mutatio
     }
     let _write = state.write_lock.lock().map_err(|e| e.to_string())?;
     let mut conn = open_database(&state.database_path)?;
+    let image_ids = normalize_batch_image_ids(request.image_ids);
+    if ["trash", "restore", "systemTrash"].contains(&request.action.as_str()) {
+        crate::duplicates::management::revoke_for_ids(&image_ids, state)?;
+    }
     let mut successful_ids = Vec::new();
     let mut failures = Vec::new();
-    for image_id in normalize_batch_image_ids(request.image_ids) {
+    for image_id in image_ids {
         let result = (|| -> Result<(), String> {
             let image = load_image_record(&conn, &image_id)?;
             if request.action == "systemTrash" {

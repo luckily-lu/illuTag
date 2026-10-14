@@ -2,6 +2,7 @@
 pub mod cache;
 pub mod fingerprint;
 pub mod index;
+pub mod management;
 
 use crate::library::GalleryImage;
 use serde::{Deserialize, Serialize};
@@ -80,6 +81,8 @@ pub struct DuplicateGroup {
     pub total_members: i64,
     pub members: Vec<DuplicateMember>,
     pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub needs_review: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -117,6 +120,107 @@ pub struct DuplicateMemberPage {
     pub members: Vec<DuplicateMember>,
     pub next_cursor: Option<String>,
     pub total_members: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateManagementRequest {
+    pub generation: String,
+    pub group_id: String,
+    pub mode: String,
+    pub keep_ids: Vec<String>,
+    #[serde(default)]
+    pub protected_ids: Vec<String>,
+    #[serde(default)]
+    pub image_ids: Vec<String>,
+    pub action: String,
+    #[serde(default)]
+    pub source_operation_id: Option<String>,
+}
+#[derive(Debug, Default, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateMetadataSummary {
+    pub favorite_count: i64,
+    pub classified_count: i64,
+    pub custom_tagged_count: i64,
+    pub supplement_tagged_count: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateActionPreview {
+    pub operation_id: String,
+    pub generation: String,
+    pub group_id: String,
+    pub action: String,
+    pub target_count: i64,
+    pub total_bytes: i64,
+    pub protected_count: i64,
+    pub skipped_count: i64,
+    pub metadata: DuplicateMetadataSummary,
+    pub sample: Vec<DuplicateMember>,
+    pub warnings: Vec<String>,
+    pub expires_at: i64,
+    pub requires_system_confirmation: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateApplyRequest {
+    pub operation_id: String,
+    pub confirmed: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateOperationStatus {
+    pub operation_id: String,
+    pub generation: String,
+    pub group_id: String,
+    pub action: String,
+    pub state: String,
+    pub processed: i64,
+    pub total: i64,
+    pub succeeded: i64,
+    pub failed: i64,
+    pub skipped: i64,
+    pub undoable: bool,
+    pub affected_group_ids: Vec<String>,
+    pub affected_groups_truncated: bool,
+    pub errors: Vec<String>,
+    pub updated_at: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateOperationResult {
+    pub ordinal: i64,
+    pub image_id: Option<String>,
+    pub file_name: String,
+    pub path: Option<String>,
+    pub state: String,
+    pub code: String,
+    pub message: String,
+    pub file_moved: bool,
+    pub db_updated: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateOperationQuery {
+    pub operation_id: String,
+    pub cursor: Option<String>,
+    pub limit: i64,
+    #[serde(default)]
+    pub state: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateOperationPage {
+    pub operation_id: String,
+    pub items: Vec<DuplicateOperationResult>,
+    pub next_cursor: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateGroupQuery {
+    pub generation: String,
+    pub group_id: String,
 }
 
 pub use cache::{

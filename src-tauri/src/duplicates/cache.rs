@@ -88,7 +88,7 @@ fn now() -> i64 {
 fn hash(value: &[u8]) -> [u8; 32] {
     Sha256::digest(value).into()
 }
-fn signature(public_id: &str, file: &fingerprint::SourceSignature) -> [u8; 32] {
+pub(crate) fn signature(public_id: &str, file: &fingerprint::SourceSignature) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(hash(public_id.as_bytes()));
     digest.update(hash(file.identity.as_bytes()));
@@ -96,12 +96,12 @@ fn signature(public_id: &str, file: &fingerprint::SourceSignature) -> [u8; 32] {
     digest.update(file.modified_ns.to_le_bytes());
     digest.finalize().into()
 }
-fn db_binding(state: &AppState) -> Result<String, String> {
+pub(crate) fn db_binding(state: &AppState) -> Result<String, String> {
     let info = fingerprint::source_signature(&state.database_path)?;
     let canonical = fs::canonicalize(&state.database_path).map_err(|e| e.to_string())?;
     Ok(format!("{}|{}", canonical.to_string_lossy(), info.identity))
 }
-fn library(state: &AppState) -> Result<Connection, String> {
+pub(crate) fn library(state: &AppState) -> Result<Connection, String> {
     let conn = Connection::open_with_flags(&state.database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| format!("无法读取图库：{e}"))?;
     conn.busy_timeout(Duration::from_secs(2))
@@ -152,7 +152,7 @@ fn validate(conn: &Connection, state: &AppState) -> Result<(), String> {
     }
     Ok(())
 }
-fn open_existing(state: &AppState, writable: bool) -> Result<Connection, String> {
+pub(crate) fn open_existing(state: &AppState, writable: bool) -> Result<Connection, String> {
     let flags = if writable {
         OpenFlags::SQLITE_OPEN_READ_WRITE
     } else {
@@ -312,9 +312,13 @@ pub fn clear_cache(state: &AppState) -> Result<(), String> {
     }
     let _write = state.write_lock.lock().map_err(|e| e.to_string())?;
     let rt = runtime(state);
+    if crate::duplicates::management::is_running(state) {
+        return Err("整理任务运行中，不能清理指纹缓存".into());
+    }
     if rt.active.load(Ordering::SeqCst)
         || state.jobs.list()?.iter().any(|job| {
-            job.request.kind == "duplicates"
+            ["duplicates", "duplicateManagement", "duplicateUndo"]
+                .contains(&job.request.kind.as_str())
                 && ["queued", "running", "paused", "cancelling"].contains(&job.state.as_str())
         })
     {
@@ -1193,36 +1197,11 @@ fn resolve(
         stale,
     }))
 }
-fn members_slice(
-    conn: &Connection,
-    db: &Connection,
-    state: &AppState,
-    generation: i64,
-    group: i64,
-    start: i64,
-    limit: i64,
-) -> Result<Vec<DuplicateMember>, String> {
-    let mut stmt=conn.prepare(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE generation=?1 AND group_no=?2 AND member_no>=?3 ORDER BY member_no LIMIT ?4")).map_err(|e|e.to_string())?;
-    let stored = stmt
-        .query_map(params![generation, group, start, limit], member_row)
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    let mut members = Vec::with_capacity(stored.len());
-    for item in stored {
-        if let Some(item) = resolve(item, db, state)? {
-            members.push(item);
-        }
-    }
-    Ok(members)
-}
-
 pub fn query_groups(query: DuplicateQuery, state: &AppState) -> Result<DuplicateGroupPage, String> {
     let conn = open_existing(state, false)?;
     conn.execute_batch("BEGIN DEFERRED;")
         .map_err(|e| e.to_string())?;
     let generation = published(&conn, &query.generation)?;
-    let db = library(state)?;
     let kind = match query.kind.as_str() {
         "all" | "" => -1,
         "exact" => 0,
@@ -1263,27 +1242,16 @@ pub fn query_groups(query: DuplicateQuery, state: &AppState) -> Result<Duplicate
         None
     };
     let mut groups = Vec::with_capacity(rows.len());
-    for (group, kind, reference_pk, total_members) in rows {
-        let reference=conn.query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE generation=?1 AND group_no=?2 AND image_pk=?3 LIMIT 1"),params![generation,group,reference_pk],member_row).optional().map_err(|e|e.to_string())?;
-        let Some(reference) = reference else {
-            return Err("查重分组缓存损坏，请清理后重新检索".into());
-        };
-        let Some(reference) = resolve(reference, &db, state)? else {
-            continue;
-        };
-        let members = members_slice(&conn, &db, state, generation, group, 0, 6)?;
-        groups.push(DuplicateGroup {
-            id: group.to_string(),
-            kind: if kind == 0 { "exact" } else { "near" }.into(),
-            reference,
-            total_members,
-            members,
-            next_cursor: if total_members > 6 {
-                Some(format!("m:{}:{group}:6", query.generation))
-            } else {
-                None
+    for (group, _, _, _) in rows {
+        if let Some(local) = query_group(
+            DuplicateGroupQuery {
+                generation: query.generation.clone(),
+                group_id: group.to_string(),
             },
-        });
+            state,
+        )? {
+            groups.push(local);
+        }
     }
     Ok(DuplicateGroupPage {
         generation: query.generation,
@@ -1291,6 +1259,229 @@ pub fn query_groups(query: DuplicateQuery, state: &AppState) -> Result<Duplicate
         next_cursor,
         total_groups: total,
     })
+}
+
+fn attach_live(conn: &Connection, state: &AppState) -> Result<(), String> {
+    // Only an existing, identity-validated main file is attached. query_only
+    // remains ON for this connection and neither database can be mutated.
+    conn.execute(
+        "ATTACH DATABASE ?1 AS live",
+        [state.database_path.to_string_lossy().as_ref()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+fn live_members(
+    conn: &Connection,
+    gen: i64,
+    group: i64,
+    start: i64,
+    limit: i64,
+) -> Result<Vec<(i64, StoredMember)>, String> {
+    let sql="SELECT m.image_pk,m.public_hash,m.signature,m.phash_distance,m.dhash_distance,m.color_distance,m.member_no FROM members m JOIN live.images i ON i.image_pk=m.image_pk WHERE m.generation=?1 AND m.group_no=?2 AND m.member_no>=?3 AND COALESCE(i.trashed,0)=0 AND COALESCE(i.source,'')<>'reference' ORDER BY m.member_no LIMIT ?4";
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let result = stmt
+        .query_map(params![gen, group, start, limit], |row| {
+            Ok((row.get(6)?, member_row(row)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(result)
+}
+fn local_metric(
+    conn: &Connection,
+    reference: i64,
+    member: i64,
+    threshold: index::Threshold,
+) -> Result<Option<DuplicateMetric>, String> {
+    let Some(a) = get_fingerprint(conn, reference)? else {
+        return Ok(None);
+    };
+    let Some(b) = get_fingerprint(conn, member)? else {
+        return Ok(None);
+    };
+    let metric = a
+        .near
+        .zip(b.near)
+        .and_then(|(a, b)| index::compare_near(&a, &b, threshold))
+        .map(|m| DuplicateMetric {
+            phash_distance: Some(m.phash_distance),
+            dhash_distance: Some(m.dhash_distance),
+            color_distance: Some(m.color_distance as f64),
+        });
+    Ok(metric)
+}
+pub fn query_group(
+    query: DuplicateGroupQuery,
+    state: &AppState,
+) -> Result<Option<DuplicateGroup>, String> {
+    let conn = open_existing(state, false)?;
+    let gen = published(&conn, &query.generation)?;
+    let group = group_number(&query.group_id)?;
+    attach_live(&conn, state)?;
+    let info: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT kind,reference_pk FROM groups WHERE generation=?1 AND group_no=?2",
+            params![gen, group],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((kind, original_ref)) = info else {
+        return Ok(None);
+    };
+    let total:i64=conn.query_row("SELECT COUNT(*) FROM members m JOIN live.images i ON i.image_pk=m.image_pk WHERE m.generation=?1 AND m.group_no=?2 AND COALESCE(i.trashed,0)=0 AND COALESCE(i.source,'')<>'reference'",params![gen,group],|r|r.get(0)).map_err(|e|e.to_string())?;
+    if total < 2 {
+        return Ok(None);
+    }
+    let db = library(state)?;
+    let sensitivity: String = conn
+        .query_row(
+            "SELECT sensitivity FROM generations WHERE generation=?1",
+            [gen],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let threshold = match sensitivity.as_str() {
+        "strict" => index::Threshold::Strict,
+        "loose" => index::Threshold::Loose,
+        _ => index::Threshold::Standard,
+    };
+    let mut rows = live_members(&conn, gen, group, 0, 7)?;
+    let reference_row=conn.query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE generation=?1 AND group_no=?2 AND image_pk=?3 LIMIT 1"),params![gen,group,original_ref],member_row).optional().map_err(|e|e.to_string())?;
+    let mut reference = match reference_row {
+        Some(row) => resolve(row, &db, state)?,
+        None => None,
+    };
+    let changed = reference.is_none();
+    if reference.is_none() {
+        for (_, row) in &rows {
+            if let Some(member) = resolve(row.clone(), &db, state)? {
+                reference = Some(member);
+                break;
+            }
+        }
+    }
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    let reference_pk: i64 = db
+        .query_row(
+            "SELECT image_pk FROM images WHERE id=?1",
+            [&reference.image.id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut review = kind == 1 && changed;
+    if let Some(flag) = meta(&conn, &format!("review:{gen}:{group}"))? {
+        review |= flag == "1";
+    }
+    let more = rows.len() > 6;
+    rows.truncate(6);
+    let next = if more {
+        rows.last()
+            .map(|(n, _)| format!("m:{}:{}:{}", query.generation, query.group_id, n + 1))
+    } else {
+        None
+    };
+    let mut members = Vec::new();
+    for (_, stored) in rows {
+        let pk = stored.image_pk;
+        if let Some(mut member) = resolve(stored, &db, state)? {
+            if kind == 1 && review && pk != reference_pk {
+                member.metric =
+                    local_metric(&conn, reference_pk, pk, threshold)?.unwrap_or_default();
+            }
+            members.push(member);
+        }
+    }
+    Ok(Some(DuplicateGroup {
+        id: query.group_id,
+        kind: if kind == 0 { "exact" } else { "near" }.into(),
+        reference,
+        total_members: total,
+        members,
+        next_cursor: next,
+        needs_review: review,
+    }))
+}
+pub(crate) fn review_affected(
+    generation: &str,
+    pks: &[i64],
+    keep_ids: &[String],
+    state: &AppState,
+) -> Result<(Vec<String>, bool), String> {
+    if !cache_path(state).exists() {
+        return Ok((vec![], true));
+    }
+    let conn = open_existing(state, true)?;
+    let gen = match published(&conn, generation) {
+        Ok(value) => value,
+        Err(_) => return Ok((vec![], true)),
+    };
+    let db = library(state)?;
+    let mut affected = std::collections::BTreeSet::new();
+    let mut truncated = false;
+    for pk in pks {
+        let mut stmt = conn
+            .prepare("SELECT group_no FROM members WHERE generation=?1 AND image_pk=?2 LIMIT 102")
+            .map_err(|e| e.to_string())?;
+        for group in stmt
+            .query_map(params![gen, pk], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?
+        {
+            affected.insert(group.map_err(|e| e.to_string())?);
+            if affected.len() > 100 {
+                truncated = true;
+                break;
+            }
+        }
+        if truncated {
+            break;
+        }
+    }
+    for group in affected.iter().take(100) {
+        let original: i64 = conn
+            .query_row(
+                "SELECT reference_pk FROM groups WHERE generation=?1 AND group_no=?2",
+                params![gen, group],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let mut preferred = None;
+        for id in keep_ids {
+            let pk: Option<i64> = db
+                .query_row(
+                    "SELECT image_pk FROM images WHERE id=?1 AND trashed=0",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if let Some(pk) = pk {
+                let exists:i64=conn.query_row("SELECT COUNT(*) FROM members WHERE generation=?1 AND group_no=?2 AND image_pk=?3",params![gen,group,pk],|r|r.get(0)).map_err(|e|e.to_string())?;
+                if exists > 0 {
+                    preferred = Some(pk);
+                    break;
+                }
+            }
+        }
+        if let Some(pk) = preferred {
+            if pk != original {
+                conn.execute(
+                    "UPDATE groups SET reference_pk=?3 WHERE generation=?1 AND group_no=?2",
+                    params![gen, group, pk],
+                )
+                .map_err(|e| e.to_string())?;
+                set_meta(&conn, &format!("review:{gen}:{group}"), "1")?;
+            }
+        }
+    }
+    Ok((
+        affected.iter().take(100).map(|g| g.to_string()).collect(),
+        truncated,
+    ))
 }
 
 pub fn query_members(
@@ -1302,26 +1493,75 @@ pub fn query_members(
         .map_err(|e| e.to_string())?;
     let generation = published(&conn, &query.generation)?;
     let group = group_number(&query.group_id)?;
-    let total: i64 = conn
+    let original_reference: i64 = conn
         .query_row(
-            "SELECT total_members FROM groups WHERE generation=?1 AND group_no=?2",
+            "SELECT reference_pk FROM groups WHERE generation=?1 AND group_no=?2",
             params![generation, group],
             |r| r.get(0),
         )
         .optional()
         .map_err(|e| e.to_string())?
         .ok_or("重复分组已失效，请刷新")?;
+    attach_live(&conn, state)?;
+    let total:i64=conn.query_row("SELECT COUNT(*) FROM members m JOIN live.images i ON i.image_pk=m.image_pk WHERE m.generation=?1 AND m.group_no=?2 AND COALESCE(i.trashed,0)=0 AND COALESCE(i.source,'')<>'reference'",params![generation,group],|r|r.get(0)).map_err(|e|e.to_string())?;
     let start = member_cursor(&query.cursor, &query.generation, &query.group_id)?;
     let limit = page_limit(query.limit, 50, 200);
     let db = library(state)?;
-    let members = members_slice(&conn, &db, state, generation, group, start, limit)?;
-    let next = start.saturating_add(limit);
+    let local = query_group(
+        DuplicateGroupQuery {
+            generation: query.generation.clone(),
+            group_id: query.group_id.clone(),
+        },
+        state,
+    )?;
+    let reference = local.as_ref().map(|g| g.reference.image.id.clone());
+    let reference_pk = match reference {
+        Some(id) => db
+            .query_row("SELECT image_pk FROM images WHERE id=?1", [id], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map_err(|e| e.to_string())?,
+        None => original_reference,
+    };
+    let sensitivity: String = conn
+        .query_row(
+            "SELECT sensitivity FROM generations WHERE generation=?1",
+            [generation],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let threshold = match sensitivity.as_str() {
+        "strict" => index::Threshold::Strict,
+        "loose" => index::Threshold::Loose,
+        _ => index::Threshold::Standard,
+    };
+    let mut rows = live_members(&conn, generation, group, start, limit + 1)?;
+    let more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    let next = rows.last().map(|(n, _)| n + 1);
+    let mut members = Vec::new();
+    for (_, stored) in rows {
+        let pk = stored.image_pk;
+        if let Some(mut member) = resolve(stored, &db, state)? {
+            if local
+                .as_ref()
+                .is_some_and(|g| g.kind == "near" && g.needs_review)
+            {
+                member.metric = if pk == reference_pk {
+                    DuplicateMetric::default()
+                } else {
+                    local_metric(&conn, reference_pk, pk, threshold)?.unwrap_or_default()
+                };
+            }
+            members.push(member);
+        }
+    }
     Ok(DuplicateMemberPage {
         generation: query.generation.clone(),
         group_id: query.group_id.clone(),
         members,
-        next_cursor: if next < total {
-            Some(format!("m:{}:{}:{next}", query.generation, query.group_id))
+        next_cursor: if more {
+            next.map(|next| format!("m:{}:{}:{next}", query.generation, query.group_id))
         } else {
             None
         },

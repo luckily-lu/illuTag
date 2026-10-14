@@ -11,13 +11,13 @@ use std::{
 };
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-struct Fixture {
-    root: PathBuf,
-    state: AppState,
-    paths: Vec<PathBuf>,
+pub(super) struct Fixture {
+    pub(super) root: PathBuf,
+    pub(super) state: AppState,
+    pub(super) paths: Vec<PathBuf>,
 }
 impl Fixture {
-    fn new(count: usize) -> Self {
+    pub(super) fn new(count: usize) -> Self {
         let base = std::env::var_os("ILLUTAG_TEST_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
@@ -68,7 +68,7 @@ impl Fixture {
         state.read_only = false;
         Self { root, state, paths }
     }
-    fn run(&self) -> Result<(), String> {
+    pub(super) fn run(&self) -> Result<(), String> {
         run_job(options(), &self.state, &mut || Ok(()), &mut |_, _| {})
     }
     fn cache(&self) -> PathBuf {

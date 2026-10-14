@@ -4,7 +4,7 @@ import type { DuplicateOptions } from "../../shared/contracts/DuplicateOptions";
 defineProps<{ rows: JobRecord[]; error: string; thumbnails: boolean }>();
 const emit = defineEmits<{
   start: [kind: string, duplicateOptions?: DuplicateOptions | null];
-  duplicates: [];
+  duplicates: [operationId?: string | null];
   control: [id: string, action: string];
 }>();
 const names: Record<string, string> = {
@@ -16,6 +16,8 @@ const names: Record<string, string> = {
   cleanup: "清理缺失索引",
   rules: "重新应用分类规则",
   duplicates: "重复与近似图片检索",
+  duplicateManagement: "处理重复图片",
+  duplicateUndo: "撤销重复图片软回收",
 };
 const states: Record<string, string> = {
   queued: "排队中",
@@ -93,6 +95,7 @@ const states: Record<string, string> = {
             取消</button
           ><button
             v-if="
+              !['duplicateManagement', 'duplicateUndo'].includes(job.request.kind) &&
               ['interrupted', 'partial', 'cancelled', 'failed'].includes(
                 job.state,
               )
@@ -103,6 +106,9 @@ const states: Record<string, string> = {
             "
           >
             重新运行
+          </button>
+          <button v-if="['duplicateManagement', 'duplicateUndo'].includes(job.request.kind)" class="soft-button compact" @click="emit('duplicates', job.request.duplicateOperationId)">
+            查看处理结果
           </button>
         </div>
       </div>

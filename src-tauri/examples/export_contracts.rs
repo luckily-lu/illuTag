@@ -26,4 +26,11 @@ fn main() {
     DuplicateGroupPage::export_all(&config).unwrap();
     DuplicateMemberQuery::export_all(&config).unwrap();
     DuplicateMemberPage::export_all(&config).unwrap();
+    DuplicateManagementRequest::export_all(&config).unwrap();
+    DuplicateActionPreview::export_all(&config).unwrap();
+    DuplicateApplyRequest::export_all(&config).unwrap();
+    DuplicateOperationStatus::export_all(&config).unwrap();
+    DuplicateOperationQuery::export_all(&config).unwrap();
+    DuplicateOperationPage::export_all(&config).unwrap();
+    DuplicateGroupQuery::export_all(&config).unwrap();
 }

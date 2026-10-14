@@ -1,11 +1,13 @@
-# illuTag 1.3.0 维护指南
+# illuTag 1.4.0 维护指南
 
 当前版本使用 Vue 3、TypeScript、Tauri 2、Rust、SQLite schema 3 与 Python ONNX。
 界面为浅色无框画廊。源码、正式程序/数据、测试工作区应使用不同目录。
 
-1.3.0 增加独立的[重复与近似图片检索](duplicate-search.md)，只检索和比对，不删除或合并图片。
+1.3.0 增加独立的[重复与近似图片检索](duplicate-search.md)，1.4.0 加入组内保留、选择、连续比对和明确执行的回收操作。
 任务由用户手动启动，不加入“一键处理”；主库仍为 schema 3，无本次数据库升级。
 查重数据属于 `cache/duplicates.sqlite` 派生缓存，可单独清理，不进入完整备份或数据目录迁移包。
+1.4.0 的批次操作与撤销记录保存在 `operations/duplicate-management.sqlite`，独立于指纹缓存，预算为 32 MiB。
+记录绑定原主库身份，恢复或替换图库后不能沿用旧撤销；清理记录需要明确确认，不能与活动整理任务同时执行。
 
 ## 开发与验证入口
 
@@ -75,6 +77,9 @@ npm run tauri dev
   候选程序和全新测试根目录。它生成少量抽象素材，使用真实 IPC 和 WebView2 检查查重任务、分页、比对、
   暂停／取消、重启及缓存清理；正常关闭本次启动的进程，截图与小型 JSON 记录写入测试根目录的 `logs`。
   不要把正式数据库或生产素材放入该脚本的测试根目录。
+- `scripts/refactor/duplicate-management-native-qa.mjs` 使用相同的 `EXE ROOT RESOURCE_ROOT` 参数与隔离约束，
+  生成少量抽象副本，验证完整组管理、跨组保留、应用回收与撤销、源文件变更和系统回收的明确确认。
+  系统回收测试只处理新生成的小文件；不能改成真实图库或将生产原图复制进去作为删除样例。
 - `scripts/refactor/storage-native-benchmark.mjs` 只接受
   `D:\Ai\illuTag-storage-work\` 内的新测试工作目录。参数顺序为
   `EXE DATABASE WORKSPACE RESOURCE_ROOT [benchmark|smoke]`，均为绝对路径。
@@ -113,6 +118,17 @@ npm run tauri dev
 
 发布前在独立目录验收程序与资源的整套组合。打包不是生产部署，不覆盖正在使用
 的数据目录。升级数据库的步骤见 [Schema 3 存储维护](storage-schema3.md)。
+
+## 1.4.0 验证范围
+
+2026-10-15 前端类型检查、构建及 23 项 Vitest 测试通过；Rust release 检查、4 项管理专项测试、
+DTO 契约导出和正式 custom-protocol release EXE 构建通过。本轮只运行改动相关检查，未重复全库性能实测。
+
+真实 Tauri／WebView2 管理验收通过 9 项检查，使用 20 张合成图片，共 32,585 字节，数据库和 WebView
+均位于隔离目录。覆盖未展开成员、保留项变化拦截、全库完全相同组一键整理、跨组保护、局部分组复核、
+近似候选逐项处理、普通回收后的撤销归属、系统回收站明确第二步，以及清指纹缓存后保留管理记录。
+真实多图审核页在 500／1280 CSS px 宽度无横向溢出，K／方向键／Delete／Enter 只回收人工选择的候选。
+正常退出测试进程；未在生产图库执行回收、重新建索引或复制全库。
 
 ## 1.3.0 验证范围
 

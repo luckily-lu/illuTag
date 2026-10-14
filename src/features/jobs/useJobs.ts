@@ -26,6 +26,7 @@ export function useJobs(
     thumbnails = true,
     sourceFolderId: number | null = null,
     duplicateOptions: DuplicateOptions | null = null,
+    duplicateOperationId: string | null = null,
   ) {
     try {
       error.value = "";
@@ -34,6 +35,7 @@ export function useJobs(
         thumbnails,
         sourceFolderId,
         duplicateOptions,
+        duplicateOperationId,
       });
       await refresh();
       return true;

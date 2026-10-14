@@ -14,6 +14,8 @@ pub struct JobRequest {
     pub source_folder_id: Option<i64>,
     #[serde(default)]
     pub duplicate_options: Option<crate::duplicates::DuplicateOptions>,
+    #[serde(default)]
+    pub duplicate_operation_id: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -125,20 +127,43 @@ pub fn start_job(
         "cleanup",
         "rules",
         "duplicates",
+        "duplicateManagement",
+        "duplicateUndo",
     ]
     .contains(&request.kind.as_str())
     {
         return Err("不支持的任务类型".into());
     }
     if request.kind == "duplicates" {
-        let options = request.duplicate_options.clone().unwrap_or(crate::duplicates::DuplicateOptions {
-            sensitivity: "standard".into(), force_recompute: false, regroup_only: false,
-        });
+        let options =
+            request
+                .duplicate_options
+                .clone()
+                .unwrap_or(crate::duplicates::DuplicateOptions {
+                    sensitivity: "standard".into(),
+                    force_recompute: false,
+                    regroup_only: false,
+                });
         if !["strict", "standard", "loose"].contains(&options.sensitivity.as_str()) {
             return Err("不支持的近似检索档位".into());
         }
-        if state.jobs.list()?.iter().any(|r| r.request.kind == "duplicates" && ["queued", "running", "paused", "cancelling"].contains(&r.state.as_str())) {
+        if state.jobs.list()?.iter().any(|r| {
+            r.request.kind == "duplicates"
+                && ["queued", "running", "paused", "cancelling"].contains(&r.state.as_str())
+        }) {
             return Err("已有重复检索任务，请等待或取消当前任务".into());
+        }
+    }
+    if ["duplicateManagement", "duplicateUndo"].contains(&request.kind.as_str()) {
+        let operation = request
+            .duplicate_operation_id
+            .as_ref()
+            .ok_or("整理批次编号缺失")?;
+        if state.jobs.list()?.iter().any(|r| {
+            r.request.duplicate_operation_id.as_ref() == Some(operation)
+                && ["queued", "running", "paused", "cancelling"].contains(&r.state.as_str())
+        }) {
+            return Err("该整理批次已经提交，不能重复应用".into());
         }
     }
     let mut queue = state.jobs.queue.lock().map_err(|e| e.to_string())?;
@@ -240,8 +265,13 @@ fn dispatch(state: AppState, app: AppHandle) {
             }
             .into()
         });
-        if record.request.kind == "duplicates" {
+        if ["duplicates", "duplicateManagement", "duplicateUndo"]
+            .contains(&record.request.kind.as_str())
+        {
             let _ = app.emit("duplicates:changed", ());
+            if record.request.kind != "duplicates" {
+                let _ = app.emit("library:changed", ());
+            }
         } else {
             if let Ok(mut revision) = state.startup_cleanup_generation.lock() {
                 *revision += 1;
@@ -261,6 +291,9 @@ fn is_cancelled(state: &AppState, id: &str) -> bool {
 fn run_stage(stage: &str, id: &str, state: &AppState, app: &AppHandle) -> Result<(), String> {
     if stage == "duplicates" {
         return run_duplicates(id, state, app);
+    }
+    if ["duplicateManagement", "duplicateUndo"].contains(&stage) {
+        return run_duplicate_management(id, state, app);
     }
     if stage == "rules" {
         return run_rules(id, state, app);
@@ -399,8 +432,14 @@ pub fn control_job(
     if !pause && !resume && action != "cancel" {
         return Err("不支持的控制操作".into());
     }
-    match if record.request.kind == "duplicates" { "duplicates" } else { record.stage.as_str() } {
-        "rules" | "duplicates" => {}
+    match if ["duplicates", "duplicateManagement", "duplicateUndo"]
+        .contains(&record.request.kind.as_str())
+    {
+        record.request.kind.as_str()
+    } else {
+        record.stage.as_str()
+    } {
+        "rules" | "duplicates" | "duplicateManagement" | "duplicateUndo" => {}
         "scan" | "tagging" => {
             if pause {
                 pause_background_scan(state)?;
@@ -474,17 +513,37 @@ fn run_rules(id: &str, state: &AppState, app: &AppHandle) -> Result<(), String> 
 }
 
 fn run_duplicates(id: &str, state: &AppState, app: &AppHandle) -> Result<(), String> {
-    let request = state.jobs.list()?.into_iter().find(|r| r.id == id).ok_or("任务不存在")?.request;
-    let options = request.duplicate_options.unwrap_or(crate::duplicates::DuplicateOptions {
-        sensitivity: "standard".into(), force_recompute: false, regroup_only: false,
-    });
+    let request = state
+        .jobs
+        .list()?
+        .into_iter()
+        .find(|r| r.id == id)
+        .ok_or("任务不存在")?
+        .request;
+    let options = request
+        .duplicate_options
+        .unwrap_or(crate::duplicates::DuplicateOptions {
+            sensitivity: "standard".into(),
+            force_recompute: false,
+            regroup_only: false,
+        });
     let mut checkpoint = || -> Result<(), String> {
         loop {
-            let current = state.jobs.list()?.into_iter().find(|r| r.id == id).ok_or("任务不存在")?;
+            let current = state
+                .jobs
+                .list()?
+                .into_iter()
+                .find(|r| r.id == id)
+                .ok_or("任务不存在")?;
             if ["cancelled", "cancelling"].contains(&current.state.as_str()) {
                 return Err("任务已取消".into());
             }
-            if current.state != "paused" && state.foreground_queries.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            if current.state != "paused"
+                && state
+                    .foreground_queries
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    == 0
+            {
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(50));
@@ -493,28 +552,92 @@ fn run_duplicates(id: &str, state: &AppState, app: &AppHandle) -> Result<(), Str
     let mut last_emit = std::time::Instant::now() - Duration::from_millis(200);
     let mut last_stage = String::new();
     let mut progress = |stage: &str, coverage: &crate::duplicates::DuplicateCoverage| {
-        if last_emit.elapsed() < Duration::from_millis(200) && stage == last_stage { return; }
+        if last_emit.elapsed() < Duration::from_millis(200) && stage == last_stage {
+            return;
+        }
         last_emit = std::time::Instant::now();
         last_stage = stage.into();
         let update = (|| -> Result<(), String> {
             let (record, save) = {
                 let mut records = state.jobs.records.lock().map_err(|e| e.to_string())?;
-                let record = records.iter_mut().find(|r| r.id == id).ok_or("任务不存在")?;
+                let record = records
+                    .iter_mut()
+                    .find(|r| r.id == id)
+                    .ok_or("任务不存在")?;
                 record.stage = stage.into();
                 record.processed = coverage.processed;
                 record.total = coverage.total;
                 record.failures = coverage.failed + coverage.too_dense;
                 let now = timestamp();
                 let save = now - record.updated_at >= 1000;
-                if save { record.updated_at = now; }
+                if save {
+                    record.updated_at = now;
+                }
                 (record.clone(), save)
             };
-            if save { persist(&record, state)?; }
+            if save {
+                persist(&record, state)?;
+            }
             let _ = app.emit("jobs:changed", record);
             Ok(())
         })();
-        if let Err(error) = update { eprintln!("[duplicates-progress] {error}"); }
+        if let Err(error) = update {
+            eprintln!("[duplicates-progress] {error}");
+        }
     };
     let result = crate::duplicates::run_job(options, state, &mut checkpoint, &mut progress);
-    if is_cancelled(state, id) { Ok(()) } else { result }
+    if is_cancelled(state, id) {
+        Ok(())
+    } else {
+        result
+    }
+}
+
+fn run_duplicate_management(id: &str, state: &AppState, app: &AppHandle) -> Result<(), String> {
+    let request = state
+        .jobs
+        .list()?
+        .into_iter()
+        .find(|r| r.id == id)
+        .ok_or("任务不存在")?
+        .request;
+    let operation = request.duplicate_operation_id.ok_or("整理批次缺失")?;
+    let mut control = || loop {
+        let record = state
+            .jobs
+            .list()?
+            .into_iter()
+            .find(|r| r.id == id)
+            .ok_or("任务不存在")?;
+        if ["cancelled", "cancelling"].contains(&record.state.as_str()) {
+            return Err("任务已取消".into());
+        }
+        if record.state != "paused" {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let mut last = std::time::Instant::now() - Duration::from_secs(1);
+    let mut progress = |status: &crate::duplicates::DuplicateOperationStatus| {
+        if last.elapsed() < Duration::from_millis(200) && status.state == "running" {
+            return;
+        }
+        last = std::time::Instant::now();
+        let _ = state.jobs.update(id, state, app, |r| {
+            r.processed = status.processed;
+            r.total = status.total;
+            r.failures = status.failed;
+            r.errors = status.errors.clone();
+            r.stage = if status.action == "restore" {
+                "还原本次软回收"
+            } else if status.action == "systemTrash" {
+                "移入系统回收站"
+            } else {
+                "整理重复图片"
+            }
+            .into();
+        });
+        let _ = app.emit("duplicate-management:changed", status);
+    };
+    crate::duplicates::management::run_operation(&operation, state, &mut control, &mut progress)
 }

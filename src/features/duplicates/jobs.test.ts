@@ -31,6 +31,7 @@ function record(state: string): JobRecord {
       kind: "duplicates",
       thumbnails: false,
       sourceFolderId: null,
+      duplicateOperationId: null,
       duplicateOptions: {
         sensitivity: "standard",
         forceRecompute: false,
@@ -98,6 +99,7 @@ describe("查重任务事件", () => {
       thumbnails: false,
       sourceFolderId: null,
       duplicateOptions: options,
+      duplicateOperationId: null,
     });
     await jobs.start("scan", true, 2);
     expect(api.startJob).toHaveBeenLastCalledWith({
@@ -105,6 +107,7 @@ describe("查重任务事件", () => {
       thumbnails: true,
       sourceFolderId: 2,
       duplicateOptions: null,
+      duplicateOperationId: null,
     });
     wrapper.unmount();
   });

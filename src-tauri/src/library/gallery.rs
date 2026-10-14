@@ -652,6 +652,7 @@ pub(super) fn remove_synced_user_folder_tree_for_root(
 }
 
 pub fn remove_image_from_index(image_id: String, state: &AppState) -> Result<LibraryStore, String> {
+    crate::duplicates::management::revoke_for_ids(std::slice::from_ref(&image_id),state)?;
     let mut library = state
         .library
         .lock()
@@ -676,6 +677,7 @@ pub fn restore_image_from_trash(
     image_id: String,
     state: &AppState,
 ) -> Result<LibraryStore, String> {
+    crate::duplicates::management::revoke_for_ids(std::slice::from_ref(&image_id),state)?;
     let mut library = state
         .library
         .lock()
@@ -756,6 +758,7 @@ pub fn move_image_to_system_trash(
     image_id: String,
     state: &AppState,
 ) -> Result<LibraryStore, String> {
+    crate::duplicates::management::revoke_for_ids(std::slice::from_ref(&image_id),state)?;
     let mut library = state
         .library
         .lock()
@@ -814,6 +817,7 @@ pub fn move_images_to_system_trash(
     image_ids: Vec<String>,
     state: &AppState,
 ) -> Result<BatchSystemTrashResult, String> {
+    crate::duplicates::management::revoke_for_ids(&image_ids,state)?;
     let image_ids = normalize_batch_image_ids(image_ids);
     if image_ids.is_empty() {
         return Ok(BatchSystemTrashResult {
@@ -1031,6 +1035,7 @@ pub fn remove_images_from_index(
     image_ids: Vec<String>,
     state: &AppState,
 ) -> Result<LibraryStore, String> {
+    crate::duplicates::management::revoke_for_ids(&image_ids,state)?;
     let image_ids = normalize_batch_image_ids(image_ids);
     if image_ids.is_empty() {
         return list_library_from_state(state);
@@ -1081,6 +1086,7 @@ pub fn restore_images_from_trash(
     image_ids: Vec<String>,
     state: &AppState,
 ) -> Result<LibraryStore, String> {
+    crate::duplicates::management::revoke_for_ids(&image_ids,state)?;
     let image_ids = normalize_batch_image_ids(image_ids);
     if image_ids.is_empty() {
         return list_library_from_state(state);

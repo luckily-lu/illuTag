@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import SoftSelect from "./shared/ui/SoftSelect.vue";
 import AppIcon from "./shared/ui/AppIcon.vue";
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { api, errorMessage, invoke } from "./shared/ipc";
 import { useGallery } from "./features/gallery/useGallery";
 import { useSelection } from "./features/gallery/useSelection";
@@ -18,6 +18,8 @@ import TagManager from "./features/tags/TagManager.vue";
 import TaskCenter from "./features/jobs/TaskCenter.vue";
 import SettingsPage from "./features/settings/SettingsPage.vue";
 import DuplicatePage from "./features/duplicates/DuplicatePage.vue";
+import { useDuplicates } from "./features/duplicates/useDuplicates";
+import { useDuplicateReview } from "./features/duplicates/useDuplicateReview";
 import SoftDialog from "./shared/ui/SoftDialog.vue";
 import type { GalleryImage } from "./shared/contracts/GalleryImage";
 import type { LibraryFolder } from "./shared/contracts/LibraryFolder";
@@ -37,6 +39,8 @@ const page = ref("gallery"),
   notice = ref(""),
   pinned = ref(false);
 const duplicateRefreshVersion = ref(0);
+const duplicates = useDuplicates(), duplicateReview = useDuplicateReview();
+watch(() => duplicates.status.value?.generation, value => duplicateReview.adopt(value ?? null));
 const jobs = useJobs(
   () => {
     duplicateRefreshVersion.value++;
@@ -44,7 +48,10 @@ const jobs = useJobs(
     if (page.value === "gallery") void gallery.search();
   },
   (job) => {
-    if (job.request.kind === "duplicates") duplicateRefreshVersion.value++;
+    if (["duplicates", "duplicateManagement", "duplicateUndo"].includes(job.request.kind)) {
+      duplicateReview.observe(job);
+      duplicateRefreshVersion.value++;
+    }
   },
 );
 const scopeName = computed(() =>
@@ -209,6 +216,10 @@ async function start(
 async function startDuplicates(options: DuplicateOptions) {
   return jobs.start("duplicates", preferences.thumbnails.value, null, options);
 }
+function openDuplicateOperation(operationId?: string | null) {
+  if (operationId) duplicateReview.activeOperationId.value = operationId;
+  page.value = "duplicates";
+}
 function tagSearch(tag: string) {
   viewer.value = null;
   page.value = "gallery";
@@ -284,6 +295,8 @@ function key(e: KeyboardEvent) {
   if (drawer.value) {
     drawer.value = false;
     e.preventDefault();
+  } else if (page.value === "duplicates") {
+    return;
   } else if (selection.active.value) {
     selection.clear();
     e.preventDefault();
@@ -311,6 +324,7 @@ onMounted(async () => {
   );
 });
 onUnmounted(() => {
+  duplicates.dispose();
   clearTimeout(dragTimer);
   window.removeEventListener("keydown", key);
   window.removeEventListener("pointermove", dragMove);
@@ -475,13 +489,19 @@ onUnmounted(() => {
             :error="jobs.error.value"
             :thumbnails="preferences.thumbnails.value"
             @start="(kind, options) => start(kind, null, options ?? null)"
-            @duplicates="page = 'duplicates'"
+            @duplicates="openDuplicateOperation"
             @control="jobs.control" /><DuplicatePage
             v-else-if="page === 'duplicates'"
             :jobs="jobs.rows.value"
             :refresh-version="duplicateRefreshVersion"
             :task-error="jobs.error.value"
             :start-job="startDuplicates"
+            :workspace="duplicates"
+            :review="duplicateReview"
+            :folders="folders.folders.value"
+            :sources="sources"
+            :control-job="jobs.control"
+            @job-created="jobs.refresh()"
             @tasks="page = 'tasks'" /><TagManager
             v-else-if="page === 'tags'"
             @search="tagSearch" /><SettingsPage

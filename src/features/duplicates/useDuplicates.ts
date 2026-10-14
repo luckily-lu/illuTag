@@ -159,6 +159,21 @@ export function useDuplicates() {
       error.value = errorMessage(e);
     }
   }
+  async function reaudit(groupIds: string[], truncated = false) {
+    const generation = status.value?.generation;
+    if (!generation) return;
+    const token = epoch;
+    const wanted = groups.value.filter(group => truncated || groupIds.includes(group.id)).map(group => group.id);
+    for (const groupId of wanted) {
+      try {
+        const group = await api.duplicateGroup({ generation, groupId });
+        if (token !== epoch || generation !== status.value?.generation) return;
+        groups.value = group
+          ? groups.value.map(old => old.id === groupId ? group : old)
+          : groups.value.filter(old => old.id !== groupId);
+      } catch (e) { if (token === epoch) error.value = errorMessage(e); }
+    }
+  }
   function dispose() {
     statusEpoch++;
     epoch++;
@@ -182,6 +197,7 @@ export function useDuplicates() {
     setKind,
     moreMembers,
     clear,
+    reaudit,
     dispose,
   };
 }

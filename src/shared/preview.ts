@@ -93,6 +93,7 @@ const duplicateFixtures: DuplicateGroup[] = Array.from(
       totalMembers: members.length,
       members,
       nextCursor: null,
+      needsReview: false,
     };
   },
 );

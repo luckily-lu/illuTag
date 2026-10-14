@@ -232,6 +232,11 @@ pub use inference::*;
 
 mod api;
 pub use api::*;
+
+pub fn recycle_duplicate_source(path:&Path)->Result<(),String>{
+    crate::runtime::check_asset_write(path)?;
+    gallery::move_file_to_system_recycle_bin(path)
+}
 pub fn job_database(state: &AppState) -> Result<Connection, String> {
     open_database(&state.database_path)
 }

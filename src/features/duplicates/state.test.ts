@@ -42,6 +42,7 @@ const group = (id: string): DuplicateGroup => ({
   totalMembers: 100,
   members: [member(id)],
   nextCursor: "6",
+  needsReview: false,
 });
 const status = (
   generation: string | null = "one",

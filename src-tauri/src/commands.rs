@@ -1211,6 +1211,43 @@ pub(super) async fn clear_duplicate_cache(app: tauri::AppHandle) -> Result<(), A
     off_main(app, |state| illutag_core::duplicates::clear_cache(&state)).await.map_err(Into::into)
 }
 
+#[tauri::command]
+pub(super) async fn query_duplicate_group(query: illutag_core::duplicates::DuplicateGroupQuery, app: tauri::AppHandle) -> Result<Option<illutag_core::duplicates::DuplicateGroup>, AppError> {
+    off_main(app, move |state| illutag_core::duplicates::cache::query_group(query, &state)).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub(super) async fn prepare_duplicate_action(request: illutag_core::duplicates::DuplicateManagementRequest, app: tauri::AppHandle) -> Result<illutag_core::duplicates::DuplicateActionPreview, AppError> {
+    off_main(app, move |state| illutag_core::duplicates::management::prepare(request, &state)).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub(super) async fn apply_duplicate_action(request: illutag_core::duplicates::DuplicateApplyRequest, app: tauri::AppHandle) -> Result<illutag_core::jobs::JobRecord, AppError> {
+    let handle = app.clone();
+    off_main(app, move |state| illutag_core::duplicates::management::apply(request, &state, handle)).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub(super) async fn duplicate_operation_status(operation_id: String, app: tauri::AppHandle) -> Result<illutag_core::duplicates::DuplicateOperationStatus, AppError> {
+    off_main(app, move |state| illutag_core::duplicates::management::operation_status(&operation_id, &state)).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub(super) async fn duplicate_operation_results(query: illutag_core::duplicates::DuplicateOperationQuery, app: tauri::AppHandle) -> Result<illutag_core::duplicates::DuplicateOperationPage, AppError> {
+    off_main(app, move |state| illutag_core::duplicates::management::operation_results(query, &state)).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub(super) async fn undo_duplicate_action(operation_id: String, app: tauri::AppHandle) -> Result<illutag_core::jobs::JobRecord, AppError> {
+    let handle = app.clone();
+    off_main(app, move |state| illutag_core::duplicates::management::undo(operation_id, &state, handle)).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub(super) async fn clear_duplicate_management_records(confirmed: bool, app: tauri::AppHandle) -> Result<(), AppError> {
+    off_main(app, move |state| illutag_core::duplicates::management::clear_records(confirmed, &state)).await.map_err(Into::into)
+}
+
 pub(super) async fn off_main_write<T, F>(app: tauri::AppHandle, work: F) -> Result<T, String>
 where
     T: Send + 'static,
