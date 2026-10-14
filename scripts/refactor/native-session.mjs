@@ -79,12 +79,14 @@ export async function connectDebugging(port) {
     return { browser, transport, diagnostics }
   } catch (error) { error.debuggingDiagnostics = diagnostics; transport.close(); throw error }
 }
-export async function launch(executable, root, port = 9781) {
+export async function launch(executable, root, port = 9781, options = {}) {
   executable = isolatedPath(executable, 'program')
   root = isolatedPath(root, 'data root')
   if (!fs.statSync(executable).isFile()) throw Error('Validation program does not exist')
+  const resourceRoot = options.resourceRoot ? path.resolve(options.resourceRoot) : path.dirname(executable)
+  if (!path.isAbsolute(resourceRoot) || !fs.statSync(resourceRoot).isDirectory()) throw Error('Validation resource root must be an existing absolute directory')
   await requireFreePort(port)
-  for (const name of ['data', 'profile', 'assets', 'logs', 'pycache']) {
+  for (const name of ['data', 'profile', 'assets', 'logs', 'pycache', 'cuda', 'temp']) {
     const directory = isolatedPath(path.join(root, name), name)
     fs.mkdirSync(directory, { recursive: true })
   }
@@ -94,7 +96,8 @@ export async function launch(executable, root, port = 9781) {
     ...process.env,
     ILLUTAG_DATA_ROOT: path.join(root, 'data'), ILLUTAG_PROFILE_ROOT: path.join(root, 'profile'),
     ILLUTAG_ASSET_ROOT: path.join(root, 'assets'), ILLUTAG_LOG_ROOT: path.join(root, 'logs'),
-    ILLUTAG_RESOURCE_ROOT: path.dirname(executable), PYTHONPYCACHEPREFIX: path.join(root, 'pycache'),
+    ILLUTAG_RESOURCE_ROOT: resourceRoot, PYTHONPYCACHEPREFIX: path.join(root, 'pycache'),
+    CUDA_CACHE_PATH: path.join(root, 'cuda'), TEMP: path.join(root, 'temp'), TMP: path.join(root, 'temp'),
     WEBVIEW2_USER_DATA_FOLDER: path.join(root, 'profile'),
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port} --remote-allow-origins=*`,
   } })

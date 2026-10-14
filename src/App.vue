@@ -17,11 +17,13 @@ import ImageViewer from "./features/viewer/ImageViewer.vue";
 import TagManager from "./features/tags/TagManager.vue";
 import TaskCenter from "./features/jobs/TaskCenter.vue";
 import SettingsPage from "./features/settings/SettingsPage.vue";
+import DuplicatePage from "./features/duplicates/DuplicatePage.vue";
 import SoftDialog from "./shared/ui/SoftDialog.vue";
 import type { GalleryImage } from "./shared/contracts/GalleryImage";
 import type { LibraryFolder } from "./shared/contracts/LibraryFolder";
 import type { ImageMutation } from "./shared/contracts/ImageMutation";
 import type { UserFolderRuleCondition } from "./shared/contracts/UserFolderRuleCondition";
+import type { DuplicateOptions } from "./shared/contracts/DuplicateOptions";
 const gallery = useGallery(),
   selection = useSelection(),
   folders = useFolders(),
@@ -34,10 +36,17 @@ const page = ref("gallery"),
   error = ref(""),
   notice = ref(""),
   pinned = ref(false);
-const jobs = useJobs(() => {
-  void refresh();
-  if (page.value === "gallery") void gallery.search();
-});
+const duplicateRefreshVersion = ref(0);
+const jobs = useJobs(
+  () => {
+    duplicateRefreshVersion.value++;
+    void refresh();
+    if (page.value === "gallery") void gallery.search();
+  },
+  (job) => {
+    if (job.request.kind === "duplicates") duplicateRefreshVersion.value++;
+  },
+);
 const scopeName = computed(() =>
   gallery.query.value.unclassifiedOnlyParentFolderId !== null
     ? (folders.folders.value.find(
@@ -184,9 +193,21 @@ async function rule(id: number) {
     error.value = errorMessage(e);
   }
 }
-async function start(kind: string, sourceFolderId: number | null = null) {
+async function start(
+  kind: string,
+  sourceFolderId: number | null = null,
+  duplicateOptions: DuplicateOptions | null = null,
+) {
   page.value = "tasks";
-  await jobs.start(kind, preferences.thumbnails.value, sourceFolderId);
+  await jobs.start(
+    kind,
+    preferences.thumbnails.value,
+    sourceFolderId,
+    duplicateOptions,
+  );
+}
+async function startDuplicates(options: DuplicateOptions) {
+  return jobs.start("duplicates", preferences.thumbnails.value, null, options);
 }
 function tagSearch(tag: string) {
   viewer.value = null;
@@ -453,8 +474,15 @@ onUnmounted(() => {
             :rows="jobs.rows.value"
             :error="jobs.error.value"
             :thumbnails="preferences.thumbnails.value"
-            @start="start"
-            @control="jobs.control" /><TagManager
+            @start="(kind, options) => start(kind, null, options ?? null)"
+            @duplicates="page = 'duplicates'"
+            @control="jobs.control" /><DuplicatePage
+            v-else-if="page === 'duplicates'"
+            :jobs="jobs.rows.value"
+            :refresh-version="duplicateRefreshVersion"
+            :task-error="jobs.error.value"
+            :start-job="startDuplicates"
+            @tasks="page = 'tasks'" /><TagManager
             v-else-if="page === 'tags'"
             @search="tagSearch" /><SettingsPage
             v-else

@@ -1,7 +1,11 @@
-# illuTag 1.2.0 维护指南
+# illuTag 1.3.0 维护指南
 
 当前版本使用 Vue 3、TypeScript、Tauri 2、Rust、SQLite schema 3 与 Python ONNX。
 界面为浅色无框画廊。源码、正式程序/数据、测试工作区应使用不同目录。
+
+1.3.0 增加独立的[重复与近似图片检索](duplicate-search.md)，只检索和比对，不删除或合并图片。
+任务由用户手动启动，不加入“一键处理”；主库仍为 schema 3，无本次数据库升级。
+查重数据属于 `cache/duplicates.sqlite` 派生缓存，可单独清理，不进入完整备份或数据目录迁移包。
 
 ## 开发与验证入口
 
@@ -65,7 +69,12 @@ npm run tauri dev
 
 - `scripts/refactor/native-session.mjs` 的程序和数据目录必须位于名称为
   `illuTag-refactor-work` 的隔离路径下，并核对目录链接。多数原生 UI/恢复脚本
-  基于这个入口，执行前查看各自参数和输出范围。
+  基于这个入口，执行前查看各自参数和输出范围。可通过 `resourceRoot` 参数只读复用已有静态资源，
+  不复制模型；WebView、Python、CUDA 缓存和临时目录仍隔离在测试根目录内。
+- `scripts/refactor/duplicate-native-qa.mjs` 参数为 `EXE ROOT RESOURCE_ROOT`，仅接受工具指定隔离工作区中的
+  候选程序和全新测试根目录。它生成少量抽象素材，使用真实 IPC 和 WebView2 检查查重任务、分页、比对、
+  暂停／取消、重启及缓存清理；正常关闭本次启动的进程，截图与小型 JSON 记录写入测试根目录的 `logs`。
+  不要把正式数据库或生产素材放入该脚本的测试根目录。
 - `scripts/refactor/storage-native-benchmark.mjs` 只接受
   `D:\Ai\illuTag-storage-work\` 内的新测试工作目录。参数顺序为
   `EXE DATABASE WORKSPACE RESOURCE_ROOT [benchmark|smoke]`，均为绝对路径。
@@ -105,6 +114,16 @@ npm run tauri dev
 发布前在独立目录验收程序与资源的整套组合。打包不是生产部署，不覆盖正在使用
 的数据目录。升级数据库的步骤见 [Schema 3 存储维护](storage-schema3.md)。
 
+## 1.3.0 验证范围
+
+2026-10-14 的前端类型检查及 21 项 Vitest 测试通过。Rust 常规测试通过 75 项库测试与 4 项程序测试，
+另显式运行通过 1 项默认忽略的 80 万条 MIH 规模测试，共 80 项。第二轮真实 Tauri／WebView2 合成素材验收
+通过 12 项检查，确认任务控制、重启中断、缓存清理及主库图片／标签完整性。
+
+真实图库 832,758 张中已提交 45,900 张指纹；按用户要求暂停全库实测，保留已提交的缓存供后续复用。
+全库分组、总耗时与真实峰值内存尚未验收，不能由合成规模测试或这段部分运行推定全库已通过。
+具体样本规模、索引估算及时间记录见[重复检索验证记录](duplicate-search.md#验证记录与实测边界)。
+
 ## 空间清理与保留边界
 
 先退出属于该测试或构建的进程，核对完整路径、目录链接和数据用途，再清理。
@@ -116,6 +135,7 @@ npm run tauri dev
 | 仓库 `node_modules`、`dist`、`src-tauri/target` 或独立 `CARGO_TARGET_DIR` | 可重新安装/构建；不删除依赖清单、源码或 `.git` |
 | 独立测试工作目录的库、日志、截图、WebView、CUDA/Python 缓存 | 已结束相关测试，确认不包含正式数据或仅存源码 |
 | 重复候选程序、ZIP、过期发布输出 | 已确认当前正式程序与最终源码保留 |
+| `cache/duplicates.sqlite` 及其伴随文件 | 优先使用“重复检索 → 清理查重缓存”；无运行或排队的查重任务，清理后须重新计算 |
 | `illutag.schema2.rollback.sqlite`、`storage-program-rollback` | 升级状态为 accepted 且用户决定放弃旧版本恢复；见存储维护说明 |
 
 必须保留正式目录里的当前 `illutag.sqlite`、仍在使用的 WAL/SHM、EXE、模型、运行时、

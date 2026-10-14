@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import type { JobRecord } from "../../shared/contracts/JobRecord";
+import type { DuplicateOptions } from "../../shared/contracts/DuplicateOptions";
 defineProps<{ rows: JobRecord[]; error: string; thumbnails: boolean }>();
 const emit = defineEmits<{
-  start: [kind: string];
+  start: [kind: string, duplicateOptions?: DuplicateOptions | null];
+  duplicates: [];
   control: [id: string, action: string];
 }>();
 const names: Record<string, string> = {
@@ -13,6 +15,7 @@ const names: Record<string, string> = {
   tagging: "自动打标",
   cleanup: "清理缺失索引",
   rules: "重新应用分类规则",
+  duplicates: "重复与近似图片检索",
 };
 const states: Record<string, string> = {
   queued: "排队中",
@@ -23,6 +26,7 @@ const states: Record<string, string> = {
   interrupted: "已中断",
   completed: "已完成",
   partial: "部分完成",
+  failed: "失败",
 };
 </script>
 <template>
@@ -36,6 +40,7 @@ const states: Record<string, string> = {
       <button class="soft-button primary" @click="emit('start', 'pipeline')">
         一键处理
       </button>
+      <button class="soft-button" @click="emit('duplicates')">重复检索</button>
     </header>
     <div class="task-launchers">
       <button
@@ -87,9 +92,15 @@ const states: Record<string, string> = {
           >
             取消</button
           ><button
-            v-if="['interrupted', 'partial', 'cancelled'].includes(job.state)"
+            v-if="
+              ['interrupted', 'partial', 'cancelled', 'failed'].includes(
+                job.state,
+              )
+            "
             class="soft-button compact"
-            @click="emit('start', job.request.kind)"
+            @click="
+              emit('start', job.request.kind, job.request.duplicateOptions)
+            "
           >
             重新运行
           </button>

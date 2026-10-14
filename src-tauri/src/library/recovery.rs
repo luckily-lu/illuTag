@@ -512,6 +512,7 @@ pub fn restore_package(
     maintenance.keep = true;
     *state.library.lock().map_err(|e| e.to_string())? = None;
     invalidate_all_similarity_caches(state);
+    crate::duplicates::invalidate(state);
     Ok(manifest)
 }
 
@@ -583,5 +584,6 @@ pub fn prepare_data_directory_migration(
     }
     fs::remove_dir(stage).map_err(|e| e.to_string())?;
     guard.keep = true;
+    crate::duplicates::invalidate(state);
     Ok((files, bytes))
 }

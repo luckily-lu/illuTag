@@ -359,6 +359,9 @@ pub fn mutate_images(request: ImageMutation, state: &AppState) -> Result<Mutatio
     let revision = invalidate_library_metadata(state)?;
     if ["trash", "restore", "systemTrash"].contains(&request.action.as_str()) {
         invalidate_all_similarity_caches(state);
+        if !successful_ids.is_empty() {
+            crate::duplicates::invalidate(state);
+        }
     }
     Ok(MutationResult {
         images,

@@ -1191,6 +1191,26 @@ pub(super) fn list_jobs(
     state.jobs.list().map_err(Into::into)
 }
 
+#[tauri::command]
+pub(super) async fn duplicate_status(app: tauri::AppHandle) -> Result<illutag_core::duplicates::DuplicateStatus, AppError> {
+    off_main(app, |state| illutag_core::duplicates::status(&state)).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub(super) async fn query_duplicate_groups(query: illutag_core::duplicates::DuplicateQuery, app: tauri::AppHandle) -> Result<illutag_core::duplicates::DuplicateGroupPage, AppError> {
+    off_main(app, move |state| illutag_core::duplicates::query_groups(query, &state)).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub(super) async fn query_duplicate_members(query: illutag_core::duplicates::DuplicateMemberQuery, app: tauri::AppHandle) -> Result<illutag_core::duplicates::DuplicateMemberPage, AppError> {
+    off_main(app, move |state| illutag_core::duplicates::query_members(query, &state)).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub(super) async fn clear_duplicate_cache(app: tauri::AppHandle) -> Result<(), AppError> {
+    off_main(app, |state| illutag_core::duplicates::clear_cache(&state)).await.map_err(Into::into)
+}
+
 pub(super) async fn off_main_write<T, F>(app: tauri::AppHandle, work: F) -> Result<T, String>
 where
     T: Send + 'static,

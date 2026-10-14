@@ -58,6 +58,7 @@ pub fn import_data_migration_backup(
 
     tx.commit()
         .map_err(|error| format!("Failed to commit migration import: {error}"))?;
+    crate::duplicates::invalidate(state);
 
     let store = load_store(&conn)?;
     *library = Some(store.clone());

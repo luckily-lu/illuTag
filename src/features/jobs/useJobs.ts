@@ -3,7 +3,11 @@ import { isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api } from "../../shared/ipc";
 import type { JobRecord } from "../../shared/contracts/JobRecord";
-export function useJobs(changed: () => void) {
+import type { DuplicateOptions } from "../../shared/contracts/DuplicateOptions";
+export function useJobs(
+  changed: () => void,
+  terminal?: (job: JobRecord) => void,
+) {
   const rows = ref<JobRecord[]>([]),
     error = ref("");
   let off: UnlistenFn | undefined;
@@ -21,12 +25,21 @@ export function useJobs(changed: () => void) {
     kind: string,
     thumbnails = true,
     sourceFolderId: number | null = null,
+    duplicateOptions: DuplicateOptions | null = null,
   ) {
     try {
-      await api.startJob({ kind, thumbnails, sourceFolderId });
+      error.value = "";
+      await api.startJob({
+        kind,
+        thumbnails,
+        sourceFolderId,
+        duplicateOptions,
+      });
       await refresh();
+      return true;
     } catch (e) {
       error.value = String(e);
+      return false;
     }
   }
   async function control(id: string, action: string) {
@@ -41,8 +54,20 @@ export function useJobs(changed: () => void) {
     if (isTauri()) {
       off = await listen<JobRecord>("jobs:changed", (e) => {
         const index = rows.value.findIndex((r) => r.id === e.payload.id);
+        const previous = index < 0 ? null : rows.value[index].state;
         if (index < 0) rows.value.unshift(e.payload);
         else rows.value[index] = e.payload;
+        if (
+          previous !== e.payload.state &&
+          [
+            "completed",
+            "partial",
+            "cancelled",
+            "interrupted",
+            "failed",
+          ].includes(e.payload.state)
+        )
+          terminal?.(e.payload);
       });
       offLibrary = await listen("library:changed", () => changed());
     }

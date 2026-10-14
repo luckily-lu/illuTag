@@ -1,4 +1,4 @@
-# illuTag 1.2.0
+# illuTag 1.3.0
 
 illuTag 是本地图片画廊与标签管理工具，使用 Vue 3、TypeScript、Tauri 2、Rust、SQLite 和 Python ONNX。图片处理和搜索在本机运行。
 
@@ -15,6 +15,7 @@ illuTag 是本地图片画廊与标签管理工具，使用 Vue 3、TypeScript�
 - 批量工具栏替换普通操作区；“选择当前已加载结果”只选择已加载图片，部分失败时保留失败项的选中状态。
 - DanbooruTagQuery 自动打标保留部署模型和预处理，生效通用/角色阈值为 0.2/0.2；目录名沿用 `wd-swinv2-tagger-v3`。
 - Chinese-CLIP 图片索引用于自然语言搜索，生成时读取原图。
+- 独立的“重复检索”页通过内容哈希和感知指纹查找复制、改名、压缩或缩放版本，按组展示并支持并排比对；仅提供检索，不删除、合并或折叠图库。操作说明见 [重复与近似图片检索](docs/duplicate-search.md)。
 
 普通以图、配色和氛围相似搜索已移除。历史配色、氛围、参考板及托管图片数据保留，并继续进入完整备份。
 
@@ -86,7 +87,7 @@ cargo build --manifest-path src-tauri/Cargo.toml --release --features custom-pro
 脚本读取当前项目版本，不覆盖已存在的包。可用 `-Build` 先构建，用 `-ReleaseExe` 指定 EXE，用 `-SkipZip` 只生成文件夹。必须包含 `tagger_config.json`、`tag_groups.json` 和 `ort_runtime.py`。模型、脚本和字典优先从 EXE 同级加载，避免快捷方式工作目录影响资源选择。
 
 ```text
-illuTag-1.2.0/
+illuTag-1.3.0/
   illutag.exe
   illutag.portable.json
   model-manifest.json
@@ -123,6 +124,7 @@ Rust 入口负责装配、窗口和命令注册，业务与 SQLite、模型进�
 | [Schema 3 存储维护](docs/storage-schema3.md) | 数据结构、离线升级、验收、恢复与硬链接 |
 | [原比例瀑布流](docs/segmented-masonry.md) | 增量布局、按列可见区查找和分页行为 |
 | [开发压力测试](docs/dev-stress-tools.md) | 开发测试入口及隔离要求 |
+| [重复与近似图片检索](docs/duplicate-search.md) | 手动查重、分组比对、候选解释与可重建缓存 |
 
 ## 第三方资源
 

@@ -31,6 +31,7 @@ import {
   Expand,
   CheckSquare,
   Maximize2,
+  ScanSearch,
 } from "@lucide/vue";
 const icons = {
   images: Images,
@@ -64,6 +65,7 @@ const icons = {
   expand: Expand,
   select: CheckSquare,
   maximize: Maximize2,
+  duplicates: ScanSearch,
 };
 export type IconName = keyof typeof icons;
 withDefaults(

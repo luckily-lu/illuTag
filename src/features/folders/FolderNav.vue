@@ -12,6 +12,7 @@ const navigation: Array<[string, string, IconName]> = [
 ];
 const utilities: Array<[string, string, IconName]> = [
   ["tags", "标签", "tags"],
+  ["duplicates", "重复检索", "duplicates"],
   ["tasks", "任务中心", "tasks"],
   ["settings", "设置", "settings"],
 ];

@@ -2,6 +2,11 @@ import type { GalleryImage } from "./contracts/GalleryImage";
 import type { GalleryQuery } from "./contracts/GalleryQuery";
 import type { ImageMutation } from "./contracts/ImageMutation";
 import type { JobRecord } from "./contracts/JobRecord";
+import type { DuplicateStatus } from "./contracts/DuplicateStatus";
+import type { DuplicateGroup } from "./contracts/DuplicateGroup";
+import type { DuplicateOptions } from "./contracts/DuplicateOptions";
+import type { DuplicateQuery } from "./contracts/DuplicateQuery";
+import type { DuplicateMemberQuery } from "./contracts/DuplicateMemberQuery";
 const ratios = [
   [720, 980],
   [1200, 800],
@@ -54,6 +59,88 @@ let images: GalleryImage[] = Array.from({ length: 48 }, (_, i) => {
 });
 const records: JobRecord[] = [];
 let revision = 0;
+let duplicateFixtureState =
+  new URLSearchParams(location.search).get("duplicates") || "empty";
+let duplicateGeneration =
+  duplicateFixtureState === "empty" ? null : "preview-1";
+let duplicateSensitivity = "standard";
+let duplicateSequence = 1;
+const duplicateFixtures: DuplicateGroup[] = Array.from(
+  { length: 28 },
+  (_, index) => {
+    const kind = index < 14 ? "exact" : "near";
+    const sample = images[index % images.length];
+    const members = Array.from(
+      { length: index === 0 ? 80 : 8 },
+      (_, member) => ({
+        image: {
+          ...sample,
+          id: `preview-duplicate-${index}-${member}`,
+          fileName: `${member === 0 ? "参考图" : "副本"}_${index + 1}_${member + 1}.png`,
+        },
+        metric: {
+          phashDistance: kind === "near" ? member % 5 : null,
+          dhashDistance: kind === "near" ? member % 8 : null,
+          colorDistance: kind === "near" ? 0.035 : null,
+        },
+        stale: false,
+      }),
+    );
+    return {
+      id: `fixture-${index}`,
+      kind,
+      reference: members[0],
+      totalMembers: members.length,
+      members,
+      nextCursor: null,
+    };
+  },
+);
+function duplicateStatusFixture(): DuplicateStatus {
+  const coverage = {
+    total: 296,
+    processed: 296,
+    failed: 0,
+    skippedNear: 3,
+    lowInformation: 2,
+    tooDense: 0,
+  };
+  return {
+    generation: duplicateGeneration,
+    sensitivity: duplicateSensitivity,
+    checkedAt: duplicateGeneration ? Date.now() : null,
+    durationMs: duplicateGeneration ? 12300 : null,
+    state: duplicateFixtureState === "empty" ? "empty" : duplicateFixtureState,
+    needsUpdate: ["stale", "invalid"].includes(duplicateFixtureState),
+    coverage: duplicateGeneration
+      ? coverage
+      : {
+          total: 296,
+          processed: 0,
+          failed: 0,
+          skippedNear: 0,
+          lowInformation: 0,
+          tooDense: 0,
+        },
+    cacheBytes: duplicateGeneration ? 8 * 1024 * 1024 : 0,
+    exactGroups: duplicateGeneration ? 14 : 0,
+    nearGroups: duplicateGeneration ? 14 : 0,
+    uniqueImages: duplicateGeneration ? 296 : 0,
+    errors:
+      duplicateFixtureState === "invalid"
+        ? ["预览示例：缓存校验失败，请重新建立索引。"]
+        : [],
+    lastAttempt:
+      duplicateFixtureState === "partial"
+        ? {
+            state: "partial",
+            coverage: { ...coverage, processed: 180, failed: 2 },
+            updatedAt: Date.now(),
+            errors: ["预览示例：来源目录离线，保留上一次完整结果。"],
+          }
+        : null,
+  };
+}
 export async function previewInvoke<T>(
   command: string,
   args: Record<string, unknown> = {},
@@ -154,7 +241,46 @@ export async function previewInvoke<T>(
     };
   } else if (command === "get_user_folder_rule_command") result = null;
   else if (command === "list_jobs") result = records;
-  else if (command === "start_job") {
+  else if (command === "duplicate_status") result = duplicateStatusFixture();
+  else if (command === "query_duplicate_groups") {
+    const q = args.query as DuplicateQuery;
+    if (q.generation !== duplicateGeneration)
+      throw new Error("预览示例：结果版本已变化，请刷新。");
+    const rows = duplicateFixtures.filter(
+      (g) => q.kind === "all" || q.kind === g.kind,
+    );
+    const offset = Number(q.cursor || 0),
+      limit = Math.min(q.limit, 20);
+    result = {
+      generation: duplicateGeneration,
+      groups: rows.slice(offset, offset + limit).map((g) => ({
+        ...g,
+        members: g.members.slice(0, 6),
+        nextCursor: g.members.length > 6 ? "6" : null,
+      })),
+      totalGroups: rows.length,
+      nextCursor: offset + limit < rows.length ? String(offset + limit) : null,
+    };
+  } else if (command === "query_duplicate_members") {
+    const q = args.query as DuplicateMemberQuery;
+    if (q.generation !== duplicateGeneration)
+      throw new Error("预览示例：结果版本已变化，请刷新。");
+    const group = duplicateFixtures.find((g) => g.id === q.groupId);
+    if (!group) throw new Error("预览示例：分组不存在。");
+    const offset = Number(q.cursor || 0),
+      limit = Math.min(q.limit, 50);
+    result = {
+      generation: duplicateGeneration,
+      groupId: q.groupId,
+      members: group.members.slice(offset, offset + limit),
+      totalMembers: group.totalMembers,
+      nextCursor:
+        offset + limit < group.members.length ? String(offset + limit) : null,
+    };
+  } else if (command === "clear_duplicate_cache") {
+    duplicateGeneration = null;
+    duplicateFixtureState = "empty";
+  } else if (command === "start_job") {
     const r: JobRecord = {
       id: String(Date.now()),
       request: args.request as JobRecord["request"],
@@ -166,6 +292,15 @@ export async function previewInvoke<T>(
       errors: [],
       updatedAt: Date.now(),
     };
+    if (r.request.kind === "duplicates") {
+      const options = r.request.duplicateOptions as DuplicateOptions | null;
+      duplicateSensitivity = options?.sensitivity || "standard";
+      duplicateGeneration = `preview-${++duplicateSequence}`;
+      duplicateFixtureState = "ready";
+      r.state = "completed";
+      r.stage = "布局预览示例完成";
+      r.processed = r.total = 296;
+    }
     records.unshift(r);
     result = r;
   } else if (command === "control_job") {

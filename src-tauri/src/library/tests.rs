@@ -709,6 +709,7 @@ fn restart_marks_incomplete_jobs_interrupted() {
     let job = crate::jobs::JobRecord {
         id: "old".into(),
         request: crate::jobs::JobRequest {
+            duplicate_options: None,
             kind: "scan".into(),
             thumbnails: false,
             source_folder_id: None,

@@ -12,6 +12,11 @@ import type { ImageMutation } from "./contracts/ImageMutation";
 import type { MutationResult } from "./contracts/MutationResult";
 import type { JobRecord } from "./contracts/JobRecord";
 import type { JobRequest } from "./contracts/JobRequest";
+import type { DuplicateStatus } from "./contracts/DuplicateStatus";
+import type { DuplicateQuery } from "./contracts/DuplicateQuery";
+import type { DuplicateGroupPage } from "./contracts/DuplicateGroupPage";
+import type { DuplicateMemberQuery } from "./contracts/DuplicateMemberQuery";
+import type { DuplicateMemberPage } from "./contracts/DuplicateMemberPage";
 
 export function errorMessage(error: unknown): string {
   if (error && typeof error === "object" && "message" in error)
@@ -50,4 +55,10 @@ export const api = {
     invoke<JobRecord>("start_job", { request }),
   controlJob: (id: string, action: string) =>
     invoke<void>("control_job", { id, action }),
+  duplicateStatus: () => invoke<DuplicateStatus>("duplicate_status"),
+  duplicateGroups: (query: DuplicateQuery) =>
+    invoke<DuplicateGroupPage>("query_duplicate_groups", { query }),
+  duplicateMembers: (query: DuplicateMemberQuery) =>
+    invoke<DuplicateMemberPage>("query_duplicate_members", { query }),
+  clearDuplicateCache: () => invoke<void>("clear_duplicate_cache"),
 };
