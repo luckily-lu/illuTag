@@ -6,6 +6,7 @@ use super::{
 use crate::library::AppState;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::Path;
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pair_checks(
@@ -24,7 +25,33 @@ pub(super) struct Verifier {
     pub uncertain: i64,
     pending: Vec<PendingEvidence>,
     evidence_ready: bool,
+    /// Source-version keyed answers for repeated/reverse pairs in one run.
+    pair_cache: HashMap<(i64, i64), (PairToken, PairToken, super::cascade_pixels::Analysis)>,
+    pair_cache_bytes: usize,
+    pub(super) pair_cache_hits: u64,
+    /// Cascade workflow batches verdict writes through `flush_verdicts`.
+    pub(super) batch_writes: bool,
+    pending_verdicts: Vec<PendingVerdict>,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PairToken {
+    signature: [u8; 32],
+    sha: [u8; 32],
+}
+
+struct PendingVerdict {
+    a: i64,
+    b: i64,
+    left_signature: Vec<u8>,
+    right_signature: Vec<u8>,
+    left_sha: Vec<u8>,
+    right_sha: Vec<u8>,
+    answer: super::cascade_pixels::Analysis,
+}
+
+const PAIR_CACHE_MAX_BYTES: usize = 96 * 1024 * 1024;
+const PAIR_CACHE_ENTRY_BYTES: usize = 192;
 
 struct PendingEvidence {
     a: i64,
@@ -69,6 +96,11 @@ impl Verifier {
             uncertain: 0,
             pending: Vec::new(),
             evidence_ready: false,
+            pair_cache: HashMap::new(),
+            pair_cache_bytes: 0,
+            pair_cache_hits: 0,
+            batch_writes: false,
+            pending_verdicts: Vec::new(),
         })
     }
 
@@ -211,6 +243,136 @@ impl Verifier {
         }
         Ok(digest)
     }
+    fn source_token(source: &Source) -> Option<PairToken> {
+        let signature: [u8; 32] = source.signature.as_slice().try_into().ok()?;
+        let sha: [u8; 32] = source.sha.as_slice().try_into().ok()?;
+        Some(PairToken { signature, sha })
+    }
+
+    fn pair_key(a: i64, b: i64) -> (i64, i64) {
+        if a <= b {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+
+    fn cached_pair(
+        &mut self,
+        a: i64,
+        b: i64,
+        left: &Source,
+        right: &Source,
+    ) -> Option<super::cascade_pixels::Analysis> {
+        let key = Self::pair_key(a, b);
+        let tokens = (Self::source_token(left)?, Self::source_token(right)?);
+        match self.pair_cache.get(&key) {
+            Some((saved_left, saved_right, answer))
+                if *saved_left == tokens.0 && *saved_right == tokens.1 =>
+            {
+                Some(answer.clone())
+            }
+            Some(_) => {
+                self.pair_cache.remove(&key);
+                self.pair_cache_bytes = self
+                    .pair_cache_bytes
+                    .saturating_sub(PAIR_CACHE_ENTRY_BYTES);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn remember_pair(
+        &mut self,
+        a: i64,
+        b: i64,
+        left: &Source,
+        right: &Source,
+        answer: &super::cascade_pixels::Analysis,
+    ) {
+        let (Some(left_token), Some(right_token)) =
+            (Self::source_token(left), Self::source_token(right))
+        else {
+            return;
+        };
+        let key = Self::pair_key(a, b);
+        if self.pair_cache.contains_key(&key) {
+            self.pair_cache.remove(&key);
+            self.pair_cache_bytes = self
+                .pair_cache_bytes
+                .saturating_sub(PAIR_CACHE_ENTRY_BYTES);
+        }
+        if self.pair_cache_bytes + PAIR_CACHE_ENTRY_BYTES > PAIR_CACHE_MAX_BYTES {
+            self.pair_cache.clear();
+            self.pair_cache_bytes = 0;
+        }
+        self.pair_cache
+            .insert(key, (left_token, right_token, answer.clone()));
+        self.pair_cache_bytes += PAIR_CACHE_ENTRY_BYTES;
+    }
+
+    pub(super) fn flush_verdicts(
+        &mut self,
+        control: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.pending_verdicts.is_empty() {
+            return Ok(());
+        }
+        cache::controlled_write(&self.conn, control, || {
+            self.conn.execute_batch("BEGIN IMMEDIATE")
+        })?;
+        let mut failure = None;
+        for verdict in &self.pending_verdicts {
+            if let Err(error) = super::cascade_store::insert_in_transaction(
+                &self.conn,
+                verdict.a,
+                verdict.b,
+                &verdict.left_signature,
+                &verdict.right_signature,
+                &verdict.left_sha,
+                &verdict.right_sha,
+                &verdict.answer,
+            ) {
+                failure = Some(error);
+                break;
+            }
+        }
+        if let Some(error) = failure {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+        self.conn
+            .execute_batch("COMMIT")
+            .map_err(|error| error.to_string())?;
+        self.pending_verdicts.clear();
+        Ok(())
+    }
+
+    fn queue_verdict(
+        &mut self,
+        a: i64,
+        b: i64,
+        left: &Source,
+        right: &Source,
+        answer: &super::cascade_pixels::Analysis,
+    ) -> Result<(), String> {
+        self.pending_verdicts.push(PendingVerdict {
+            a,
+            b,
+            left_signature: left.signature.clone(),
+            right_signature: right.signature.clone(),
+            left_sha: left.sha.clone(),
+            right_sha: right.sha.clone(),
+            answer: answer.clone(),
+        });
+        Ok(())
+    }
+
+    pub(super) fn pending_verdict_count(&self) -> usize {
+        self.pending_verdicts.len()
+    }
+
     pub(super) fn check_cascade(
         &mut self,
         a: i64,
@@ -225,11 +387,24 @@ impl Verifier {
             Ok(x) => x,
             Err(_) => return Ok(Analysis::new("uncertain", "source_unavailable", false)),
         };
+        if let Some(answer) = self.cached_pair(a, b, &left, &right) {
+            // Source tokens already matched above; still honour cancellation and
+            // never turn an uncertain/no-source result into a permanent answer.
+            control()?;
+            self.pair_cache_hits += 1;
+            return Ok(answer);
+        }
         if left.sha == right.sha {
-            if self.check(a, b, true, state, control)? == VerificationOutcome::Identical {
-                return Ok(Analysis::new("exact", "byte_identical", true));
+            let answer = if self.check(a, b, true, state, control)? == VerificationOutcome::Identical
+            {
+                Analysis::new("exact", "byte_identical", true)
+            } else {
+                Analysis::new("uncertain", "byte_proof_failed", false)
+            };
+            if answer.kind != "uncertain" {
+                self.remember_pair(a, b, &left, &right, &answer);
             }
-            return Ok(Analysis::new("uncertain", "byte_proof_failed", false));
+            return Ok(answer);
         }
         if let Some(answer) = super::cascade_store::lookup(
             &self.conn,
@@ -240,6 +415,7 @@ impl Verifier {
             &left.sha,
             &right.sha,
         )? {
+            self.remember_pair(a, b, &left, &right, &answer);
             return Ok(answer);
         }
         let answer =
@@ -248,25 +424,30 @@ impl Verifier {
             if self.checks % 32 == 0 {
                 cache::check_disk(&cache::cache_path(state))?;
             }
-            cache::controlled_write(&self.conn, control, || {
-                self.conn.execute_batch("BEGIN IMMEDIATE")
-            })?;
-            if let Err(e) = super::cascade_store::insert(
-                &self.conn,
-                a,
-                b,
-                &left.signature,
-                &right.signature,
-                &left.sha,
-                &right.sha,
-                &answer,
-            ) {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                return Err(e);
+            if self.batch_writes {
+                self.queue_verdict(a, b, &left, &right, &answer)?;
+            } else {
+                cache::controlled_write(&self.conn, control, || {
+                    self.conn.execute_batch("BEGIN IMMEDIATE")
+                })?;
+                if let Err(e) = super::cascade_store::insert(
+                    &self.conn,
+                    a,
+                    b,
+                    &left.signature,
+                    &right.signature,
+                    &left.sha,
+                    &right.sha,
+                    &answer,
+                ) {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|e| e.to_string())?;
             }
-            self.conn
-                .execute_batch("COMMIT")
-                .map_err(|e| e.to_string())?;
+            self.remember_pair(a, b, &left, &right, &answer);
             self.checks += 1;
         }
         Ok(answer)

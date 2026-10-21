@@ -246,6 +246,70 @@ fn cascade_cancelled_second_round_reuses_compatible_draft_and_never_publishes_pa
     assert_eq!(next.cleanup_count, 4);
 }
 #[test]
+fn cascade_pair_cache_revalidates_the_source_before_reusing_an_answer() {
+    use sha2::{Digest, Sha256};
+    let f = Fixture::new(2);
+    let mut changed = scene();
+    for pixel in changed.pixels_mut() {
+        pixel[0] = 255 - pixel[0];
+        pixel[1] = 255 - pixel[1];
+        pixel[2] = 255 - pixel[2];
+    }
+    save(&f.paths[1], &changed, CompressionType::Fast);
+    f.run().unwrap();
+
+    let mut verifier = super::verification_cache::Verifier::new(&f.state, false).unwrap();
+    let first = verifier
+        .check_cascade(1, 2, &f.state, &mut || Ok(()))
+        .unwrap();
+    assert_ne!(first.kind, "exact");
+    assert_eq!(verifier.pair_cache_hits, 0);
+
+    // Replace the second file with an exact copy of the first and refresh the
+    // fingerprint so the source itself remains valid. Only the source token
+    // changes; a bare image-id cache would incorrectly return the old answer.
+    fs::copy(&f.paths[0], &f.paths[1]).unwrap();
+    let signature = fingerprint::source_signature(&f.paths[1]).unwrap();
+    let image_id = f.paths[1].to_string_lossy().into_owned();
+    let sha = Sha256::digest(fs::read(&f.paths[1]).unwrap()).to_vec();
+    let cache = rusqlite::Connection::open(cache::cache_path(&f.state)).unwrap();
+    cache
+        .execute(
+            "UPDATE fingerprints SET signature=?1,sha=?2 WHERE image_pk=2",
+            params![
+                cache::signature(&image_id, &signature).to_vec(),
+                sha
+            ],
+        )
+        .unwrap();
+    drop(cache);
+
+    let second = verifier
+        .check_cascade(1, 2, &f.state, &mut || Ok(()))
+        .unwrap();
+    assert_eq!(
+        second.kind, "exact",
+        "a changed source token must force re-verification"
+    );
+    assert_eq!(
+        verifier.pair_cache_hits, 0,
+        "the stale pair must not be served from cache"
+    );
+
+    let third = verifier
+        .check_cascade(1, 2, &f.state, &mut || Ok(()))
+        .unwrap();
+    assert_eq!(third.kind, "exact");
+    assert_eq!(verifier.pair_cache_hits, 1);
+    assert!(
+        verifier
+            .check_cascade(1, 2, &f.state, &mut || Err("cancelled".into()))
+            .is_err(),
+        "a cache hit must still honour cancellation"
+    );
+}
+
+#[test]
 fn cascade_source_change_invalidates_cached_classification() {
     let f = examples();
     run(&f);

@@ -77,6 +77,20 @@ pub(super) fn insert(
     bsha: &[u8],
     answer: &Analysis,
 ) -> Result<(), String> {
+    insert_in_transaction(c, a, b, asig, bsig, asha, bsha, answer)
+}
+
+/// Caller owns the surrounding transaction. Used by the batched verifier.
+pub(super) fn insert_in_transaction(
+    c: &Connection,
+    a: i64,
+    b: i64,
+    asig: &[u8],
+    bsig: &[u8],
+    asha: &[u8],
+    bsha: &[u8],
+    answer: &Analysis,
+) -> Result<(), String> {
     let code = match answer.kind.as_str() {
         "exact" if answer.strict => 1,
         "near" if !answer.strict => 2,

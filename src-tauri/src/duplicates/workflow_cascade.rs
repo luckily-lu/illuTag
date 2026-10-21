@@ -114,6 +114,8 @@ fn classify_pool(
     }
     let controls = RefCell::new(control);
     let verifier = RefCell::new(verification_cache::Verifier::new(state, false)?);
+    verifier.borrow_mut().batch_writes = true;
+    let analyses = RefCell::new(Vec::<(i64, i64, super::super::cascade_pixels::Analysis)>::new());
     let bits = RefCell::new(covered);
     let dense = RefCell::new(resume.dense.clone());
     let next = std::cell::Cell::new(resume.next_anchor);
@@ -136,6 +138,44 @@ fn classify_pool(
         })?;
         Ok(())
     };
+    let flush_analyses = |control: &mut dyn FnMut() -> Result<(), String>| -> Result<(), String> {
+        if analyses.borrow().is_empty() {
+            return Ok(());
+        }
+        cache::controlled_write(c, control, || {
+            c.execute_batch("BEGIN IMMEDIATE")
+        })?;
+        let result = (|| -> Result<(), String> {
+            let mut insert = c
+                .prepare_cached(
+                    "INSERT INTO cascade_pairs(generation,a,b,reference,kind,strict,reason)
+                     VALUES(?1,?2,?3,?2,?4,?5,?6)
+                     ON CONFLICT(generation,a,b) DO UPDATE SET
+                       kind=excluded.kind,strict=excluded.strict,reason=excluded.reason",
+                )
+                .map_err(|error| error.to_string())?;
+            for (a, b, answer) in analyses.borrow().iter() {
+                insert
+                    .execute(params![
+                        g,
+                        a.min(b),
+                        a.max(b),
+                        answer.kind,
+                        answer.strict as i64,
+                        answer.reason
+                    ])
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = c.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+        c.execute_batch("COMMIT").map_err(|error| error.to_string())?;
+        analyses.borrow_mut().clear();
+        Ok(())
+    };
     let mut pair = |a: usize, b: usize| -> Result<super::super::cascade_pixels::Analysis, String> {
         let answer = verifier.borrow_mut().check_cascade(
             records[a].image_pk,
@@ -143,14 +183,19 @@ fn classify_pool(
             state,
             &mut **controls.borrow_mut(),
         )?;
-        save_analysis(
-            c,
-            g,
+        analyses.borrow_mut().push((
             records[a].image_pk,
             records[b].image_pk,
-            &answer,
-            &mut **controls.borrow_mut(),
-        )?;
+            answer.clone(),
+        ));
+        if analyses.borrow().len() >= 512 {
+            flush_analyses(&mut **controls.borrow_mut())?;
+        }
+        if verifier.borrow().pending_verdict_count() >= 256 {
+            verifier
+                .borrow_mut()
+                .flush_verdicts(&mut **controls.borrow_mut())?;
+        }
         checked.set(checked.get() + 1);
         progress(
             "第二轮：验证候选关系",
@@ -198,6 +243,10 @@ fn classify_pool(
                 dense.borrow_mut().push(reference);
             }
             if anchor.next_anchor % 512 == 0 || last.elapsed().as_secs() >= 1 {
+                flush_analyses(&mut **controls.borrow_mut())?;
+                verifier
+                    .borrow_mut()
+                    .flush_verdicts(&mut **controls.borrow_mut())?;
                 flush()?;
                 cache::check_disk(&cache::cache_path(state))?;
                 last = Instant::now();
@@ -206,7 +255,20 @@ fn classify_pool(
         },
     );
     if result.is_ok() {
+        flush_analyses(&mut **controls.borrow_mut())?;
+        verifier
+            .borrow_mut()
+            .flush_verdicts(&mut **controls.borrow_mut())?;
         flush()?;
+    } else {
+        // Persist already-started relationships and verdicts for the draft even
+        // when the cancellation/stop hook would reject further writes. This is a
+        // bounded best-effort flush of work that was already completed.
+        let mut ignore_cancel = || Ok::<(), String>(());
+        let _ = flush_analyses(&mut ignore_cancel);
+        let _ = verifier
+            .borrow_mut()
+            .flush_verdicts(&mut ignore_cancel);
     }
     let result = result?;
     if !result.too_dense_references.is_empty() {
