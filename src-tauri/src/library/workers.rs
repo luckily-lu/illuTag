@@ -163,7 +163,7 @@ pub(super) fn start_scan_all_folders_worker(
                         break;
                     }
                 };
-                let mut tag_queue_image_ids = match collect_pending_tag_image_ids(&conn) {
+                let mut tag_queue_images = match collect_pending_tag_images(&conn) {
                     Ok(value) => value,
                     Err(error) => {
                         set_scan_progress_error(&background_scan_progress, &error);
@@ -172,16 +172,14 @@ pub(super) fn start_scan_all_folders_worker(
                         break;
                     }
                 };
-                tag_queue_image_ids.sort();
-                tag_queue_image_ids.dedup();
+                tag_queue_images.sort_by(|left, right| left.id.cmp(&right.id));
+                tag_queue_images.dedup_by(|left, right| left.id == right.id);
                 set_scan_progress_phase(&background_scan_progress, "tagging");
                 set_scan_progress_queued_images(
                     &background_scan_progress,
-                    tag_queue_image_ids.len() as i64,
+                    tag_queue_images.len() as i64,
                 );
-                Ok(ScanCollectResult {
-                    tag_queue_image_ids,
-                })
+                Ok(ScanCollectResult { tag_queue_images })
             } else {
                 scan_all_folders_and_collect_new_images(
                     &database_path,
@@ -210,7 +208,7 @@ pub(super) fn start_scan_all_folders_worker(
                         if let Err(error) = tag_images_with_wd_model(
                             &database_path,
                             &foreground,
-                            &scan_result.tag_queue_image_ids,
+                            &scan_result.tag_queue_images,
                             &background_scan_progress,
                             &background_scan_pause_requested_flag,
                             &background_scan_stop_requested_flag,

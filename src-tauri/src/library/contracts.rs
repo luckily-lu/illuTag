@@ -590,8 +590,16 @@ pub(super) struct ExistingImageMeta {
     pub(super) missing: i64,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct TagQueueImage {
+    /// Stable library id. After a mapped import/migration it is not a file path.
+    pub(super) id: String,
+    /// Actual, current file path used by the inference service.
+    pub(super) path: String,
+}
+
 pub(super) struct ScanCollectResult {
-    pub(super) tag_queue_image_ids: Vec<String>,
+    pub(super) tag_queue_images: Vec<TagQueueImage>,
 }
 
 #[derive(Debug, Clone)]

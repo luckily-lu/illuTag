@@ -152,6 +152,38 @@ fn viewer_undo_restores_only_its_latest_unchanged_mutation() {
 }
 
 #[test]
+fn tag_queue_keeps_stable_id_separate_from_real_path() {
+    let f = Fixture::new(2);
+    let path = f
+        .root
+        .join("image-000000.png")
+        .to_string_lossy()
+        .into_owned();
+    let normal = f
+        .root
+        .join("image-000001.png")
+        .to_string_lossy()
+        .into_owned();
+    let conn = open_database(&f.state.database_path).unwrap();
+    conn.execute("UPDATE images SET id='legacy-id' WHERE path=?1", [&path])
+        .unwrap();
+    drop(conn);
+
+    let queue = collect_pending_tag_images(&open_database(&f.state.database_path).unwrap()).unwrap();
+    let item = queue
+        .iter()
+        .find(|item| item.path == path)
+        .expect("mapped image must be queued");
+    assert_eq!(item.id, "legacy-id");
+    assert_eq!(item.path, path);
+    let plain = queue
+        .iter()
+        .find(|item| item.path == normal)
+        .expect("normal image must be queued");
+    assert_eq!(plain.id, normal);
+}
+
+#[test]
 fn compact_tags_preserve_translation_and_distinct_image_statistics() {
     let f = Fixture::new(1);
     let conn = open_database(&f.state.database_path).unwrap();

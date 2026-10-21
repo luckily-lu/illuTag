@@ -276,7 +276,7 @@ pub(super) fn scan_all_folders_and_collect_new_images(
     if background_scan_stop_requested(stop_requested) {
         let _ = write_app_meta_value(&conn, "library_scan_in_progress", "0");
         return Ok(ScanCollectResult {
-            tag_queue_image_ids: Vec::new(),
+            tag_queue_images: Vec::new(),
         });
     }
 
@@ -284,31 +284,29 @@ pub(super) fn scan_all_folders_and_collect_new_images(
         set_scan_progress_queued_images(progress, 0);
         let _ = write_app_meta_value(&conn, "library_scan_in_progress", "0");
         return Ok(ScanCollectResult {
-            tag_queue_image_ids: Vec::new(),
+            tag_queue_images: Vec::new(),
         });
     }
 
-    let mut tag_queue_image_ids = collect_pending_tag_image_ids(&conn)?;
-    tag_queue_image_ids.sort();
-    tag_queue_image_ids.dedup();
+    let mut tag_queue_images = collect_pending_tag_images(&conn)?;
+    tag_queue_images.sort_by(|left, right| left.id.cmp(&right.id));
+    tag_queue_images.dedup_by(|left, right| left.id == right.id);
     set_scan_progress_phase(progress, "tagging");
-    set_scan_progress_queued_images(progress, tag_queue_image_ids.len() as i64);
+    set_scan_progress_queued_images(progress, tag_queue_images.len() as i64);
 
-    Ok(ScanCollectResult {
-        tag_queue_image_ids,
-    })
+    Ok(ScanCollectResult { tag_queue_images })
 }
 
 pub(super) fn tag_images_with_wd_model(
     database_path: &Path,
     foreground: &Arc<std::sync::atomic::AtomicUsize>,
-    image_ids: &[String],
+    images: &[TagQueueImage],
     progress: &Arc<Mutex<BackgroundScanProgress>>,
     pause_requested: &Arc<Mutex<bool>>,
     stop_requested: &Arc<Mutex<bool>>,
     wd_tagger_service: &Arc<Mutex<Option<WdTaggerService>>>,
 ) -> Result<(), String> {
-    if image_ids.is_empty() {
+    if images.is_empty() {
         return Ok(());
     }
 
@@ -332,12 +330,12 @@ pub(super) fn tag_images_with_wd_model(
         .map_err(|_| "WD tagger service state is locked".to_string())?;
     ensure_wd_tagger_service_started(&mut service_guard, &model_path, &tags_path, &script_path)?;
 
-    eprintln!("[wd-tag] queue size: {}", image_ids.len());
+    eprintln!("[wd-tag] queue size: {}", images.len());
 
     // 流水线：发送下一张图片的请求后再等待当前响应，
     // 让 Python 侧的预处理与 GPU 推理重叠；写库按批次单事务提交。
-    let total = image_ids.len();
-    let mut pending = std::collections::VecDeque::<(usize, String)>::new();
+    let total = images.len();
+    let mut pending = std::collections::VecDeque::<(usize, TagQueueImage)>::new();
     let mut read_idx = 0usize; // 下一张等待响应的图片
     let mut send_idx = 0usize; // 下一张待发送的图片
     let mut retried_current = false;
@@ -355,8 +353,8 @@ pub(super) fn tag_images_with_wd_model(
 
         // 保持管道深度为 2（一张推理中、一张预处理中）
         while send_idx < total && pending.len() < 2 {
-            let image_path = image_ids[send_idx].clone();
-            if !Path::new(&image_path).is_file() {
+            let image = images[send_idx].clone();
+            if !Path::new(&image.path).is_file() {
                 increment_scan_progress_failed(progress);
                 send_idx += 1;
                 continue;
@@ -366,13 +364,13 @@ pub(super) fn tag_images_with_wd_model(
                 &model_path,
                 &tags_path,
                 &script_path,
-                &image_path,
-                &image_path,
+                &image.id,
+                &image.path,
                 0.35,
                 0.85,
             ) {
                 Ok(()) => {
-                    pending.push_back((send_idx, image_path));
+                    pending.push_back((send_idx, image));
                     send_idx += 1;
                 }
                 Err(error) => {
@@ -388,7 +386,7 @@ pub(super) fn tag_images_with_wd_model(
             break;
         }
 
-        let (current_index, current_id) = pending.front().cloned().ok_or("模型请求队列为空")?;
+        let (current_index, current) = pending.front().cloned().ok_or("模型请求队列为空")?;
         read_idx = current_index;
         let read_result = {
             let service = service_guard
@@ -398,12 +396,12 @@ pub(super) fn tag_images_with_wd_model(
         };
         match read_result {
             Ok(result) => {
-                if result.image_id != current_id {
+                if result.image_id != current.id {
                     stop_python_child_service(&mut service_guard, |running| &mut running.child);
                     return Err("模型响应与图片请求不一致，已停止任务".into());
                 }
                 pending.pop_front();
-                pending_saves.push((current_id, result));
+                pending_saves.push((current.id, result));
                 read_idx += 1;
                 retried_current = false;
                 if pending_saves.len() >= TAG_SAVE_BATCH_SIZE {
@@ -689,11 +687,11 @@ pub(super) fn upsert_image_auto_tag(
     )
 }
 
-pub(super) fn collect_pending_tag_image_ids(conn: &Connection) -> Result<Vec<String>, String> {
+pub(super) fn collect_pending_tag_images(conn: &Connection) -> Result<Vec<TagQueueImage>, String> {
     let model_name = WD_TAGGER_MODEL_NAME;
     conn.prepare(
         "
-        SELECT images.id
+        SELECT images.id, images.path
         FROM images
         WHERE images.source = 'library'
           AND COALESCE(images.trashed, 0) = 0
@@ -706,8 +704,13 @@ pub(super) fn collect_pending_tag_image_ids(conn: &Connection) -> Result<Vec<Str
         ",
     )
     .and_then(|mut stmt| {
-        stmt.query_map(params![model_name], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()
+        stmt.query_map(params![model_name], |row| {
+            Ok(TagQueueImage {
+                id: row.get(0)?,
+                path: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
     })
     .map_err(|error| format!("Failed to collect pending tag images: {error}"))
 }
