@@ -202,6 +202,7 @@ impl PairCache {
         self.slots.capacity().saturating_mul(std::mem::size_of::<PairSlot>())
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.len
     }
@@ -619,10 +620,12 @@ impl Verifier {
             .set_max_bytes(pair_cache_budget(index_bytes));
     }
 
+    #[cfg(test)]
     pub(super) fn pair_cache_allocated_bytes(&self) -> usize {
         self.pair_cache.allocated_bytes()
     }
 
+    #[cfg(test)]
     pub(super) fn pair_cache_len(&self) -> usize {
         self.pair_cache.len()
     }
@@ -699,14 +702,17 @@ impl Verifier {
         self.pending_checks.len() + self.pending_verdicts.len()
     }
 
+    #[cfg(test)]
     pub(super) fn pair_check_transactions(&self) -> u64 {
         self.pair_check_transactions
     }
 
+    #[cfg(test)]
     pub(super) fn pair_check_rows(&self) -> u64 {
         self.pair_check_rows
     }
 
+    #[cfg(test)]
     pub(super) fn verdict_transactions(&self) -> u64 {
         self.verdict_transactions
     }

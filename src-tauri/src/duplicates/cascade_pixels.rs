@@ -5,11 +5,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
-    cell::Cell,
     fs::File,
     io::{BufReader, Seek, SeekFrom},
     path::Path,
 };
+
+#[cfg(test)]
+use std::cell::Cell;
 
 #[cfg(test)]
 thread_local! {
