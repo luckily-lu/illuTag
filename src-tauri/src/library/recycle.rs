@@ -543,6 +543,7 @@ fn delete_chunk(
     db: &Connection,
     state: &AppState,
     mover: &mut dyn FnMut(&[PathBuf]) -> Result<(), String>,
+    committed: &std::cell::Cell<bool>,
 ) -> Result<(), String> {
     let mut results = Vec::new();
     let mut ready = Vec::new();
@@ -624,6 +625,7 @@ fn delete_chunk(
     })();
     if let Err(e) = update { let _ = db.execute_batch("ROLLBACK"); return Err(e); }
     db.execute_batch("COMMIT").map_err(|e|e.to_string())?;
+    committed.set(true);
     outcomes(log, operation, &results)
 }
 fn restore_chunk(
@@ -633,6 +635,7 @@ fn restore_chunk(
     db: &Connection,
     state: &AppState,
     binding: &str,
+    committed: &std::cell::Cell<bool>,
 ) -> Result<(), String> {
     let _guard = state.write_lock.lock().map_err(|e| e.to_string())?;
     writable(state)?;
@@ -675,6 +678,7 @@ fn restore_chunk(
         return Err(e);
     }
     db.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+    committed.set(true);
     let tx = log.transaction().map_err(|e| e.to_string())?;
     let success = ready.len() + recovered.len();
     for item in ready.iter().chain(recovered.iter()) {
@@ -709,6 +713,22 @@ fn run_with(
         Ok(())
     })
 }
+struct MembershipCommitGuard<'a> {
+    state: &'a AppState,
+    committed: &'a std::cell::Cell<bool>,
+}
+impl Drop for MembershipCommitGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed.get() {
+            // The batch may have failed after a chunk was already durable
+            // (journal status, progress, final state). Invalidate exactly once
+            // here so stale gallery/vector/duplicate caches cannot survive.
+            let _ = api::invalidate_library_metadata(self.state);
+            invalidate_all_similarity_caches(self.state);
+            crate::duplicates::membership_invalidated(self.state);
+        }
+    }
+}
 fn run_with_batches(
     operation: &str,
     state: &AppState,
@@ -728,6 +748,11 @@ fn run_with_batches(
     if !["restore", "systemTrash"].contains(&action.as_str()) {
         return Err("回收批次尚未确认".into());
     }
+    let committed = std::cell::Cell::new(false);
+    let _membership_guard = MembershipCommitGuard {
+        state,
+        committed: &committed,
+    };
     log.execute(
         "UPDATE selections SET state='running',updated=?2 WHERE id=?1",
         params![operation, now_ms()],
@@ -758,7 +783,7 @@ fn run_with_batches(
                 return Err("图库已替换，停止此回收批次".into());
             }
             if action == "restore" {
-                restore_chunk(rows, operation, &mut log, &db, state, &binding)?;
+                restore_chunk(rows, operation, &mut log, &db, state, &binding, &committed)?;
                 if stamp.elapsed() >= Duration::from_millis(200) {
                     progress(&status(operation, state)?);
                     stamp = Instant::now();
@@ -772,7 +797,7 @@ fn run_with_batches(
                 if cache::db_binding(state)? != binding {
                     return Err("图库已替换，停止此回收批次".into());
                 }
-                delete_chunk(chunk, operation, &mut log, &db, state, mover)?;
+                delete_chunk(chunk, operation, &mut log, &db, state, mover, &committed)?;
                 drop(_guard);
                 if stamp.elapsed() >= Duration::from_millis(200) {
                     progress(&status(operation, state)?);
@@ -801,8 +826,6 @@ fn run_with_batches(
         params![operation, final_state, now_ms()],
     )
     .map_err(|e| e.to_string())?;
-    api::invalidate_library_metadata(state)?;
-    crate::duplicates::membership_invalidated(state);
     progress(&status(operation, state)?);
     work
 }

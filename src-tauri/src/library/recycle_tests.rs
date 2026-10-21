@@ -358,6 +358,73 @@ fn recycle_stops_between_small_batches_and_resumes_without_repeating_moves() {
     assert_eq!((done.succeeded, done.failed), (37, 0));
 }
 
+fn with_fake_clip_cache(state: &AppState) {
+    *state.clip_vector_cache.lock().unwrap() = Some(ClipImageVectorCache {
+        model_id: "synthetic".into(),
+        model_version: "v1".into(),
+        dimension: 2,
+        vectors: std::collections::HashMap::new(),
+    });
+}
+
+#[test]
+fn committed_restore_invalidates_similarity_cache_on_success() {
+    let f = Fixture::new(3);
+    let s = f.select();
+    f.confirm(&s.selection_id, "restore");
+    with_fake_clip_cache(&f.state);
+    let revision = *f.state.startup_cleanup_generation.lock().unwrap();
+    run_with(&s.selection_id, &f.state, &mut || Ok(()), &mut |_| {}, &mut |_| {
+        panic!("restore must not move files")
+    })
+    .unwrap();
+    assert!(f.state.clip_vector_cache.lock().unwrap().is_none());
+    assert!(*f.state.startup_cleanup_generation.lock().unwrap() > revision);
+}
+
+#[test]
+fn committed_restore_invalidates_caches_when_final_journal_update_fails() {
+    let f = Fixture::new(3);
+    let s = f.select();
+    f.confirm(&s.selection_id, "restore");
+    with_fake_clip_cache(&f.state);
+    let revision = *f.state.startup_cleanup_generation.lock().unwrap();
+    let log = journal(&f.state).unwrap();
+    log.execute_batch(
+        "CREATE TRIGGER reject_final_state BEFORE UPDATE OF state ON selections
+         WHEN NEW.state IN ('completed','partial','interrupted')
+         BEGIN SELECT RAISE(ABORT,'synthetic final update failure'); END;",
+    )
+    .unwrap();
+    drop(log);
+
+    let error = run_with(
+        &s.selection_id,
+        &f.state,
+        &mut || Ok(()),
+        &mut |_| {},
+        &mut |_| panic!("restore must not move files"),
+    )
+    .unwrap_err();
+    assert!(error.contains("synthetic final update failure"), "{error}");
+    assert!(
+        f.state.clip_vector_cache.lock().unwrap().is_none(),
+        "a committed chunk must invalidate the vector cache even if final bookkeeping fails"
+    );
+    assert!(
+        *f.state.startup_cleanup_generation.lock().unwrap() > revision,
+        "the gallery snapshot must be invalidated too"
+    );
+    let db = open_database(&f.state.database_path).unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM images WHERE trashed<>0", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "the first chunk was already committed"
+    );
+}
+
 #[test]
 fn recycle_batch_database_failure_repairs_only_recorded_moves() {
     let f = Fixture::new(4);
