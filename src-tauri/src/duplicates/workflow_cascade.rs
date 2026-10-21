@@ -114,6 +114,9 @@ fn classify_pool(
     }
     let controls = RefCell::new(control);
     let verifier = RefCell::new(verification_cache::Verifier::new(state, false)?);
+    verifier
+        .borrow_mut()
+        .configure_work_memory(index::estimate_memory_bytes(records.len()));
     verifier.borrow_mut().batch_writes = true;
     let analyses = RefCell::new(Vec::<(i64, i64, super::super::cascade_pixels::Analysis)>::new());
     let bits = RefCell::new(covered);
@@ -191,7 +194,7 @@ fn classify_pool(
         if analyses.borrow().len() >= 512 {
             flush_analyses(&mut **controls.borrow_mut())?;
         }
-        if verifier.borrow().pending_verdict_count() >= 256 {
+        if verifier.borrow().pending_write_count() >= 256 {
             verifier
                 .borrow_mut()
                 .flush_verdicts(&mut **controls.borrow_mut())?;

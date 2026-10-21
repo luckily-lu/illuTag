@@ -5,10 +5,26 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
+    cell::Cell,
     fs::File,
     io::{BufReader, Seek, SeekFrom},
     path::Path,
 };
+
+#[cfg(test)]
+thread_local! {
+    static DECODE_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_decode_count() {
+    DECODE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn decode_count() -> u64 {
+    DECODE_COUNT.with(Cell::get)
+}
 
 pub(super) const POLICY: &str = "illuTag-three-pass-v1";
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -37,6 +53,8 @@ fn decode(
     path: &Path,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<DynamicImage, Failure> {
+    #[cfg(test)]
+    DECODE_COUNT.with(|count| count.set(count.get() + 1));
     check().map_err(Failure::Control)?;
     let mut file = File::open(path).map_err(|_| Failure::Input("read_error"))?;
     let format = ImageReader::new(BufReader::new(&mut file))

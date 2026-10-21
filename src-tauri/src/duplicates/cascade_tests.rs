@@ -301,12 +301,175 @@ fn cascade_pair_cache_revalidates_the_source_before_reusing_an_answer() {
         .unwrap();
     assert_eq!(third.kind, "exact");
     assert_eq!(verifier.pair_cache_hits, 1);
+    assert!(verifier.pair_cache_allocated_bytes() > 0);
+    assert_eq!(verifier.pair_cache_len(), 1);
     assert!(
         verifier
             .check_cascade(1, 2, &f.state, &mut || Err("cancelled".into()))
             .is_err(),
         "a cache hit must still honour cancellation"
     );
+}
+
+#[test]
+fn byte_checks_use_the_bounded_batch_transaction_instead_of_per_pair_autocommit() {
+    let f = Fixture::new(25);
+    f.run().unwrap();
+    let mut verifier = super::verification_cache::Verifier::new(&f.state, true).unwrap();
+    verifier.batch_writes = true;
+    let mut pairs = 0;
+    for a in 1..=25_i64 {
+        for b in (a + 1)..=25_i64 {
+            let answer = verifier
+                .check_cascade(a, b, &f.state, &mut || Ok(()))
+                .unwrap();
+            assert_eq!(answer.kind, "exact");
+            pairs += 1;
+        }
+    }
+    verifier.flush_verdicts(&mut || Ok(())).unwrap();
+    assert_eq!(pairs, 300);
+    assert_eq!(
+        verifier.pair_check_rows(),
+        300,
+        "all byte checks must reach the same bounded buffer"
+    );
+    assert_eq!(
+        verifier.pair_check_transactions(),
+        2,
+        "300 checks should commit in two batches (256 + 44), not 300 autocommits"
+    );
+    assert_eq!(
+        verifier.verdict_transactions(),
+        0,
+        "the byte-identical path must not create per-pair verdict transactions"
+    );
+    drop(verifier);
+    let conn = cache::open_existing(&f.state, true).unwrap();
+    let stored: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pair_checks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(stored, 300);
+}
+
+#[test]
+#[ignore = "explicit synthetic cascade performance matrix; never reads production data"]
+fn benchmark_cascade_matrix() {
+    use std::time::Instant;
+
+    let f = Fixture::new(45);
+    for (n, path) in f.paths.iter().enumerate() {
+        let shift = n as u32;
+        RgbImage::from_fn(320, 240, |x, y| {
+            Rgb([
+                ((x * 7 + y * 11 + shift) % 256) as u8,
+                ((x * 2 + y * 5 + shift * 3) % 256) as u8,
+                ((x * 13 + y * 3 + shift * 7) % 256) as u8,
+            ])
+        })
+        .save(path)
+        .unwrap();
+    }
+    let db = rusqlite::Connection::open(&f.state.database_path).unwrap();
+    for (index, path) in f.paths.iter().enumerate() {
+        db.execute(
+            "UPDATE images SET width=320,height=240,file_size=?2,modified_at=?3 WHERE image_pk=?1",
+            params![
+                index as i64 + 1,
+                fs::metadata(path).unwrap().len() as i64,
+                crate::duplicates::fingerprint::source_signature(path)
+                    .unwrap()
+                    .modified_ns
+                    / 1_000_000
+            ],
+        )
+        .unwrap();
+    }
+    drop(db);
+    f.run().unwrap();
+    let images: Vec<i64> = (1..=45).collect();
+    let pairs: Vec<(i64, i64)> = images
+        .iter()
+        .enumerate()
+        .flat_map(|(index, &a)| images[index + 1..].iter().map(move |&b| (a, b)))
+        .collect();
+    assert_eq!(pairs.len(), 990);
+
+    let out = std::env::var_os("ILLUTAG_BENCH_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("illutag-bench"));
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("cascade.pid"), std::process::id().to_string()).unwrap();
+
+    let run = |verifier: &mut super::verification_cache::Verifier,
+               subset: &[(i64, i64)]|
+     -> serde_json::Value {
+        super::cascade_pixels::reset_decode_count();
+        let hits_before = verifier.pair_cache_hits;
+        let checks_before = verifier.pair_check_transactions();
+        let verdicts_before = verifier.verdict_transactions();
+        let started = Instant::now();
+        for &(a, b) in subset {
+            verifier
+                .check_cascade(a, b, &f.state, &mut || Ok(()))
+                .unwrap();
+        }
+        verifier.flush_verdicts(&mut || Ok(())).unwrap();
+        serde_json::json!({
+            "pairs": subset.len(),
+            "elapsed_ms": started.elapsed().as_millis(),
+            "decodes": super::cascade_pixels::decode_count(),
+            "pair_cache_hits": verifier.pair_cache_hits - hits_before,
+            "pair_cache_bytes": verifier.pair_cache_allocated_bytes(),
+            "pair_check_transactions": verifier.pair_check_transactions() - checks_before,
+            "verdict_transactions": verifier.verdict_transactions() - verdicts_before,
+        })
+    };
+
+    let mut cold = super::verification_cache::Verifier::new(&f.state, true).unwrap();
+    cold.configure_work_memory(index::estimate_memory_bytes(45));
+    cold.batch_writes = true;
+    let cold_stats = run(&mut cold, &pairs);
+    let hot_stats = run(&mut cold, &pairs);
+    drop(cold);
+
+    let mut dense = super::verification_cache::Verifier::new(&f.state, false).unwrap();
+    dense.configure_work_memory(index::estimate_memory_bytes(45));
+    dense.batch_writes = true;
+    let dense_stats = run(&mut dense, &pairs);
+    drop(dense);
+
+    let mut partial = super::verification_cache::Verifier::new(&f.state, true).unwrap();
+    partial.configure_work_memory(index::estimate_memory_bytes(45));
+    partial.batch_writes = true;
+    for &(a, b) in &pairs[..400] {
+        partial
+            .check_cascade(a, b, &f.state, &mut || Ok(()))
+            .unwrap();
+    }
+    partial.flush_verdicts(&mut || Ok(())).unwrap();
+    drop(partial);
+    let mut resumed = super::verification_cache::Verifier::new(&f.state, false).unwrap();
+    resumed.configure_work_memory(index::estimate_memory_bytes(45));
+    resumed.batch_writes = true;
+    let resume_stats = run(&mut resumed, &pairs);
+
+    let result = serde_json::json!({
+        "pid": std::process::id(),
+        "images": images.len(),
+        "pairs": pairs.len(),
+        "pair_cache_budget_bytes": super::verification_cache::pair_cache_budget(
+            index::estimate_memory_bytes(45)
+        ),
+        "cold": cold_stats,
+        "hot": hot_stats,
+        "dense_persisted": dense_stats,
+        "resume": resume_stats,
+        "peak_working_set_bytes": null,
+    });
+    let path = out.join(format!("cascade-{}.json", std::process::id()));
+    fs::write(&path, serde_json::to_string_pretty(&result).unwrap()).unwrap();
+    println!("BENCH_RESULT={}", path.display());
 }
 
 #[test]

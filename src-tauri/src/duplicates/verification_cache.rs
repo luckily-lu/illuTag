@@ -6,7 +6,6 @@ use super::{
 use crate::library::AppState;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::path::Path;
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pair_checks(
@@ -26,12 +25,16 @@ pub(super) struct Verifier {
     pending: Vec<PendingEvidence>,
     evidence_ready: bool,
     /// Source-version keyed answers for repeated/reverse pairs in one run.
-    pair_cache: HashMap<(i64, i64), (PairToken, PairToken, super::cascade_pixels::Analysis)>,
-    pair_cache_bytes: usize,
+    pair_cache: PairCache,
     pub(super) pair_cache_hits: u64,
     /// Cascade workflow batches verdict writes through `flush_verdicts`.
     pub(super) batch_writes: bool,
     pending_verdicts: Vec<PendingVerdict>,
+    /// Byte-equality checks share the same bounded write transaction.
+    pending_checks: Vec<PendingCheck>,
+    pair_check_transactions: u64,
+    pair_check_rows: u64,
+    verdict_transactions: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -40,6 +43,260 @@ struct PairToken {
     sha: [u8; 32],
 }
 
+#[derive(Clone, Copy)]
+struct CachedAnswer {
+    kind: u8,
+    reason: u8,
+    strict: bool,
+}
+
+const CACHED_EXACT: u8 = 1;
+const CACHED_NEAR: u8 = 2;
+const CACHED_SIMILAR: u8 = 3;
+
+fn cached_kind(kind: &str) -> Option<u8> {
+    match kind {
+        "exact" => Some(CACHED_EXACT),
+        "near" => Some(CACHED_NEAR),
+        "similar" => Some(CACHED_SIMILAR),
+        _ => None,
+    }
+}
+
+fn cached_kind_name(code: u8) -> &'static str {
+    match code {
+        CACHED_EXACT => "exact",
+        CACHED_NEAR => "near",
+        _ => "similar",
+    }
+}
+
+fn cached_reason(reason: &str) -> Option<u8> {
+    Some(match reason {
+        "all_native_samples_equal" => 1,
+        "multiscale_content_passed" => 2,
+        "alpha_detail_difference" => 3,
+        "aspect_ratio_difference" => 4,
+        "color_variant" => 5,
+        "global_pixel_difference" => 6,
+        "local_detail_difference" => 7,
+        "measured_detail_difference" => 8,
+        "byte_identical" => 9,
+        _ => return None,
+    })
+}
+
+fn cached_reason_name(code: u8) -> &'static str {
+    match code {
+        1 => "all_native_samples_equal",
+        2 => "multiscale_content_passed",
+        3 => "alpha_detail_difference",
+        4 => "aspect_ratio_difference",
+        5 => "color_variant",
+        6 => "global_pixel_difference",
+        7 => "local_detail_difference",
+        8 => "measured_detail_difference",
+        _ => "byte_identical",
+    }
+}
+
+impl CachedAnswer {
+    fn from_analysis(answer: &super::cascade_pixels::Analysis) -> Option<Self> {
+        Some(Self {
+            kind: cached_kind(&answer.kind)?,
+            reason: cached_reason(&answer.reason)?,
+            strict: answer.strict,
+        })
+    }
+
+    fn into_analysis(self) -> super::cascade_pixels::Analysis {
+        super::cascade_pixels::Analysis::new(
+            cached_kind_name(self.kind),
+            cached_reason_name(self.reason),
+            self.strict,
+        )
+    }
+}
+
+const SLOT_EMPTY: u8 = 0;
+const SLOT_OCCUPIED: u8 = 1;
+const SLOT_TOMBSTONE: u8 = 2;
+
+#[derive(Clone, Copy)]
+struct PairSlot {
+    key: (i64, i64),
+    left: PairToken,
+    right: PairToken,
+    answer: CachedAnswer,
+    state: u8,
+}
+
+const EMPTY_SLOT: PairSlot = PairSlot {
+    key: (0, 0),
+    left: PairToken {
+        signature: [0; 32],
+        sha: [0; 32],
+    },
+    right: PairToken {
+        signature: [0; 32],
+        sha: [0; 32],
+    },
+    answer: CachedAnswer {
+        kind: 0,
+        reason: 0,
+        strict: false,
+    },
+    state: SLOT_EMPTY,
+};
+
+/// Fixed-capacity open-addressed table. The backing allocation is the hard
+/// limit: entries never grow a heap map beyond the configured bytes, and
+/// eviction keeps the same accounted allocation instead of pretending the
+/// memory was released.
+struct PairCache {
+    slots: Vec<PairSlot>,
+    len: usize,
+    used: usize,
+    max_bytes: usize,
+}
+
+const PAIR_CACHE_DEFAULT_BYTES: usize = 8 * 1024 * 1024;
+const PAIR_CACHE_MAX_BYTES: usize = 96 * 1024 * 1024;
+const PAIR_CACHE_LOAD_PERCENT: usize = 76;
+const WORK_MEMORY_BUDGET_BYTES: usize = super::index::MEMORY_BUDGET_BYTES as usize;
+const WORK_MEMORY_HEADROOM_BYTES: usize = 24 * 1024 * 1024;
+
+pub(super) fn pair_cache_budget(index_bytes: u64) -> usize {
+    let index_bytes = usize::try_from(index_bytes).unwrap_or(usize::MAX);
+    let remaining = WORK_MEMORY_BUDGET_BYTES
+        .saturating_sub(index_bytes)
+        .saturating_sub(WORK_MEMORY_HEADROOM_BYTES);
+    (remaining / 3).min(PAIR_CACHE_MAX_BYTES)
+}
+
+impl PairCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            slots: Vec::new(),
+            len: 0,
+            used: 0,
+            max_bytes,
+        }
+    }
+
+    fn set_max_bytes(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes;
+        if self.allocated_bytes() > max_bytes {
+            self.clear_and_release();
+        }
+        if self.max_slots() == 0 {
+            self.clear_and_release();
+        }
+    }
+
+    fn max_slots(&self) -> usize {
+        self.max_bytes / std::mem::size_of::<PairSlot>()
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.slots.capacity().saturating_mul(std::mem::size_of::<PairSlot>())
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn clear_and_release(&mut self) {
+        self.slots = Vec::new();
+        self.len = 0;
+        self.used = 0;
+    }
+
+    fn clear_entries(&mut self) {
+        self.slots.fill(EMPTY_SLOT);
+        self.len = 0;
+        self.used = 0;
+    }
+
+    fn hash(key: (i64, i64)) -> usize {
+        let mut value = (key.0 as u64) ^ (key.1 as u64).rotate_left(32);
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        value as usize
+    }
+
+    fn probe(&self, key: (i64, i64)) -> (usize, bool) {
+        if self.slots.is_empty() {
+            return (0, false);
+        }
+        let start = Self::hash(key) % self.slots.len();
+        for step in 0..self.slots.len() {
+            let index = (start + step) % self.slots.len();
+            let slot = &self.slots[index];
+            if slot.state == SLOT_EMPTY {
+                return (index, false);
+            }
+            if slot.state == SLOT_OCCUPIED && slot.key == key {
+                return (index, true);
+            }
+        }
+        (start, false)
+    }
+
+    fn get(&mut self, key: (i64, i64), left: PairToken, right: PairToken) -> Option<CachedAnswer> {
+        let (index, found) = self.probe(key);
+        if !found {
+            return None;
+        }
+        let slot = self.slots[index];
+        if slot.left == left && slot.right == right {
+            return Some(slot.answer);
+        }
+        self.slots[index].state = SLOT_TOMBSTONE;
+        self.len = self.len.saturating_sub(1);
+        None
+    }
+
+    fn insert(&mut self, key: (i64, i64), left: PairToken, right: PairToken, answer: CachedAnswer) {
+        if self.slots.is_empty() {
+            let slots = self.max_slots();
+            if slots == 0 {
+                return;
+            }
+            self.slots = vec![EMPTY_SLOT; slots];
+        }
+        if (self.used + 1) * 100 > self.slots.len() * PAIR_CACHE_LOAD_PERCENT {
+            self.clear_entries();
+        }
+        let (index, found) = self.probe(key);
+        if found {
+            self.slots[index] = PairSlot {
+                key,
+                left,
+                right,
+                answer,
+                state: SLOT_OCCUPIED,
+            };
+            return;
+        }
+        if self.slots[index].state == SLOT_EMPTY {
+            self.used += 1;
+        }
+        self.slots[index] = PairSlot {
+            key,
+            left,
+            right,
+            answer,
+            state: SLOT_OCCUPIED,
+        };
+        self.len += 1;
+    }
+}
+
+#[derive(Clone)]
 struct PendingVerdict {
     a: i64,
     b: i64,
@@ -50,8 +307,18 @@ struct PendingVerdict {
     answer: super::cascade_pixels::Analysis,
 }
 
-const PAIR_CACHE_MAX_BYTES: usize = 96 * 1024 * 1024;
-const PAIR_CACHE_ENTRY_BYTES: usize = 192;
+struct PendingCheck {
+    a: i64,
+    b: i64,
+    kind: i64,
+    left_signature: Vec<u8>,
+    right_signature: Vec<u8>,
+    left_sha: Vec<u8>,
+    right_sha: Vec<u8>,
+    outcome: i64,
+}
+
+const CHECK_BUFFER_MAX: usize = 256;
 
 struct PendingEvidence {
     a: i64,
@@ -96,11 +363,14 @@ impl Verifier {
             uncertain: 0,
             pending: Vec::new(),
             evidence_ready: false,
-            pair_cache: HashMap::new(),
-            pair_cache_bytes: 0,
+            pair_cache: PairCache::new(PAIR_CACHE_DEFAULT_BYTES),
             pair_cache_hits: 0,
             batch_writes: false,
             pending_verdicts: Vec::new(),
+            pending_checks: Vec::new(),
+            pair_check_transactions: 0,
+            pair_check_rows: 0,
+            verdict_transactions: 0,
         })
     }
 
@@ -130,6 +400,30 @@ impl Verifier {
         })
     }
 
+    fn pending_check_outcome(
+        &self,
+        a: i64,
+        b: i64,
+        exact: bool,
+        left: &Source,
+        right: &Source,
+    ) -> Option<VerificationOutcome> {
+        let pending = self.pending_checks.iter().find(|check| {
+            check.a == a
+                && check.b == b
+                && check.kind == exact as i64
+                && check.left_signature == left.signature
+                && check.right_signature == right.signature
+                && check.left_sha == left.sha
+                && check.right_sha == right.sha
+        })?;
+        Some(match (pending.outcome, exact) {
+            (1, true) => VerificationOutcome::Identical,
+            (1, false) => VerificationOutcome::Equivalent,
+            _ => VerificationOutcome::Variant("cached_local_difference"),
+        })
+    }
+
     pub fn check(
         &mut self,
         a: i64,
@@ -152,46 +446,68 @@ impl Verifier {
         };
         // Byte-identical candidates need no image decoding, including tiny/animated files.
         let exact = exact || left.sha == right.sha;
-        let cached: Option<i64> = self.conn.query_row(
+        let outcome = if let Some(outcome) =
+            self.pending_check_outcome(a, b, exact, &left, &right)
+        {
+            outcome
+        } else {
+            let cached: Option<i64> = self.conn.query_row(
             "SELECT outcome FROM pair_checks WHERE a=?1 AND b=?2 AND kind=?3 AND a_signature=?4 AND b_signature=?5 AND a_sha=?6 AND b_sha=?7 AND algorithm=?8",
             params![a,b,exact as i64,left.signature,right.signature,left.sha,right.sha,version(exact)],
             |r| r.get(0),
         ).optional().map_err(|e| e.to_string())?;
-        let outcome = match cached {
-            Some(1) if exact => VerificationOutcome::Identical,
-            Some(1) => VerificationOutcome::Equivalent,
-            Some(0) => VerificationOutcome::Variant("cached_local_difference"),
-            _ => {
-                let outcome = verification::verify_pair(
-                    Path::new(&left.path),
-                    Path::new(&right.path),
-                    exact,
-                    control,
-                )?;
-                // Decoder errors/offline files are retryable, not permanent negative decisions.
-                if !matches!(outcome, VerificationOutcome::Uncertain(_)) {
-                    if self.checks % 64 == 0 {
-                        cache::check_disk(&cache::cache_path(state))?;
-                    }
-                    cache::controlled_write(&self.conn, control, || {
-                        self.conn.execute(
-                            "INSERT OR REPLACE INTO pair_checks VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                            params![
+            match cached {
+                Some(1) if exact => VerificationOutcome::Identical,
+                Some(1) => VerificationOutcome::Equivalent,
+                Some(0) => VerificationOutcome::Variant("cached_local_difference"),
+                _ => {
+                    let outcome = verification::verify_pair(
+                        Path::new(&left.path),
+                        Path::new(&right.path),
+                        exact,
+                        control,
+                    )?;
+                    // Decoder errors/offline files are retryable, not permanent negative decisions.
+                    if !matches!(outcome, VerificationOutcome::Uncertain(_)) {
+                        if self.checks % 64 == 0 {
+                            cache::check_disk(&cache::cache_path(state))?;
+                        }
+                        if self.batch_writes {
+                            if self.pending_checks.len() >= CHECK_BUFFER_MAX {
+                                self.flush_verdicts(control)?;
+                            }
+                            self.pending_checks.push(PendingCheck {
                                 a,
                                 b,
-                                exact as i64,
-                                left.signature,
-                                right.signature,
-                                left.sha,
-                                right.sha,
-                                version(exact),
-                                outcome.is_equivalent() as i64
-                            ],
-                        )
-                    })
-                    .map_err(|e| format!("保存细节复核缓存失败：{e}"))?;
+                                kind: exact as i64,
+                                left_signature: left.signature.clone(),
+                                right_signature: right.signature.clone(),
+                                left_sha: left.sha.clone(),
+                                right_sha: right.sha.clone(),
+                                outcome: outcome.is_equivalent() as i64,
+                            });
+                        } else {
+                            cache::controlled_write(&self.conn, control, || {
+                                self.conn.execute(
+                                    "INSERT OR REPLACE INTO pair_checks VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                                    params![
+                                        a,
+                                        b,
+                                        exact as i64,
+                                        left.signature,
+                                        right.signature,
+                                        left.sha,
+                                        right.sha,
+                                        version(exact),
+                                        outcome.is_equivalent() as i64
+                                    ],
+                                )
+                            })
+                            .map_err(|e| format!("保存细节复核缓存失败：{e}"))?;
+                        }
+                    }
+                    outcome
                 }
-                outcome
             }
         };
         self.checks += 1;
@@ -266,21 +582,9 @@ impl Verifier {
     ) -> Option<super::cascade_pixels::Analysis> {
         let key = Self::pair_key(a, b);
         let tokens = (Self::source_token(left)?, Self::source_token(right)?);
-        match self.pair_cache.get(&key) {
-            Some((saved_left, saved_right, answer))
-                if *saved_left == tokens.0 && *saved_right == tokens.1 =>
-            {
-                Some(answer.clone())
-            }
-            Some(_) => {
-                self.pair_cache.remove(&key);
-                self.pair_cache_bytes = self
-                    .pair_cache_bytes
-                    .saturating_sub(PAIR_CACHE_ENTRY_BYTES);
-                None
-            }
-            None => None,
-        }
+        self.pair_cache
+            .get(key, tokens.0, tokens.1)
+            .map(CachedAnswer::into_analysis)
     }
 
     fn remember_pair(
@@ -296,46 +600,75 @@ impl Verifier {
         else {
             return;
         };
-        let key = Self::pair_key(a, b);
-        if self.pair_cache.contains_key(&key) {
-            self.pair_cache.remove(&key);
-            self.pair_cache_bytes = self
-                .pair_cache_bytes
-                .saturating_sub(PAIR_CACHE_ENTRY_BYTES);
-        }
-        if self.pair_cache_bytes + PAIR_CACHE_ENTRY_BYTES > PAIR_CACHE_MAX_BYTES {
-            self.pair_cache.clear();
-            self.pair_cache_bytes = 0;
-        }
+        let Some(answer) = CachedAnswer::from_analysis(answer) else {
+            return;
+        };
         self.pair_cache
-            .insert(key, (left_token, right_token, answer.clone()));
-        self.pair_cache_bytes += PAIR_CACHE_ENTRY_BYTES;
+            .insert(Self::pair_key(a, b), left_token, right_token, answer);
+    }
+
+    /// Fit the pair cache inside the remaining 512 MiB duplicate-work budget.
+    /// The low-level table charges its actual Vec capacity, not an entry guess.
+    pub(super) fn configure_work_memory(&mut self, index_bytes: u64) {
+        self.pair_cache
+            .set_max_bytes(pair_cache_budget(index_bytes));
+    }
+
+    pub(super) fn pair_cache_allocated_bytes(&self) -> usize {
+        self.pair_cache.allocated_bytes()
+    }
+
+    pub(super) fn pair_cache_len(&self) -> usize {
+        self.pair_cache.len()
     }
 
     pub(super) fn flush_verdicts(
         &mut self,
         control: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<(), String> {
-        if self.pending_verdicts.is_empty() {
+        if self.pending_verdicts.is_empty() && self.pending_checks.is_empty() {
             return Ok(());
         }
+        let check_rows = self.pending_checks.len() as u64;
+        let verdict_rows = self.pending_verdicts.len();
         cache::controlled_write(&self.conn, control, || {
             self.conn.execute_batch("BEGIN IMMEDIATE")
         })?;
         let mut failure = None;
-        for verdict in &self.pending_verdicts {
-            if let Err(error) = super::cascade_store::insert_in_transaction(
-                &self.conn,
-                verdict.a,
-                verdict.b,
-                &verdict.left_signature,
-                &verdict.right_signature,
-                &verdict.left_sha,
-                &verdict.right_sha,
-                &verdict.answer,
+        for check in &self.pending_checks {
+            if let Err(error) = self.conn.execute(
+                "INSERT OR REPLACE INTO pair_checks VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    check.a,
+                    check.b,
+                    check.kind,
+                    check.left_signature,
+                    check.right_signature,
+                    check.left_sha,
+                    check.right_sha,
+                    version(check.kind != 0),
+                    check.outcome
+                ],
             ) {
-                failure = Some(error);
+                failure = Some(format!("保存细节复核缓存失败：{error}"));
                 break;
+            }
+        }
+        if failure.is_none() {
+            for verdict in &self.pending_verdicts {
+                if let Err(error) = super::cascade_store::insert_in_transaction(
+                    &self.conn,
+                    verdict.a,
+                    verdict.b,
+                    &verdict.left_signature,
+                    &verdict.right_signature,
+                    &verdict.left_sha,
+                    &verdict.right_sha,
+                    &verdict.answer,
+                ) {
+                    failure = Some(error);
+                    break;
+                }
             }
         }
         if let Some(error) = failure {
@@ -345,8 +678,32 @@ impl Verifier {
         self.conn
             .execute_batch("COMMIT")
             .map_err(|error| error.to_string())?;
+        self.pending_checks.clear();
         self.pending_verdicts.clear();
+        if check_rows > 0 {
+            self.pair_check_transactions += 1;
+            self.pair_check_rows += check_rows;
+        }
+        if verdict_rows > 0 {
+            self.verdict_transactions += 1;
+        }
         Ok(())
+    }
+
+    pub(super) fn pending_write_count(&self) -> usize {
+        self.pending_checks.len() + self.pending_verdicts.len()
+    }
+
+    pub(super) fn pair_check_transactions(&self) -> u64 {
+        self.pair_check_transactions
+    }
+
+    pub(super) fn pair_check_rows(&self) -> u64 {
+        self.pair_check_rows
+    }
+
+    pub(super) fn verdict_transactions(&self) -> u64 {
+        self.verdict_transactions
     }
 
     fn queue_verdict(
@@ -367,10 +724,6 @@ impl Verifier {
             answer: answer.clone(),
         });
         Ok(())
-    }
-
-    pub(super) fn pending_verdict_count(&self) -> usize {
-        self.pending_verdicts.len()
     }
 
     pub(super) fn check_cascade(
@@ -595,4 +948,88 @@ pub(super) fn accepted_cached(
     }
     conn.query_row("SELECT EXISTS(SELECT 1 FROM pair_checks p JOIN fingerprints a ON a.image_pk=p.a JOIN fingerprints b ON b.image_pk=p.b WHERE p.a=?1 AND p.b=?2 AND p.kind=?3 AND p.algorithm=?4 AND p.outcome=1 AND a.signature=p.a_signature AND b.signature=p.b_signature AND a.sha=p.a_sha AND b.sha=p.b_sha)",
         params![a,b,exact as i64,version(exact)], |r|r.get(0)).map_err(|e|e.to_string())
+}
+
+#[cfg(test)]
+mod pair_cache_tests {
+    use super::*;
+
+    fn token(byte: u8) -> PairToken {
+        PairToken {
+            signature: [byte; 32],
+            sha: [byte.wrapping_add(1); 32],
+        }
+    }
+
+    fn answer() -> CachedAnswer {
+        CachedAnswer {
+            kind: CACHED_SIMILAR,
+            reason: 7,
+            strict: false,
+        }
+    }
+
+    #[test]
+    fn allocation_is_the_limit_and_eviction_keeps_it_counted() {
+        let mut cache = PairCache::new(1024 * 1024);
+        for n in 0..50_000_i64 {
+            cache.insert((n, n + 1), token(1), token(2), answer());
+        }
+        assert!(
+            cache.allocated_bytes() <= 1024 * 1024,
+            "allocated {}",
+            cache.allocated_bytes()
+        );
+        assert_eq!(
+            cache.allocated_bytes(),
+            cache.slots.capacity() * std::mem::size_of::<PairSlot>()
+        );
+        assert!(cache.len() <= cache.slots.len() * PAIR_CACHE_LOAD_PERCENT / 100);
+        let allocated = cache.allocated_bytes();
+        cache.clear_entries();
+        assert_eq!(cache.len(), 0);
+        assert_eq!(
+            cache.allocated_bytes(),
+            allocated,
+            "retained capacity must stay in the byte accounting, not become zero"
+        );
+    }
+
+    #[test]
+    fn changed_tokens_are_not_served_from_the_pair_cache() {
+        let mut cache = PairCache::new(1024 * 1024);
+        cache.insert((1, 2), token(1), token(2), answer());
+        assert!(cache.get((1, 2), token(1), token(2)).is_some());
+        assert!(cache.get((1, 2), token(1), token(9)).is_none());
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn dense_thousand_image_pair_set_fits_the_real_capacity() {
+        let mut cache = PairCache::new(96 * 1024 * 1024);
+        for a in 0..1000_i64 {
+            for b in (a + 1)..1000_i64 {
+                cache.insert((a, b), token(1), token(2), answer());
+            }
+        }
+        assert!(
+            cache.allocated_bytes() <= 96 * 1024 * 1024,
+            "allocated {}",
+            cache.allocated_bytes()
+        );
+        assert_eq!(cache.len(), 499_500);
+    }
+
+    #[test]
+    fn pair_cache_budget_stays_inside_the_work_memory_budget() {
+        assert_eq!(pair_cache_budget(0), 96 * 1024 * 1024);
+        let index = super::super::index::estimate_memory_bytes(800_000);
+        let cache = pair_cache_budget(index);
+        assert!(cache > 0);
+        assert!(
+            cache + index as usize + WORK_MEMORY_HEADROOM_BYTES
+                <= WORK_MEMORY_BUDGET_BYTES
+        );
+        assert_eq!(pair_cache_budget(u64::MAX), 0);
+    }
 }
