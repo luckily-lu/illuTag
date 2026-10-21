@@ -185,6 +185,68 @@ fn claim_retry_recovers_without_a_new_enqueue_and_keeps_fifo_order() {
 }
 
 #[test]
+fn idle_exit_cannot_lose_a_job_enqueued_in_the_same_gate_window() {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    let f = Fixture::new();
+    *f.state.jobs.running.lock().unwrap() = true;
+    let spawns = Arc::new(AtomicUsize::new(0));
+
+    // A dispatcher observed the empty queue and is waiting to relinquish. Hold
+    // the gate so the enqueue happens exactly inside the old race window.
+    let gate = f.state.jobs.gate.lock().unwrap();
+    let state = f.state.clone();
+    let relinquish = std::thread::spawn(move || relinquish_dispatch_if_idle(&state));
+
+    f.state
+        .jobs
+        .queue
+        .lock()
+        .unwrap()
+        .push_back("late".into());
+    ensure_dispatch_with(&f.state, || {
+        spawns.fetch_add(1, AtomicOrdering::SeqCst);
+    });
+    drop(gate);
+
+    assert!(
+        !relinquish.join().unwrap(),
+        "the dispatcher must see the late job and keep running"
+    );
+    assert!(*f.state.jobs.running.lock().unwrap());
+    assert_eq!(
+        spawns.load(AtomicOrdering::SeqCst),
+        0,
+        "the existing dispatcher must continue; a second one would duplicate work"
+    );
+    assert_eq!(
+        *f.state.jobs.queue.lock().unwrap(),
+        VecDeque::from(["late".to_string()]),
+        "the job must remain executable without another enqueue"
+    );
+
+    // Drain the job, then verify the normal idle exit still spawns exactly one
+    // dispatcher for the next enqueue.
+    f.state.jobs.queue.lock().unwrap().clear();
+    assert!(relinquish_dispatch_if_idle(&f.state));
+    assert!(!*f.state.jobs.running.lock().unwrap());
+
+    let _gate = f.state.jobs.gate.lock().unwrap();
+    f.state
+        .jobs
+        .queue
+        .lock()
+        .unwrap()
+        .push_back("next".into());
+    ensure_dispatch_with(&f.state, || {
+        spawns.fetch_add(1, AtomicOrdering::SeqCst);
+    });
+    drop(_gate);
+    assert_eq!(spawns.load(AtomicOrdering::SeqCst), 1);
+    assert!(*f.state.jobs.running.lock().unwrap());
+}
+
+#[test]
 fn claim_retry_can_be_cancelled_during_backoff() {
     let f = Fixture::new();
     f.add(row("waiting", "queued"));
@@ -231,6 +293,40 @@ fn claim_backoff_is_bounded_and_sliced_for_cancellation() {
     assert_eq!(claim_backoff(20), Duration::from_secs(30));
     let f = Fixture::new();
     wait_for_claim(&f.state, Duration::from_millis(20));
+}
+
+#[test]
+fn queued_cancel_reports_a_busy_database_without_dropping_the_fifo_entry() {
+    let f = Fixture::new();
+    f.add(row("blocked", "queued"));
+    f.state
+        .jobs
+        .queue
+        .lock()
+        .unwrap()
+        .push_back("blocked".into());
+    let conn = database(&f.state).unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    let error = f
+        .state
+        .jobs
+        .cancel_queued_locked("blocked", &f.state, |_| {})
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "queued cancel must not wait for the default 30s timeout: {error}"
+    );
+    assert!(error.contains("稍后重试"), "{error}");
+    assert_eq!(f.state.jobs.find("blocked").unwrap().state, "queued");
+    assert_eq!(*f.state.jobs.queue.lock().unwrap(), VecDeque::from(["blocked".to_string()]));
+    conn.execute_batch("ROLLBACK").unwrap();
+    f.state
+        .jobs
+        .cancel_queued_locked("blocked", &f.state, |_| {})
+        .unwrap();
+    assert_eq!(f.state.jobs.find("blocked").unwrap().state, "cancelled");
+    assert!(f.state.jobs.queue.lock().unwrap().is_empty());
 }
 
 #[test]

@@ -295,7 +295,19 @@ impl JobRuntime {
         if self.find(id)?.state != "queued" {
             return Err("任务已经开始".into());
         }
-        self.commit_locked(id, state, publish, |r| r.state = "cancelled".into())?;
+        // A queued cancel must not sit behind the default 30s SQLite timeout.
+        // If persistence cannot complete quickly, keep the FIFO entry and tell
+        // the user instead of showing a frozen cancellation.
+        self.commit_with_timeout_locked(
+            id,
+            state,
+            publish,
+            |r| r.state = "cancelled".into(),
+            Some(Duration::from_millis(750)),
+        )
+        .map_err(|error| {
+            format!("取消请求未能保存（{error}），任务仍在等待队列，请稍后重试")
+        })?;
         self.queue
             .lock()
             .map_err(|e| e.to_string())?

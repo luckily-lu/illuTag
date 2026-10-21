@@ -240,14 +240,41 @@ pub(crate) fn start_job_locked(
     Ok(record)
 }
 
-// Caller holds gate, including the idle/enqueue boundary.
+// Caller holds gate, including the idle/enqueue boundary. The spawn itself is
+// injectable so the hand-off can be tested without an AppHandle.
 fn ensure_dispatch(state: &AppState, app: AppHandle) {
+    let spawn_state = state.clone();
+    ensure_dispatch_with(state, move || {
+        thread::spawn(move || dispatch(spawn_state, app));
+    });
+}
+
+fn ensure_dispatch_with(state: &AppState, spawn: impl FnOnce()) {
     let mut running = state.jobs.running.lock().unwrap();
-    if !*running {
-        *running = true;
-        let state = state.clone();
-        thread::spawn(move || dispatch(state, app));
+    if *running {
+        return;
     }
+    *running = true;
+    drop(running);
+    spawn();
+}
+
+// Empty-queue observation and `running=false` are one gate-protected decision.
+// If a job arrived after claim_with_retry saw the empty queue, the caller keeps
+// the dispatcher alive and loops instead of losing the wake-up.
+fn relinquish_dispatch_if_idle(state: &AppState) -> bool {
+    let _gate = state.jobs.gate.lock().unwrap();
+    if !state
+        .jobs
+        .queue
+        .lock()
+        .map(|queue| queue.is_empty())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    *state.jobs.running.lock().unwrap() = false;
+    true
 }
 
 fn next_id() -> String {
@@ -353,8 +380,10 @@ fn dispatch(state: AppState, app: AppHandle) {
         ) {
             Ok(Some(record)) => record,
             Ok(None) => {
-                *state.jobs.running.lock().unwrap() = false;
-                return;
+                if relinquish_dispatch_if_idle(&state) {
+                    return;
+                }
+                continue;
             }
             Err(error) => {
                 eprintln!("[jobs-dispatch] {error}");
