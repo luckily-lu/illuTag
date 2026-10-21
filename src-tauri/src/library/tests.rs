@@ -399,6 +399,141 @@ fn image_folder_rows(conn: &Connection, image_path: &str) -> Vec<(i64, String)> 
     .unwrap()
 }
 
+struct FakeTagSession {
+    sends: std::collections::VecDeque<Result<(), String>>,
+    reads: std::collections::VecDeque<Result<WdTaggerTestResult, String>>,
+    sent_ids: Vec<String>,
+    restarts: usize,
+}
+impl TagSession for FakeTagSession {
+    fn send(&mut self, image: &TagQueueImage) -> Result<(), String> {
+        self.sent_ids.push(image.id.clone());
+        self.sends.pop_front().unwrap_or(Ok(()))
+    }
+    fn read(&mut self) -> Result<WdTaggerTestResult, String> {
+        self.reads.pop_front().unwrap_or_else(|| Err("no response".into()))
+    }
+    fn restart(&mut self) -> Result<(), String> {
+        self.restarts += 1;
+        Ok(())
+    }
+}
+fn wd_result(id: &str) -> WdTaggerTestResult {
+    WdTaggerTestResult {
+        image_id: id.into(),
+        ratings: vec![],
+        general_tags: vec![],
+        character_tags: vec![],
+        general_threshold: 0.35,
+        character_threshold: 0.85,
+        elapsed_ms: 0.0,
+    }
+}
+fn pipeline_images(f: &Fixture, count: usize) -> Vec<TagQueueImage> {
+    (0..count)
+        .map(|index| {
+            let path = f.root.join(format!("pipeline-{index}.png"));
+            fs::write(&path, b"pipeline fixture").unwrap();
+            TagQueueImage {
+                id: format!("image-{index}"),
+                path: path.to_string_lossy().into_owned(),
+            }
+        })
+        .collect()
+}
+fn run_fake_pipeline(
+    session: &mut FakeTagSession,
+    images: &[TagQueueImage],
+) -> (
+    Result<(), String>,
+    Vec<String>,
+    Vec<String>,
+    i64,
+) {
+    let mut saved = Vec::<String>::new();
+    let mut failures = Vec::<String>::new();
+    let mut saved_count = 0;
+    let result = run_tag_pipeline(
+        session,
+        images,
+        &mut || Ok(true),
+        &mut |batch| {
+            saved.extend(batch.iter().map(|(id, _)| id.clone()));
+            Ok(())
+        },
+        &mut |error| failures.push(error.into()),
+        &mut |count| saved_count += count,
+    );
+    (result, saved, failures, saved_count)
+}
+
+#[test]
+fn prefetch_send_failure_resends_unread_requests_without_duplicates() {
+    let f = Fixture::new(0);
+    let images = pipeline_images(&f, 2);
+    let mut session = FakeTagSession {
+        sends: std::collections::VecDeque::from([
+            Ok(()),
+            Err("child exited".into()),
+            Ok(()),
+            Ok(()),
+        ]),
+        reads: std::collections::VecDeque::from([Ok(wd_result("image-0")), Ok(wd_result("image-1"))]),
+        sent_ids: vec![],
+        restarts: 0,
+    };
+    let (result, saved, failures, count) = run_fake_pipeline(&mut session, &images);
+    result.unwrap();
+    assert_eq!(saved, vec!["image-0", "image-1"]);
+    assert_eq!(count, 2);
+    assert!(failures.is_empty());
+    assert_eq!(session.restarts, 1);
+    assert_eq!(
+        session.sent_ids,
+        vec!["image-0", "image-1", "image-0", "image-1"],
+        "the failed send and its already-accepted prefetch must be re-sent in order"
+    );
+}
+
+#[test]
+fn prefetch_read_failure_resends_from_the_unread_item() {
+    let f = Fixture::new(0);
+    let images = pipeline_images(&f, 2);
+    let mut session = FakeTagSession {
+        sends: std::collections::VecDeque::from([Ok(()), Ok(()), Ok(()), Ok(())]),
+        reads: std::collections::VecDeque::from([
+            Err("child exited".into()),
+            Ok(wd_result("image-0")),
+            Ok(wd_result("image-1")),
+        ]),
+        sent_ids: vec![],
+        restarts: 0,
+    };
+    let (result, saved, failures, count) = run_fake_pipeline(&mut session, &images);
+    result.unwrap();
+    assert_eq!(saved, vec!["image-0", "image-1"]);
+    assert_eq!(count, 2);
+    assert!(failures.is_empty());
+    assert_eq!(session.restarts, 1);
+}
+
+#[test]
+fn prefetch_response_mismatch_stops_without_saving_wrong_tags() {
+    let f = Fixture::new(0);
+    let images = pipeline_images(&f, 1);
+    let mut session = FakeTagSession {
+        sends: std::collections::VecDeque::from([Ok(()), Ok(())]),
+        reads: std::collections::VecDeque::from([Ok(wd_result("other-image"))]),
+        sent_ids: vec![],
+        restarts: 0,
+    };
+    let (result, saved, _, count) = run_fake_pipeline(&mut session, &images);
+    assert!(result.is_err());
+    assert!(saved.is_empty());
+    assert_eq!(count, 0);
+    assert_eq!(session.restarts, 1);
+}
+
 #[test]
 fn pending_scan_assignment_is_replayed_per_image() {
     let f = Fixture::new(1);

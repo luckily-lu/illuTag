@@ -431,53 +431,137 @@ pub(super) fn tag_images_with_wd_model(
 
     eprintln!("[wd-tag] queue size: {}", images.len());
 
-    // 流水线：发送下一张图片的请求后再等待当前响应，
-    // 让 Python 侧的预处理与 GPU 推理重叠；写库按批次单事务提交。
+    let mut session = WdTagSession {
+        service: &mut service_guard,
+        model_path: &model_path,
+        tags_path: &tags_path,
+        script_path: &script_path,
+    };
+    let mut checkpoint = | | -> Result<bool, String> {
+        yield_to_foreground(foreground, stop_requested);
+        if background_scan_stop_requested(stop_requested) {
+            return Ok(false);
+        }
+        wait_for_background_scan_resume(progress, pause_requested, stop_requested, "tagging");
+        Ok(!background_scan_stop_requested(stop_requested))
+    };
+    let mut save_batch = |batch: &[(String, WdTaggerTestResult)]| {
+        flush_wd_tag_saves(&mut conn, batch, &dictionary)
+    };
+    let mut failed = |error: &str| {
+        increment_scan_progress_failed(progress);
+        set_scan_progress_error(progress, error);
+        push_scan_progress_recent_error(progress, error);
+        eprintln!("[wd-tag] {error}");
+    };
+    let mut saved = |count: i64| add_scan_progress_tagged(progress, count);
+    run_tag_pipeline(
+        &mut session,
+        images,
+        &mut checkpoint,
+        &mut save_batch,
+        &mut failed,
+        &mut saved,
+    )
+}
+
+pub(super) trait TagSession {
+    fn send(&mut self, image: &TagQueueImage) -> Result<(), String>;
+    fn read(&mut self) -> Result<WdTaggerTestResult, String>;
+    fn restart(&mut self) -> Result<(), String>;
+}
+
+struct WdTagSession<'a> {
+    service: &'a mut Option<WdTaggerService>,
+    model_path: &'a Path,
+    tags_path: &'a Path,
+    script_path: &'a Path,
+}
+
+impl TagSession for WdTagSession<'_> {
+    fn send(&mut self, image: &TagQueueImage) -> Result<(), String> {
+        ensure_wd_tagger_service_started(
+            self.service,
+            self.model_path,
+            self.tags_path,
+            self.script_path,
+        )?;
+        let running = self
+            .service
+            .as_mut()
+            .ok_or_else(|| "WD tagger service unavailable".to_string())?;
+        wd_tagger_send_request(running, &image.id, &image.path, 0.35, 0.85)
+    }
+
+    fn read(&mut self) -> Result<WdTaggerTestResult, String> {
+        let running = self
+            .service
+            .as_mut()
+            .ok_or_else(|| "WD tagger service unavailable".to_string())?;
+        wd_tagger_read_response(running)
+    }
+
+    fn restart(&mut self) -> Result<(), String> {
+        stop_python_child_service(self.service, |running| &mut running.child);
+        ensure_wd_tagger_service_started(
+            self.service,
+            self.model_path,
+            self.tags_path,
+            self.script_path,
+        )
+    }
+}
+
+/// Prefetch depth 2: send the next request before waiting for the current
+/// response. The pipeline owns service generations: after a send/read failure
+/// it restarts the service and re-sends every unread request in order. A save is
+/// attempted only after an ID-validated response, so a restart cannot duplicate
+/// or misattribute tags.
+pub(super) fn run_tag_pipeline<S: TagSession>(
+    session: &mut S,
+    images: &[TagQueueImage],
+    checkpoint: &mut dyn FnMut() -> Result<bool, String>,
+    save_batch: &mut dyn FnMut(&[(String, WdTaggerTestResult)]) -> Result<(), String>,
+    failed: &mut dyn FnMut(&str),
+    saved: &mut dyn FnMut(i64),
+) -> Result<(), String> {
     let total = images.len();
     let mut pending = std::collections::VecDeque::<(usize, TagQueueImage)>::new();
-    let mut read_idx = 0usize; // 下一张等待响应的图片
-    let mut send_idx = 0usize; // 下一张待发送的图片
+    let mut read_idx = 0usize;
+    let mut send_idx = 0usize;
     let mut retried_current = false;
+    let mut retried_send = false;
     let mut pending_saves: Vec<(String, WdTaggerTestResult)> = Vec::new();
 
     while read_idx < total {
-        yield_to_foreground(foreground, stop_requested);
-        if background_scan_stop_requested(stop_requested) {
+        if !checkpoint()? {
             break;
         }
-        wait_for_background_scan_resume(progress, pause_requested, stop_requested, "tagging");
-        if background_scan_stop_requested(stop_requested) {
-            break;
-        }
-
-        // 保持管道深度为 2（一张推理中、一张预处理中）
         while send_idx < total && pending.len() < 2 {
             let image = images[send_idx].clone();
             if !Path::new(&image.path).is_file() {
-                increment_scan_progress_failed(progress);
+                failed(&format!("图片文件不存在，已跳过：{}", image.path));
                 send_idx += 1;
                 continue;
             }
-            match wd_tagger_send_with_recovery(
-                &mut service_guard,
-                &model_path,
-                &tags_path,
-                &script_path,
-                &image.id,
-                &image.path,
-                0.35,
-                0.85,
-            ) {
+            match session.send(&image) {
                 Ok(()) => {
                     pending.push_back((send_idx, image));
                     send_idx += 1;
                 }
                 Err(error) => {
-                    eprintln!("[wd-tag] {error}");
-                    increment_scan_progress_failed(progress);
-                    set_scan_progress_error(progress, &error);
-                    push_scan_progress_recent_error(progress, &error);
-                    send_idx += 1;
+                    eprintln!("[wd-tag] send failed, restarting service: {error}");
+                    session.restart()?;
+                    pending.clear();
+                    // Re-submit the failed request and every prefetched request
+                    // the old service may already have accepted.
+                    send_idx = read_idx;
+                    if retried_send {
+                        return Err(format!(
+                            "WD tagger service failed twice while sending: {error}"
+                        ));
+                    }
+                    retried_send = true;
                 }
             }
         }
@@ -487,46 +571,38 @@ pub(super) fn tag_images_with_wd_model(
 
         let (current_index, current) = pending.front().cloned().ok_or("模型请求队列为空")?;
         read_idx = current_index;
-        let read_result = {
-            let service = service_guard
-                .as_mut()
-                .ok_or_else(|| "WD tagger service unavailable".to_string())?;
-            wd_tagger_read_response(service)
-        };
-        match read_result {
+        match session.read() {
             Ok(result) => {
                 if result.image_id != current.id {
-                    stop_python_child_service(&mut service_guard, |running| &mut running.child);
+                    session.restart()?;
                     return Err("模型响应与图片请求不一致，已停止任务".into());
                 }
                 pending.pop_front();
                 pending_saves.push((current.id, result));
                 read_idx += 1;
                 retried_current = false;
+                retried_send = false;
                 if pending_saves.len() >= TAG_SAVE_BATCH_SIZE {
-                    let saved = pending_saves.len() as i64;
-                    flush_wd_tag_saves(&mut conn, &pending_saves, &dictionary)?;
+                    let count = pending_saves.len() as i64;
+                    save_batch(&pending_saves)?;
                     pending_saves.clear();
-                    add_scan_progress_tagged(progress, saved);
+                    saved(count);
                 }
             }
             Err(first_error) => {
-                // 服务可能已挂掉：重启后当前图片及已发送但未读的请求全部重发
                 eprintln!("[wd-tag] read failed, restarting service: {first_error}");
-                stop_python_child_service(&mut service_guard, |running| &mut running.child);
+                session.restart()?;
                 send_idx = read_idx;
                 pending.clear();
                 if retried_current {
                     let error = format!("WD tagger service failed twice: {first_error}");
-                    eprintln!("[wd-tag] {error}");
-                    increment_scan_progress_failed(progress);
-                    set_scan_progress_error(progress, &error);
-                    push_scan_progress_recent_error(progress, &error);
+                    failed(&error);
                     read_idx += 1;
-                    // The failed item has consumed its one retry. Restart the remaining
-                    // pipeline at the next item, including any lost prefetch request.
+                    // The failed item consumed its retry. Restart the remaining
+                    // pipeline at the next item, including the lost prefetch.
                     send_idx = read_idx;
                     retried_current = false;
+                    retried_send = false;
                 } else {
                     retried_current = true;
                 }
@@ -535,67 +611,17 @@ pub(super) fn tag_images_with_wd_model(
     }
 
     if !pending_saves.is_empty() {
-        let saved = pending_saves.len() as i64;
-        flush_wd_tag_saves(&mut conn, &pending_saves, &dictionary)?;
-        pending_saves.clear();
-        add_scan_progress_tagged(progress, saved);
+        let count = pending_saves.len() as i64;
+        save_batch(&pending_saves)?;
+        saved(count);
     }
 
-    // 若中途停止且管道中尚有未读响应，直接重启服务，避免下次读到错位的旧响应
+    // Stopping with unread requests would leave stale responses in the pipe.
     if read_idx < total && send_idx > read_idx {
-        stop_python_child_service(&mut service_guard, |running| &mut running.child);
+        let _ = session.restart();
     }
-
     Ok(())
 }
-
-pub(super) fn wd_tagger_send_with_recovery(
-    service: &mut Option<WdTaggerService>,
-    model_path: &Path,
-    tags_path: &Path,
-    script_path: &Path,
-    image_id: &str,
-    image_path: &str,
-    general_threshold: f32,
-    character_threshold: f32,
-) -> Result<(), String> {
-    ensure_wd_tagger_service_started(service, model_path, tags_path, script_path)?;
-    let primary = {
-        let running = service
-            .as_mut()
-            .ok_or_else(|| "WD tagger service unavailable".to_string())?;
-        wd_tagger_send_request(
-            running,
-            image_id,
-            image_path,
-            general_threshold,
-            character_threshold,
-        )
-    };
-    match primary {
-        Ok(()) => Ok(()),
-        Err(first_error) => {
-            stop_python_child_service(service, |running| &mut running.child);
-            ensure_wd_tagger_service_started(service, model_path, tags_path, script_path)?;
-            let running = service
-                .as_mut()
-                .ok_or_else(|| "WD tagger service unavailable after restart".to_string())?;
-            wd_tagger_send_request(
-                running,
-                image_id,
-                image_path,
-                general_threshold,
-                character_threshold,
-            )
-            .map_err(|second_error| {
-                format!(
-                    "WD tagger service failed and restart retry also failed. first: {first_error}; second: {second_error}"
-                )
-            })
-        }
-    }
-}
-
 pub(super) fn ensure_wd_tagger_service_started(
     service: &mut Option<WdTaggerService>,
     model_path: &Path,
