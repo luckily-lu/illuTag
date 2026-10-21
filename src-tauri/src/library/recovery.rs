@@ -644,6 +644,105 @@ fn repaired_item_payload(
         .map_err(|error| (Some(pk), format!("记录无法序列化：{error}")))
 }
 
+fn remap_duplicate_request_ids(
+    request: &mut crate::duplicates::DuplicateManagementRequest,
+    db: &Connection,
+    mappings: &[BackupPathMapping],
+    operation: i64,
+    issues: &mut Vec<OperationLogIssue>,
+) -> Result<(), String> {
+    for ids in [
+        &mut request.keep_ids,
+        &mut request.protected_ids,
+        &mut request.image_ids,
+    ] {
+        for id in ids.iter_mut() {
+            let old = id.clone();
+            let next = remap_backup_path(&old, mappings);
+            let exists: bool = db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM images WHERE id=?1)",
+                    [&next],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if !exists {
+                issues.push(OperationLogIssue {
+                    kind: "operationRequest".into(),
+                    operation: operation.to_string(),
+                    image_pk: None,
+                    image_id: Some(old),
+                    reason: format!("请求中的图片不存在：{next}"),
+                });
+            }
+            *id = next;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_duplicate_plan(
+    id: i64,
+    raw: &str,
+    db: &Connection,
+    mappings: &[BackupPathMapping],
+) -> Result<(String, Vec<OperationLogIssue>), String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|error| format!("请求无法解析：{error}"))?;
+    let mut issues = Vec::<OperationLogIssue>::new();
+
+    let request_value = value
+        .get("request")
+        .cloned()
+        .ok_or_else(|| "请求缺少 Plan.request".to_string())?;
+    let mut request: crate::duplicates::DuplicateManagementRequest =
+        serde_json::from_value(request_value)
+            .map_err(|error| format!("Plan.request 结构不兼容：{error}"))?;
+    remap_duplicate_request_ids(&mut request, db, mappings, id, &mut issues)?;
+    value["request"] = serde_json::to_value(&request).map_err(|error| error.to_string())?;
+
+    let keepers = value
+        .get_mut("keepers")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| "请求缺少 Plan.keepers".to_string())?;
+    for keeper in keepers.iter_mut() {
+        let payload = serde_json::to_string(&*keeper).map_err(|error| error.to_string())?;
+        match repaired_item_payload(db, &payload) {
+            Ok(next) => {
+                *keeper =
+                    serde_json::from_str(&next).map_err(|error| format!("保留图修复失败：{error}"))?;
+            }
+            Err((image_pk, reason)) => issues.push(OperationLogIssue {
+                kind: "operationKeeper".into(),
+                operation: id.to_string(),
+                image_pk,
+                image_id: keeper
+                    .get("image")
+                    .and_then(|image| image.get("id"))
+                    .and_then(|image| image.as_str())
+                    .map(str::to_string),
+                reason,
+            }),
+        }
+    }
+
+    if let Some(batches) = value
+        .get_mut("batches")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for batch in batches.iter_mut() {
+            let mut request: crate::duplicates::DuplicateManagementRequest =
+                serde_json::from_value(batch.clone())
+                    .map_err(|error| format!("Plan.batches 结构不兼容：{error}"))?;
+            remap_duplicate_request_ids(&mut request, db, mappings, id, &mut issues)?;
+            *batch = serde_json::to_value(&request).map_err(|error| error.to_string())?;
+        }
+    }
+
+    let next = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+    Ok((next, issues))
+}
+
 fn mark_duplicate_item_unavailable(
     conn: &Connection,
     operation: i64,
@@ -895,54 +994,57 @@ fn migrate_duplicate_journal(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     for (id, request) in operations {
-        let mut value: serde_json::Value = match serde_json::from_str(&request) {
-            Ok(value) => value,
-            Err(error) => {
-                report.unresolved.push(OperationLogIssue {
-                    kind: "operationRequest".into(),
-                    operation: id.to_string(),
-                    image_pk: None,
-                    image_id: None,
-                    reason: format!("请求无法解析：{error}"),
-                });
-                continue;
-            }
-        };
-        for key in ["keep_ids", "protected_ids", "image_ids"] {
-            let Some(ids) = value.get_mut(key).and_then(|value| value.as_array_mut()) else {
-                continue;
-            };
-            for id_value in ids {
-                let Some(old) = id_value.as_str() else {
-                    continue;
-                };
-                let next = remap_backup_path(old, mappings);
-                if next != old {
-                    let exists: bool = db
-                        .query_row(
-                            "SELECT EXISTS(SELECT 1 FROM images WHERE id=?1)",
-                            [&next],
-                            |row| row.get(0),
-                        )
+        report.rows_total += 1;
+        match migrate_duplicate_plan(id, &request, db, mappings) {
+            Ok((next, issues)) => {
+                tx.execute(
+                    "UPDATE operations SET request=?2 WHERE id=?1",
+                    params![id, next],
+                )
+                .map_err(|error| error.to_string())?;
+                if issues.is_empty() {
+                    report.rows_migrated += 1;
+                } else {
+                    // Keep the operation row but make it explicit that this plan
+                    // is not fully migrated. Continuing it will fail at the
+                    // keeper/identity check instead of silently using old data.
+                    let reasons: Vec<String> = issues
+                        .iter()
+                        .map(|issue| {
+                            format!(
+                                "{}: {}",
+                                issue
+                                    .image_id
+                                    .as_deref()
+                                    .unwrap_or("keeper"),
+                                issue.reason
+                            )
+                        })
+                        .collect();
+                    let existing: String = tx
+                        .query_row("SELECT errors FROM operations WHERE id=?1", [id], |row| {
+                            row.get(0)
+                        })
                         .map_err(|error| error.to_string())?;
-                    if !exists {
-                        report.unresolved.push(OperationLogIssue {
-                            kind: "operationRequest".into(),
-                            operation: id.to_string(),
-                            image_pk: None,
-                            image_id: Some(old.to_string()),
-                            reason: format!("映射后的图片不存在：{next}"),
-                        });
-                    }
-                    *id_value = serde_json::json!(next);
+                    let mut errors: Vec<String> =
+                        serde_json::from_str(&existing).unwrap_or_default();
+                    errors.extend(reasons);
+                    tx.execute(
+                        "UPDATE operations SET errors=?2 WHERE id=?1",
+                        params![id, serde_json::to_string(&errors).unwrap_or_default()],
+                    )
+                    .map_err(|error| error.to_string())?;
+                    report.unresolved.extend(issues);
                 }
             }
+            Err(reason) => report.unresolved.push(OperationLogIssue {
+                kind: "operationRequest".into(),
+                operation: id.to_string(),
+                image_pk: None,
+                image_id: None,
+                reason,
+            }),
         }
-        tx.execute(
-            "UPDATE operations SET request=?2 WHERE id=?1",
-            params![id, serde_json::to_string(&value).map_err(|error| error.to_string())?],
-        )
-        .map_err(|error| error.to_string())?;
     }
 
     let owner_rows = tx

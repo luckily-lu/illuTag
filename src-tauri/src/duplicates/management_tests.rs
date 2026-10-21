@@ -119,6 +119,200 @@ fn migration_repairs_duplicate_payloads_and_undo_still_works() {
 }
 
 #[test]
+fn migration_repairs_partial_plan_keepers_and_continue_executes() {
+    let mut f = Fixture::new(3);
+    let new_assets = f.state.data_dir.join("clipboard");
+    fs::rename(f.root.join("assets"), &new_assets).unwrap();
+    let db = Connection::open(&f.state.database_path).unwrap();
+    db.execute(
+        "UPDATE folders SET path=?1",
+        [new_assets.to_string_lossy().as_ref()],
+    )
+    .unwrap();
+    for (index, path) in f.paths.iter_mut().enumerate() {
+        let next = new_assets.join(path.file_name().unwrap());
+        db.execute(
+            "UPDATE images SET id=?1,path=?1 WHERE image_pk=?2",
+            params![next.to_string_lossy().as_ref(), index as i64 + 1],
+        )
+        .unwrap();
+        *path = next;
+    }
+    drop(db);
+    f.run().unwrap();
+
+    let g = group(&f);
+    let preview = prepare(
+        request(&f, &g, "exactOthers", vec![id(&f, 0)], vec![]),
+        &f.state,
+    )
+    .unwrap();
+    let operation = op_id(&preview.operation_id).unwrap();
+    let log = journal(&f.state, false).unwrap();
+    let first_target: i64 = log
+        .query_row(
+            "SELECT image_pk FROM items WHERE operation=?1 AND state='pending' ORDER BY ordinal LIMIT 1",
+            [operation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    log.execute(
+        "UPDATE items SET state='succeeded' WHERE operation=?1 AND image_pk=?2",
+        params![operation, first_target],
+    )
+    .unwrap();
+    log.execute(
+        "UPDATE operations SET state='partial' WHERE id=?1",
+        [operation],
+    )
+    .unwrap();
+    drop(log);
+    let db = Connection::open(&f.state.database_path).unwrap();
+    db.execute(
+        "UPDATE images SET trashed=1 WHERE image_pk=?1",
+        [first_target],
+    )
+    .unwrap();
+    drop(db);
+
+    let destination = f.root.join("migrated-partial");
+    fs::create_dir(&destination).unwrap();
+    let (_, _, reports) =
+        crate::library::prepare_data_directory_migration(&destination, &f.state).unwrap();
+    let report = reports
+        .iter()
+        .find(|report| report.journal == "duplicate-management.sqlite")
+        .expect("duplicate journal report");
+    assert_eq!(report.status, "migrated", "{report:?}");
+    assert!(report.unresolved.is_empty(), "{report:?}");
+
+    let mut new_state = crate::library::AppState::new(
+        destination.join("illutag.sqlite"),
+        destination.clone(),
+        None,
+        None,
+    );
+    new_state.read_only = false;
+    run_operation(
+        &preview.operation_id,
+        &new_state,
+        &mut || Ok(()),
+        &mut |_| {},
+    )
+    .unwrap();
+    let new_db = cache::library(&new_state).unwrap();
+    let trashed: i64 = new_db
+        .query_row("SELECT COUNT(*) FROM images WHERE trashed<>0", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(trashed, 2, "continue must finish the remaining target");
+
+    let journal = Connection::open(destination.join("operations/duplicate-management.sqlite"))
+        .unwrap();
+    let raw: String = journal
+        .query_row(
+            "SELECT request FROM operations WHERE id=?1",
+            [operation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let keeper = &plan["keepers"][0];
+    let keeper_path = keeper["image"]["path"].as_str().unwrap();
+    assert!(
+        keeper_path.starts_with(destination.to_string_lossy().as_ref()),
+        "keeper must point at the migrated file: {keeper_path}"
+    );
+    let canonical = keeper["canonical"].as_str().unwrap();
+    let canonical = canonical.strip_prefix(r"\\?\").unwrap_or(canonical);
+    assert!(
+        canonical
+            .to_lowercase()
+            .starts_with(&destination.to_string_lossy().to_lowercase()),
+        "canonical={canonical} destination={}",
+        destination.display()
+    );
+    assert!(Path::new(canonical).is_file(), "{canonical}");
+    let new_keeper_id: String = new_db
+        .query_row("SELECT id FROM images WHERE image_pk=1", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        plan["request"]["keepIds"][0].as_str(),
+        Some(new_keeper_id.as_str())
+    );
+    assert_eq!(keeper["image"]["id"].as_str(), Some(new_keeper_id.as_str()));
+}
+
+#[test]
+fn migration_report_marks_unresolved_plan_keeper_as_partial() {
+    let mut f = Fixture::new(3);
+    let new_assets = f.state.data_dir.join("clipboard");
+    fs::rename(f.root.join("assets"), &new_assets).unwrap();
+    let db = Connection::open(&f.state.database_path).unwrap();
+    db.execute(
+        "UPDATE folders SET path=?1",
+        [new_assets.to_string_lossy().as_ref()],
+    )
+    .unwrap();
+    for (index, path) in f.paths.iter_mut().enumerate() {
+        let next = new_assets.join(path.file_name().unwrap());
+        db.execute(
+            "UPDATE images SET id=?1,path=?1 WHERE image_pk=?2",
+            params![next.to_string_lossy().as_ref(), index as i64 + 1],
+        )
+        .unwrap();
+        *path = next;
+    }
+    drop(db);
+    f.run().unwrap();
+
+    let g = group(&f);
+    let preview = prepare(
+        request(&f, &g, "exactOthers", vec![id(&f, 0)], vec![]),
+        &f.state,
+    )
+    .unwrap();
+    let operation = op_id(&preview.operation_id).unwrap();
+    let db = Connection::open(&f.state.database_path).unwrap();
+    db.execute("DELETE FROM images WHERE image_pk=1", [])
+        .unwrap();
+    drop(db);
+
+    let destination = f.root.join("migrated-missing-keeper");
+    fs::create_dir(&destination).unwrap();
+    let (_, _, reports) =
+        crate::library::prepare_data_directory_migration(&destination, &f.state).unwrap();
+    let report = reports
+        .iter()
+        .find(|report| report.journal == "duplicate-management.sqlite")
+        .expect("duplicate journal report");
+    assert_eq!(report.status, "partial", "{report:?}");
+    assert!(
+        report.unresolved.iter().any(|issue| issue.kind == "operationKeeper"),
+        "{report:?}"
+    );
+    assert!(
+        report.message.contains("无法完整迁移"),
+        "the report must not claim a complete migration: {}",
+        report.message
+    );
+    let journal = Connection::open(destination.join("operations/duplicate-management.sqlite"))
+        .unwrap();
+    let errors: String = journal
+        .query_row(
+            "SELECT errors FROM operations WHERE id=?1",
+            [operation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        errors.contains("图库记录已移除") || errors.contains("保留图"),
+        "{errors}"
+    );
+}
+
+#[test]
 fn physical_alias_preflight_releases_library_readers_before_pause_acknowledgement() {
     let f = Fixture::new(1005);
     f.run().unwrap();
