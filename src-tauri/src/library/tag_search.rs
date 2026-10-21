@@ -149,11 +149,7 @@ pub fn suggest_known_auto_tags(
         .map_err(|error| format!("Failed to query known tag suggestions: {error}"))
 }
 
-pub fn search_gallery_image_ids(
-    filters: GallerySearchFilters,
-    state: &AppState,
-) -> Result<Vec<String>, String> {
-    let conn = open_database(&state.database_path)?;
+pub(super) fn gallery_search_sql(filters: GallerySearchFilters) -> (String, Vec<Value>) {
     let (scope_where, mut params_values) = gallery_scope_where_sql(
         "images",
         filters.scope.as_deref().unwrap_or("all"),
@@ -269,6 +265,15 @@ pub fn search_gallery_image_ids(
     }
 
     sql.push_str(" ORDER BY images.modified_at DESC, images.path ASC");
+    (sql, params_values)
+}
+
+pub fn search_gallery_image_ids(
+    filters: GallerySearchFilters,
+    state: &AppState,
+) -> Result<Vec<String>, String> {
+    let conn = open_database(&state.database_path)?;
+    let (sql, params_values) = gallery_search_sql(filters);
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|error| format!("Failed to prepare gallery search query: {error}"))?;

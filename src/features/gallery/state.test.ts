@@ -70,6 +70,18 @@ describe("选择与瀑布流", () => {
     expect([...s.ids.value]).toEqual(["failed"]);
     expect(s.active.value).toBe(true);
   });
+  it("全选查询后取消与执行成功只更新排除集", () => {
+    const s = useSelection();
+    s.selectAllResults(12000);
+    expect(s.count.value).toBe(12000);
+    expect(s.isSelected("unloaded-id")).toBe(true);
+    s.toggle("one-id");
+    expect(s.isSelected("one-id")).toBe(false);
+    expect(s.count.value).toBe(11999);
+    s.done(["unloaded-id"]);
+    expect(s.isSelected("unloaded-id")).toBe(false);
+    expect(s.count.value).toBe(11998);
+  });
   it.each([400, 500, 768, 1024, 1280, 1920])(
     "宽度 %s 保持比例和增量布局",
     (width) => {

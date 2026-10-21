@@ -653,6 +653,7 @@ pub(super) fn remove_synced_user_folder_tree_for_root(
 
 pub fn remove_image_from_index(image_id: String, state: &AppState) -> Result<LibraryStore, String> {
     crate::duplicates::management::revoke_for_ids(std::slice::from_ref(&image_id),state)?;
+    super::recycle::revoke_for_ids(std::slice::from_ref(&image_id),state)?;
     let mut library = state
         .library
         .lock()
@@ -678,6 +679,7 @@ pub fn restore_image_from_trash(
     state: &AppState,
 ) -> Result<LibraryStore, String> {
     crate::duplicates::management::revoke_for_ids(std::slice::from_ref(&image_id),state)?;
+    super::recycle::revoke_for_ids(std::slice::from_ref(&image_id),state)?;
     let mut library = state
         .library
         .lock()
@@ -727,6 +729,20 @@ pub(super) fn move_file_to_system_recycle_bin(path: &Path) -> Result<(), String>
     }
 }
 
+// Share one Windows shell operation across a small, already validated batch.
+pub(super) fn move_files_to_system_recycle_bin(paths: &[PathBuf]) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let paths: Vec<_> = paths.iter().map(|p| normalize_windows_path_for_recycle_bin(p)).collect();
+        trash::delete_all(&paths).map_err(|error| format!("移动到系统回收站失败：{error}"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = paths;
+        Err("Moving files to system recycle bin is only supported on Windows".into())
+    }
+}
+
 pub(super) fn normalize_windows_path_for_recycle_bin(path: &Path) -> PathBuf {
     #[cfg(target_os = "windows")]
     {
@@ -759,6 +775,7 @@ pub fn move_image_to_system_trash(
     state: &AppState,
 ) -> Result<LibraryStore, String> {
     crate::duplicates::management::revoke_for_ids(std::slice::from_ref(&image_id),state)?;
+    super::recycle::revoke_for_ids(std::slice::from_ref(&image_id),state)?;
     let mut library = state
         .library
         .lock()
@@ -818,6 +835,7 @@ pub fn move_images_to_system_trash(
     state: &AppState,
 ) -> Result<BatchSystemTrashResult, String> {
     crate::duplicates::management::revoke_for_ids(&image_ids,state)?;
+    super::recycle::revoke_for_ids(&image_ids,state)?;
     let image_ids = normalize_batch_image_ids(image_ids);
     if image_ids.is_empty() {
         return Ok(BatchSystemTrashResult {
@@ -1036,6 +1054,7 @@ pub fn remove_images_from_index(
     state: &AppState,
 ) -> Result<LibraryStore, String> {
     crate::duplicates::management::revoke_for_ids(&image_ids,state)?;
+    super::recycle::revoke_for_ids(&image_ids,state)?;
     let image_ids = normalize_batch_image_ids(image_ids);
     if image_ids.is_empty() {
         return list_library_from_state(state);
@@ -1087,6 +1106,7 @@ pub fn restore_images_from_trash(
     state: &AppState,
 ) -> Result<LibraryStore, String> {
     crate::duplicates::management::revoke_for_ids(&image_ids,state)?;
+    super::recycle::revoke_for_ids(&image_ids,state)?;
     let image_ids = normalize_batch_image_ids(image_ids);
     if image_ids.is_empty() {
         return list_library_from_state(state);

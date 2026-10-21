@@ -8,16 +8,12 @@ import { bytes } from "./format";
 const props = defineProps<{
   member: DuplicateMember;
   reference?: boolean;
-  kept?: boolean;
-  selected?: boolean;
-  processed?: boolean;
-  disabled?: boolean;
   detail?: ImageDetail;
   detailLoading?: boolean;
   detailError?: string;
   folderLabels?: string[];
 }>();
-const emit = defineEmits<{ compare: []; keep: []; select: []; details: [] }>();
+const emit = defineEmits<{ compare: []; details: [] }>();
 const failed = ref(false);
 const detailsOpen = ref(false);
 function details() {
@@ -34,9 +30,6 @@ watch(
     class="duplicate-thumb"
     :class="{
       'duplicate-reference': reference,
-      'duplicate-kept': kept,
-      'duplicate-selected': selected,
-      'duplicate-processed': processed,
     }"
     :data-image-id="member.image.id"
   >
@@ -71,30 +64,6 @@ watch(
     }}</span>
     <span v-if="member.stale" class="duplicate-warning"
       >文件已变化，请更新结果</span
-    >
-    <div class="duplicate-card-actions">
-      <button
-        class="soft-button compact"
-        :aria-label="`保留：${member.image.fileName}`"
-        :aria-pressed="!!kept"
-        :disabled="disabled || processed"
-        @click="emit('keep')"
-      >
-        {{ kept ? "已保留" : "保留" }}
-      </button>
-      <label class="duplicate-card-select"
-        ><input
-          type="checkbox"
-          :aria-label="`待处理：${member.image.fileName}`"
-          :checked="!!selected"
-          :disabled="disabled || kept || processed || member.stale"
-          @change="emit('select')"
-        />待处理</label
-      >
-    </div>
-    <span v-if="processed" class="duplicate-card-status">已处理</span>
-    <span v-else-if="kept" class="duplicate-card-status"
-      >在所有分组中保护此图</span
     >
     <button
       class="text-button compact duplicate-details-toggle"

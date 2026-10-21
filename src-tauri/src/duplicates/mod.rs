@@ -1,8 +1,21 @@
 //! Explicit, derived duplicate-search cache. The library database is never written here.
 pub mod cache;
+mod cache_capacity;
+mod cascade_gc;
 pub mod fingerprint;
 pub mod index;
 pub mod management;
+pub mod verification;
+mod evidence_store;
+mod evidence;
+mod cascade_pixels;
+mod cascade_store;
+#[cfg(test)]
+mod cascade_tests;
+#[cfg(test)]
+mod cascade_scope_tests;
+mod verification_cache;
+pub mod workflow;
 
 use crate::library::GalleryImage;
 use serde::{Deserialize, Serialize};
@@ -16,6 +29,9 @@ pub struct DuplicateOptions {
     pub force_recompute: bool,
     #[serde(default)]
     pub regroup_only: bool,
+    /// candidate keeps the original visual search; verified adds local-content checks.
+    #[serde(default)]
+    pub verification_mode: String,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, TS)]
@@ -27,6 +43,12 @@ pub struct DuplicateCoverage {
     pub skipped_near: i64,
     pub low_information: i64,
     pub too_dense: i64,
+    #[serde(default)]
+    pub verified_pairs: i64,
+    #[serde(default)]
+    pub content_variants: i64,
+    #[serde(default)]
+    pub uncertain_pairs: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -43,6 +65,8 @@ pub struct DuplicateAttempt {
 pub struct DuplicateStatus {
     pub generation: Option<String>,
     pub sensitivity: String,
+    #[serde(default)]
+    pub verification_mode: String,
     pub checked_at: Option<i64>,
     pub duration_ms: Option<i64>,
     pub state: String,
@@ -176,6 +200,12 @@ pub struct DuplicateOperationStatus {
     pub group_id: String,
     pub action: String,
     pub state: String,
+    #[serde(default)]
+    pub stage: String,
+    #[serde(default)]
+    pub stage_processed: i64,
+    #[serde(default)]
+    pub stage_total: i64,
     pub processed: i64,
     pub total: i64,
     pub succeeded: i64,
@@ -223,9 +253,122 @@ pub struct DuplicateGroupQuery {
     pub group_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateCategory {
+    pub kind: String,
+    pub images: i64,
+    pub groups: i64,
+    pub cleanup_count: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateWorkflowStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub rounds: Option<Vec<DuplicateRoundStatus>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub policy: Option<String>,
+    pub generation: Option<String>,
+    pub revision: String,
+    pub stage: String,
+    pub scan: DuplicateStatus,
+    pub categories: Vec<DuplicateCategory>,
+    pub cleanup_count: i64,
+    pub protected_count: i64,
+    pub last_operation_id: Option<String>,
+    pub errors: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateRoundStatus {
+    pub round: i64,
+    pub name: String,
+    pub state: String,
+    pub input_pairs: i64,
+    pub passed_pairs: i64,
+    pub filtered_pairs: i64,
+    pub uncertain_pairs: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateReviewMember {
+    pub member: DuplicateMember,
+    pub disposition: String,
+    pub is_keeper: bool,
+    pub reason: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateWorkflowGroup {
+    pub id: String,
+    pub kind: String,
+    pub reference_id: String,
+    pub confirmed: bool,
+    pub total_members: i64,
+    pub members: Vec<DuplicateReviewMember>,
+    pub next_cursor: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateWorkflowQuery {
+    pub generation: String,
+    pub kind: String,
+    pub cursor: Option<String>,
+    pub limit: i64,
+    pub group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub reanchor: Option<bool>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateWorkflowPaging {
+    pub offset: i64,
+    pub previous_cursor: Option<String>,
+    pub previous_limit: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateWorkflowPage {
+    pub generation: String,
+    pub revision: String,
+    pub groups: Vec<DuplicateWorkflowGroup>,
+    pub next_cursor: Option<String>,
+    pub total_groups: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub paging: Option<DuplicateWorkflowPaging>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateReviewEdit {
+    pub generation: String,
+    pub revision: String,
+    pub group_id: String,
+    pub image_id: Option<String>,
+    pub action: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateWorkflowRequest {
+    pub generation: String,
+    pub revision: String,
+}
+
 pub use cache::{
-    clear_cache, invalidate, invalidate_database, query_groups, query_members, run_job, status,
+    clear_cache, invalidate, invalidate_database, membership_invalidated, query_groups,
+    query_members, status,
 };
+pub use workflow::run_job;
+
+#[cfg(test)]
+mod workflow_tests;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod verification_tests;
+#[cfg(test)]
+mod evidence_tests;

@@ -6,12 +6,12 @@ import type { UserFolder } from "../../shared/contracts/UserFolder";
 const navigation: Array<[string, string, IconName]> = [
   ["all", "全部", "images"],
   ["random", "随机", "shuffle"],
+  ["tags", "标签", "tags"],
   ["favorites", "收藏", "heart"],
   ["unclassified", "待分类", "inbox"],
   ["trash", "回收站", "trash"],
 ];
 const utilities: Array<[string, string, IconName]> = [
-  ["tags", "标签", "tags"],
   ["duplicates", "重复检索", "duplicates"],
   ["tasks", "任务中心", "tasks"],
   ["settings", "设置", "settings"],
@@ -62,10 +62,14 @@ function action(id: string, folder: UserFolder) {
       :key="key"
       class="nav-row"
       :class="{
-        active: page === 'gallery' && scope === key && folderId === null,
+        active:
+          key === 'tags'
+            ? page === 'tags'
+            : page === 'gallery' && scope === key && folderId === null,
       }"
       :title="label"
-      @click="emit('go', key)"
+      :aria-label="label"
+      @click="key === 'tags' ? emit('page', 'tags') : emit('go', key)"
     >
       <span class="nav-icon"><AppIcon :name="icon" /></span
       ><span class="nav-label">{{ label }}</span>
@@ -142,6 +146,7 @@ function action(id: string, folder: UserFolder) {
         class="nav-row"
         :class="{ active: page === id }"
         :title="label"
+        :aria-label="label"
         @click="emit('page', id)"
       >
         <span class="nav-icon"><AppIcon :name="icon" /></span

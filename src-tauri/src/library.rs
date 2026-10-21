@@ -194,6 +194,8 @@ pub use search::*;
 
 mod tags;
 pub use tags::*;
+mod tag_covers;
+pub use tag_covers::*;
 
 mod legacy_backup;
 pub use legacy_backup::*;
@@ -232,6 +234,9 @@ pub use inference::*;
 
 mod api;
 pub use api::*;
+pub mod recycle;
+mod tag_favorites;
+pub use tag_favorites::*;
 
 pub fn recycle_duplicate_source(path:&Path)->Result<(),String>{
     crate::runtime::check_asset_write(path)?;

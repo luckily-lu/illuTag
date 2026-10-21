@@ -73,6 +73,85 @@ fn migration_only_moves_forward() {
 }
 
 #[test]
+fn favorite_tags_survive_reopen_without_changing_images_or_schema() {
+    let f = Fixture::new(2);
+    let conn = open_database(&f.state.database_path).unwrap();
+    let before: String = conn
+        .query_row(
+            "SELECT group_concat(id||':'||trashed) FROM images",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        set_favorite_tag("long_hair".into(), true, &f.state).unwrap(),
+        vec!["long_hair"]
+    );
+    assert_eq!(
+        set_favorite_tag("long_hair".into(), true, &f.state)
+            .unwrap()
+            .len(),
+        1
+    );
+    let reopened = AppState::new(f.state.database_path.clone(), f.root.clone(), None, None);
+    assert_eq!(list_favorite_tags(&reopened).unwrap(), vec!["long_hair"]);
+    assert_eq!(
+        conn.query_row(
+            "SELECT group_concat(id||':'||trashed) FROM images",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        before
+    );
+    assert_eq!(
+        conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    assert!(set_favorite_tag("long_hair".into(), false, &f.state)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn viewer_undo_restores_only_its_latest_unchanged_mutation() {
+    let f = Fixture::new(2);
+    let conn = open_database(&f.state.database_path).unwrap();
+    let ids: Vec<String> = conn
+        .prepare("SELECT id FROM images ORDER BY image_pk")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let request = |action: &str, id: &str| ImageMutation {
+        action: action.into(),
+        image_ids: vec![id.into()],
+        folder_id: None,
+        favorite: Some(true),
+        custom_tags: vec![],
+        supplement_tags: vec![],
+    };
+    let removed = mutate_images(request("trash", &ids[0]), &f.state).unwrap();
+    assert_eq!(removed.successful_ids.len(), 1);
+    assert!(
+        !undo_viewer_trash(ids[0].clone(), removed.revision, &f.state)
+            .unwrap()
+            .images[0]
+            .trashed
+    );
+    let removed = mutate_images(request("trash", &ids[0]), &f.state).unwrap();
+    mutate_images(request("favorite", &ids[1]), &f.state).unwrap();
+    assert!(
+        undo_viewer_trash(ids[0].clone(), removed.revision, &f.state)
+            .unwrap_err()
+            .contains("后续修改")
+    );
+    assert!(load_image_record(&conn, &ids[0]).unwrap().trashed);
+}
+
+#[test]
 fn compact_tags_preserve_translation_and_distinct_image_statistics() {
     let f = Fixture::new(1);
     let conn = open_database(&f.state.database_path).unwrap();
@@ -153,35 +232,114 @@ fn compact_tags_preserve_translation_and_distinct_image_statistics() {
 
 #[test]
 fn exact_ranking_retains_path_tie_break_and_top_600_boundaries() {
-    for count in [599usize,600,601] {
-        let mut cache=ClipImageVectorCache {model_id:CHINESE_CLIP_MODEL_ID.into(),model_version:CHINESE_CLIP_MODEL_VERSION.into(),dimension:2,vectors:HashMap::new()};
-        let ids=(0..count).map(|n|format!("D:/image-{n:05}.png")).collect::<Vec<_>>();
-        for id in ids.iter().rev() { cache.vectors.insert(id.clone(),vec![1.0,0.0]); }
-        assert_eq!(rank_clip_candidates(&cache,&[1.0,0.0],None),ids[..count.min(600)]);
-        let selected=HashSet::from([ids[count-1].clone()]);
-        assert_eq!(rank_clip_candidates(&cache,&[1.0,0.0],Some(&selected)),vec![ids[count-1].clone()]);
-        assert!(rank_clip_candidates(&cache,&[1.0,0.0],Some(&HashSet::new())).is_empty());
+    for count in [599usize, 600, 601] {
+        let mut cache = ClipImageVectorCache {
+            model_id: CHINESE_CLIP_MODEL_ID.into(),
+            model_version: CHINESE_CLIP_MODEL_VERSION.into(),
+            dimension: 2,
+            vectors: HashMap::new(),
+        };
+        let ids = (0..count)
+            .map(|n| format!("D:/image-{n:05}.png"))
+            .collect::<Vec<_>>();
+        for id in ids.iter().rev() {
+            cache.vectors.insert(id.clone(), vec![1.0, 0.0]);
+        }
+        assert_eq!(
+            rank_clip_candidates(&cache, &[1.0, 0.0], None),
+            ids[..count.min(600)]
+        );
+        let selected = HashSet::from([ids[count - 1].clone()]);
+        assert_eq!(
+            rank_clip_candidates(&cache, &[1.0, 0.0], Some(&selected)),
+            vec![ids[count - 1].clone()]
+        );
+        assert!(rank_clip_candidates(&cache, &[1.0, 0.0], Some(&HashSet::new())).is_empty());
     }
 }
 
 #[test]
 fn compact_search_combines_model_supplement_custom_and_filename_filters() {
-    let f=Fixture::new(3);
-    let ids=(0..3).map(|n|f.root.join(format!("image-{n:06}.png")).to_string_lossy().into_owned()).collect::<Vec<_>>();
-    let conn=open_database(&f.state.database_path).unwrap();
-    compact::upsert_auto_tag(&conn,&ids[0],"general","1girl",Some("女孩"),0.8,WD_TAGGER_MODEL_NAME,17).unwrap();
-    compact::upsert_auto_tag(&conn,&ids[0],"general","blue_hair",None,0.7,WD_TAGGER_MODEL_NAME,17).unwrap();
+    let f = Fixture::new(3);
+    let ids = (0..3)
+        .map(|n| {
+            f.root
+                .join(format!("image-{n:06}.png"))
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    let conn = open_database(&f.state.database_path).unwrap();
+    compact::upsert_auto_tag(
+        &conn,
+        &ids[0],
+        "general",
+        "1girl",
+        Some("女孩"),
+        0.8,
+        WD_TAGGER_MODEL_NAME,
+        17,
+    )
+    .unwrap();
+    compact::upsert_auto_tag(
+        &conn,
+        &ids[0],
+        "general",
+        "blue_hair",
+        None,
+        0.7,
+        WD_TAGGER_MODEL_NAME,
+        17,
+    )
+    .unwrap();
     drop(conn);
-    add_image_user_supplement_tag(ids[1].clone(),"1girl".into(),None,&f.state).unwrap();
-    add_image_user_custom_tag(ids[2].clone(),"1girl".into(),&f.state).unwrap();
-    let page=query_gallery(GalleryQuery{tags:vec!["1girl".into()],..Default::default()},&f.state).unwrap();
-    assert_eq!(page.images.iter().map(|i|i.id.clone()).collect::<Vec<_>>(),ids.iter().rev().cloned().collect::<Vec<_>>());
-    let page=query_gallery(GalleryQuery{tags:vec!["1girl".into(),"blue_hair".into()],..Default::default()},&f.state).unwrap();
-    assert_eq!(page.images.len(),1);assert_eq!(page.images[0].id,ids[0]);
-    let page=query_gallery(GalleryQuery{tags:vec!["1girl".into()],file_name:"000001".into(),..Default::default()},&f.state).unwrap();
-    assert_eq!(page.images.len(),1);assert_eq!(page.images[0].id,ids[1]);
-    let page=query_gallery(GalleryQuery{english_query:"1girl".into(),..Default::default()},&f.state).unwrap();
-    assert_eq!(page.images.iter().map(|i|i.id.clone()).collect::<Vec<_>>(),vec![ids[1].clone(),ids[0].clone()]);
+    add_image_user_supplement_tag(ids[1].clone(), "1girl".into(), None, &f.state).unwrap();
+    add_image_user_custom_tag(ids[2].clone(), "1girl".into(), &f.state).unwrap();
+    let page = query_gallery(
+        GalleryQuery {
+            tags: vec!["1girl".into()],
+            ..Default::default()
+        },
+        &f.state,
+    )
+    .unwrap();
+    assert_eq!(
+        page.images.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+        ids.iter().rev().cloned().collect::<Vec<_>>()
+    );
+    let page = query_gallery(
+        GalleryQuery {
+            tags: vec!["1girl".into(), "blue_hair".into()],
+            ..Default::default()
+        },
+        &f.state,
+    )
+    .unwrap();
+    assert_eq!(page.images.len(), 1);
+    assert_eq!(page.images[0].id, ids[0]);
+    let page = query_gallery(
+        GalleryQuery {
+            tags: vec!["1girl".into()],
+            file_name: "000001".into(),
+            ..Default::default()
+        },
+        &f.state,
+    )
+    .unwrap();
+    assert_eq!(page.images.len(), 1);
+    assert_eq!(page.images[0].id, ids[1]);
+    let page = query_gallery(
+        GalleryQuery {
+            english_query: "1girl".into(),
+            ..Default::default()
+        },
+        &f.state,
+    )
+    .unwrap();
+    assert_eq!(
+        page.images.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+        vec![ids[1].clone(), ids[0].clone()]
+    );
 }
 
 #[test]
@@ -709,7 +867,8 @@ fn restart_marks_incomplete_jobs_interrupted() {
     let job = crate::jobs::JobRecord {
         id: "old".into(),
         request: crate::jobs::JobRequest {
-            duplicate_operation_id:None,
+            recycle_operation_id: None,
+            duplicate_operation_id: None,
             duplicate_options: None,
             kind: "scan".into(),
             thumbnails: false,
@@ -722,6 +881,7 @@ fn restart_marks_incomplete_jobs_interrupted() {
         failures: 0,
         errors: vec![],
         updated_at: 0,
+        meta: None,
     };
     let conn = open_database(&f.state.database_path).unwrap();
     conn.execute(

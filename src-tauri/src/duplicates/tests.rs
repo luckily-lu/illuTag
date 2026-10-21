@@ -84,7 +84,7 @@ fn options() -> DuplicateOptions {
     DuplicateOptions {
         sensitivity: "standard".into(),
         force_recompute: false,
-        regroup_only: false,
+        regroup_only: false, verification_mode: "candidate".into(),
     }
 }
 fn digest(path: &std::path::Path) -> Vec<u8> {
@@ -107,11 +107,69 @@ fn groups(state: &AppState, generation: &str) -> DuplicateGroupPage {
 fn ordinary_status_does_not_create_a_cache() {
     let fixture = Fixture::new(2);
     let before = digest(&fixture.state.database_path);
+    cache::membership_invalidated(&fixture.state);
     let info = status(&fixture.state).unwrap();
     assert_eq!(info.state, "empty");
     assert!(info.generation.is_none());
     assert!(!fixture.cache().exists());
     assert_eq!(digest(&fixture.state.database_path), before);
+}
+
+#[test]
+fn active_near_view_rebuilds_direct_stars_after_reference_removal_and_restores_them() {
+    let fixture = Fixture::new(5);
+    fixture.run().unwrap();
+    let generation = status(&fixture.state).unwrap().generation.unwrap();
+    let cache = cache::open_existing(&fixture.state, true).unwrap();
+    cache.execute_batch("BEGIN; DELETE FROM members; DELETE FROM groups;").unwrap();
+    // Reference 0 matches every leaf. Without it only 15~7 and 240~224
+    // remain. Preserve both direct stars without joining them transitively.
+    for (pk, phash) in [(1_i64, 0_u64), (2, 15), (3, 240), (4, 7), (5, 224)] {
+        cache.execute("UPDATE fingerprints SET sha=?2,phash=?3,dhash=?4,low_info=0 WHERE image_pk=?1",
+            params![pk, vec![pk as u8; 32], phash.to_le_bytes().as_slice(), 0_u64.to_le_bytes().as_slice()]).unwrap();
+    }
+    cache.execute("INSERT INTO groups VALUES(?1,1,1,1,5)", [&generation]).unwrap();
+    cache.execute("INSERT INTO members SELECT ?1,1,image_pk-1,image_pk,public_hash,signature,NULL,NULL,NULL FROM fingerprints", [&generation]).unwrap();
+    cache.execute_batch("COMMIT").unwrap();
+    drop(cache);
+    cache::membership_invalidated(&fixture.state);
+    assert_eq!(status(&fixture.state).unwrap().near_groups, 1);
+    let db = Connection::open(&fixture.state.database_path).unwrap();
+    db.execute("UPDATE images SET trashed=1 WHERE image_pk=1", []).unwrap();
+    cache::membership_invalidated(&fixture.state);
+    let cache_before = digest(&fixture.cache());
+    let active = status(&fixture.state).unwrap();
+    assert_eq!(active.generation.as_deref(), Some(generation.as_str()));
+    assert_eq!((active.exact_groups, active.near_groups, active.unique_images), (0, 2, 4));
+    assert!(!active.needs_update);
+    let page = groups(&fixture.state, &generation);
+    assert_eq!(page.total_groups, 2);
+    assert_eq!(page.groups[0].total_members, 2);
+    assert!(page.groups[0].members.iter().all(|member|
+        member.image.id.as_str() == fixture.paths[1].to_string_lossy().as_ref()
+            || member.image.id.as_str() == fixture.paths[3].to_string_lossy().as_ref()));
+    let all = query_members(DuplicateMemberQuery {
+        generation: generation.clone(), group_id: page.groups[0].id.clone(), cursor: None, limit: 200,
+    }, &fixture.state).unwrap();
+    assert_eq!(all.members.len(), 2);
+    assert_eq!(all.total_members, 2);
+    let second = query_members(DuplicateMemberQuery {
+        generation: generation.clone(), group_id: page.groups[1].id.clone(), cursor: None, limit: 200,
+    }, &fixture.state).unwrap();
+    assert_eq!(second.total_members, 2);
+    assert!(second.members.iter().all(|member|
+        member.image.id.as_str() == fixture.paths[2].to_string_lossy().as_ref()
+            || member.image.id.as_str() == fixture.paths[4].to_string_lossy().as_ref()));
+    assert_eq!(digest(&fixture.cache()), cache_before, "active projection never rewrites fingerprints");
+
+    db.execute("UPDATE images SET trashed=0 WHERE image_pk=1", []).unwrap();
+    cache::membership_invalidated(&fixture.state);
+    let restored = status(&fixture.state).unwrap();
+    assert_eq!((restored.near_groups, restored.unique_images), (1, 5));
+    cache::invalidate(&fixture.state);
+    cache::membership_invalidated(&fixture.state);
+    assert!(status(&fixture.state).unwrap().needs_update,
+        "membership refresh must preserve a pre-existing source-dirty flag");
 }
 
 #[test]

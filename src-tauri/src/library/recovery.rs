@@ -60,7 +60,7 @@ pub fn begin_maintenance(state: &AppState) -> Result<MaintenanceGuard<'_>, Strin
         .jobs
         .list()?
         .iter()
-        .any(|j| ["queued", "running", "paused", "cancelling"].contains(&j.state.as_str()))
+        .any(|j| ["queued", "running", "pausing", "paused", "cancelling"].contains(&j.state.as_str()))
         || *state
             .background_scan_running
             .lock()
@@ -414,6 +414,7 @@ pub fn remap_database_paths(path: &Path, mappings: &[BackupPathMapping]) -> Resu
             }
         }
     }
+    tag_covers::remap_choices(&tx, mappings)?;
     tx.commit().map_err(|e| e.to_string())?;
     verify_database(&conn)
 }

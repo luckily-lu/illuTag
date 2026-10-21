@@ -90,6 +90,31 @@ export function useGallery() {
     revision.value = page.revision;
     loading.value = false;
   }
+  function removeImage(id: string, nextRevision: number) {
+    generation.invalidate();
+    const before = images.value.length;
+    images.value = images.value.filter((i) => i.id !== id);
+    total.value = Math.max(0, total.value - (before - images.value.length));
+    revision.value = nextRevision;
+    loading.value = false;
+    pageLoading.value = false;
+  }
+  function restoreImage(
+    image: GalleryImage,
+    index: number,
+    nextRevision: number,
+  ) {
+    generation.invalidate();
+    if (!images.value.some((i) => i.id === image.id)) {
+      const next = [...images.value];
+      next.splice(Math.max(0, index), 0, image);
+      images.value = next;
+      total.value++;
+    }
+    revision.value = nextRevision;
+    loading.value = false;
+    pageLoading.value = false;
+  }
   function resetFilters() {
     generation.invalidate();
     query.value.scope = "all";
@@ -114,6 +139,8 @@ export function useGallery() {
     patch,
     resetFilters,
     adopt,
+    removeImage,
+    restoreImage,
     hasMore: computed(() => images.value.length < total.value),
   };
 }

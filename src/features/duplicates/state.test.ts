@@ -50,6 +50,7 @@ const status = (
 ): DuplicateStatus => ({
   generation,
   sensitivity: "standard",
+  verificationMode: "candidate",
   checkedAt: null,
   durationMs: null,
   state: generation ? "ready" : "empty",
@@ -61,6 +62,9 @@ const status = (
     skippedNear: 0,
     lowInformation: 0,
     tooDense: 0,
+    verifiedPairs: 0,
+    contentVariants: 0,
+    uncertainPairs: 0,
   },
   cacheBytes: 1024,
   exactGroups: 1,
@@ -172,6 +176,7 @@ describe("查重查询状态", () => {
     expect(d.status.value.sensitivity).toBe("standard");
     expect(d.options(true)).toEqual({
       sensitivity: "loose",
+      verificationMode: "verified",
       forceRecompute: false,
       regroupOnly: true,
     });
@@ -180,6 +185,16 @@ describe("查重查询状态", () => {
     d.status.value = status();
     d.forceRecompute.value = true;
     expect(d.options(true).regroupOnly).toBe(false);
+  });
+  it("默认使用细节复核；切换模式仅在手动检索后生效", () => {
+    const d = useDuplicates();
+    d.status.value = status();
+    expect(d.options(true).verificationMode).toBe("verified");
+    expect(d.pendingSensitivity.value).toBe(true);
+    d.verificationMode.value = "candidate";
+    expect(d.pendingSensitivity.value).toBe(false);
+    expect(d.status.value.verificationMode).toBe("candidate");
+    expect(api.duplicateGroups).not.toHaveBeenCalled();
   });
   it("取消或部分完成记录保留上一代完整结果", async () => {
     const d = useDuplicates();

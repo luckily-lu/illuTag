@@ -9,6 +9,7 @@ export function useDuplicates() {
   const groups = shallowRef<DuplicateGroup[]>([]);
   const kind = ref("all"),
     sensitivity = ref("standard"),
+    verificationMode = ref("verified"),
     forceRecompute = ref(false);
   const loading = ref(false),
     pageLoading = ref(false),
@@ -22,12 +23,15 @@ export function useDuplicates() {
   const pendingSensitivity = computed(
     () =>
       !!status.value?.generation &&
-      sensitivity.value !== status.value.sensitivity,
+      (sensitivity.value !== status.value.sensitivity ||
+        verificationMode.value !==
+          (status.value.verificationMode || "candidate")),
   );
 
   function options(regroupOnly = false): DuplicateOptions {
     return {
       sensitivity: sensitivity.value,
+      verificationMode: verificationMode.value,
       forceRecompute: forceRecompute.value,
       regroupOnly:
         regroupOnly &&
@@ -163,15 +167,19 @@ export function useDuplicates() {
     const generation = status.value?.generation;
     if (!generation) return;
     const token = epoch;
-    const wanted = groups.value.filter(group => truncated || groupIds.includes(group.id)).map(group => group.id);
+    const wanted = groups.value
+      .filter((group) => truncated || groupIds.includes(group.id))
+      .map((group) => group.id);
     for (const groupId of wanted) {
       try {
         const group = await api.duplicateGroup({ generation, groupId });
         if (token !== epoch || generation !== status.value?.generation) return;
         groups.value = group
-          ? groups.value.map(old => old.id === groupId ? group : old)
-          : groups.value.filter(old => old.id !== groupId);
-      } catch (e) { if (token === epoch) error.value = errorMessage(e); }
+          ? groups.value.map((old) => (old.id === groupId ? group : old))
+          : groups.value.filter((old) => old.id !== groupId);
+      } catch (e) {
+        if (token === epoch) error.value = errorMessage(e);
+      }
     }
   }
   function dispose() {
@@ -191,6 +199,7 @@ export function useDuplicates() {
     totalGroups,
     memberLoading,
     pendingSensitivity,
+    verificationMode,
     options,
     refresh,
     loadGroups,

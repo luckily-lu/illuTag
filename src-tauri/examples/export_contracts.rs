@@ -3,12 +3,21 @@ use ts_rs::{Config, TS};
 use illutag_core::duplicates::*;
 fn main() {
     let config = Config::from_env();
+    use illutag_core::library::recycle::*;
+    RecycleSelectionRequest::export_all(&config).unwrap();
+    RecycleSelection::export_all(&config).unwrap();
+    RecycleApplyRequest::export_all(&config).unwrap();
+    RecycleOperationStatus::export_all(&config).unwrap();
+    RecycleOperationQuery::export_all(&config).unwrap();
+    RecycleOperationPage::export_all(&config).unwrap();
     RestoreManifest::export_all(&config).unwrap();
     OrganizedExportReport::export_all(&config).unwrap();
     BackupPathMapping::export_all(&config).unwrap();
     Bootstrap::export_all(&config).unwrap();
     NavigationMetadata::export_all(&config).unwrap();
     TagLabel::export_all(&config).unwrap();
+    TagCover::export_all(&config).unwrap();
+    TagCoverRequest::export_all(&config).unwrap();
     QueryPage::export_all(&config).unwrap();
     GalleryQuery::export_all(&config).unwrap();
     ImageDetail::export_all(&config).unwrap();
@@ -16,6 +25,8 @@ fn main() {
     MutationResult::export_all(&config).unwrap();
     AppError::export_all(&config).unwrap();
     JobRecord::export_all(&config).unwrap();
+    JobHistoryQuery::export_all(&config).unwrap();
+    JobHistoryPage::export_all(&config).unwrap();
     TagManagementState::export_all(&config).unwrap();
     TagDictionaryBrowserState::export_all(&config).unwrap();
     UserFolderRule::export_all(&config).unwrap();
@@ -33,4 +44,9 @@ fn main() {
     DuplicateOperationQuery::export_all(&config).unwrap();
     DuplicateOperationPage::export_all(&config).unwrap();
     DuplicateGroupQuery::export_all(&config).unwrap();
+    DuplicateWorkflowStatus::export_all(&config).unwrap();
+    DuplicateWorkflowQuery::export_all(&config).unwrap();
+    DuplicateWorkflowPage::export_all(&config).unwrap();
+    DuplicateReviewEdit::export_all(&config).unwrap();
+    DuplicateWorkflowRequest::export_all(&config).unwrap();
 }

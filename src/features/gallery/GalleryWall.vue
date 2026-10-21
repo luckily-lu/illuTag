@@ -100,7 +100,7 @@ function enter(id: string, event: PointerEvent) {
     selection.active.value &&
     event.buttons === 1 &&
     sweep &&
-    !selection.ids.value.has(id)
+    !selection.isSelected(id)
   )
     selection.toggle(id);
 }
@@ -166,7 +166,7 @@ onUnmounted(() => {
         v-for="item in rendered"
         :key="item.id"
         class="image-tile"
-        :class="{ 'is-selected': selection.ids.value.has(item.id) }"
+        :class="{ 'is-selected': selection.isSelected(item.id) }"
         :data-gallery-image-id="item.id"
         :style="{
           left: item.x + 'px',
@@ -184,9 +184,7 @@ onUnmounted(() => {
               : '查看 ' + byId.get(item.id)?.fileName
           "
           :aria-pressed="
-            selection.active.value
-              ? selection.ids.value.has(item.id)
-              : undefined
+            selection.active.value ? selection.isSelected(item.id) : undefined
           "
           @click="click(item.id)"
           @pointerdown="down(item.id, $event)"
@@ -201,7 +199,9 @@ onUnmounted(() => {
           />
         </button>
         <button
-          v-if="!selection.active.value"
+          v-if="
+            !selection.active.value && gallery.query.value.scope !== 'trash'
+          "
           class="tile-action tile-select"
           aria-label="选择图片"
           @click.stop="selection.toggle(item.id)"
@@ -209,6 +209,7 @@ onUnmounted(() => {
           <AppIcon name="check" :size="17" />
         </button>
         <button
+          v-if="gallery.query.value.scope !== 'trash'"
           class="tile-action tile-favorite"
           :class="{ 'is-active': byId.get(item.id)?.isFavorite }"
           :aria-label="byId.get(item.id)?.isFavorite ? '取消收藏' : '收藏图片'"
@@ -221,7 +222,7 @@ onUnmounted(() => {
           />
         </button>
         <span
-          v-if="selection.ids.value.has(item.id)"
+          v-if="selection.isSelected(item.id)"
           class="selection-check"
           aria-hidden="true"
           ><AppIcon name="check" :size="17"

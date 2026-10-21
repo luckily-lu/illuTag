@@ -1,12 +1,25 @@
 <script setup lang="ts">
 import SoftSelect from "../../shared/ui/SoftSelect.vue";
 import AppIcon from "../../shared/ui/AppIcon.vue";
+import SoftDialog from "../../shared/ui/SoftDialog.vue";
 import { onMounted, ref } from "vue";
 import { useTagManagement } from "../../composables/useTagManagement";
 import { errorMessage, invoke } from "../../shared/ipc";
 const error = ref(""),
   editName = ref(""),
   editing = ref<number | null>(null);
+const pendingDelete = ref<{
+  title: string;
+  text: string;
+  command: string;
+  args: Record<string, unknown>;
+} | null>(null);
+async function confirmDelete() {
+  const pending = pendingDelete.value;
+  if (!pending) return;
+  pendingDelete.value = null;
+  await call(pending.command, pending.args);
+}
 const t = useTagManagement({
   formatError: errorMessage,
   setErrorText: (v) => (error.value = v),
@@ -37,7 +50,7 @@ function drop(e: DragEvent, id: number | null) {
 </script>
 <template>
   <section class="page-content">
-    <h1>标签</h1>
+    <h1>我的标签</h1>
     <p>整理自定义标签，或从标签字典查找图片。</p>
     <div class="segmented">
       <button
@@ -109,11 +122,14 @@ function drop(e: DragEvent, id: number | null) {
             >
               重命名</button
             ><button
-              class="soft-button"
+              class="soft-button danger"
               @click="
-                call('delete_user_tag_folder_command', {
-                  folderId: t.activeTagManagerFolderId.value,
-                })
+                pendingDelete = {
+                  title: '删除标签文件夹',
+                  text: '删除此标签分组，组内标签保留并回到未分类；分组结构无法撤销。',
+                  command: 'delete_user_tag_folder_command',
+                  args: { folderId: t.activeTagManagerFolderId.value },
+                }
               "
             >
               删除标签文件夹
@@ -148,9 +164,15 @@ function drop(e: DragEvent, id: number | null) {
               @dragstart="$event.dataTransfer?.setData('illutag/tag', tag)"
               ><button @click="emit('search', tag)">{{ tag }}</button
               ><button
+                class="danger"
                 aria-label="删除标签"
                 @click="
-                  call('delete_user_custom_tag_command', { tagText: tag })
+                  pendingDelete = {
+                    title: '删除自定义标签',
+                    text: `删除「${tag}」以及它与图片的关联；此操作无法撤销，图片原文件保留。`,
+                    command: 'delete_user_custom_tag_command',
+                    args: { tagText: tag },
+                  }
                 "
               >
                 <AppIcon name="close" :size="14" /></button
@@ -226,6 +248,18 @@ function drop(e: DragEvent, id: number | null) {
       >
         加载更多标签
       </button></template
+    >
+    <SoftDialog
+      v-if="pendingDelete"
+      :title="pendingDelete.title"
+      @close="pendingDelete = null"
+      ><p>{{ pendingDelete.text }}</p>
+      <template #actions
+        ><button class="text-button" @click="pendingDelete = null">取消</button
+        ><button class="soft-button danger" @click="confirmDelete">
+          确认删除
+        </button></template
+      ></SoftDialog
     >
   </section>
 </template>

@@ -9,25 +9,11 @@ const props = withDefaults(
     candidate: DuplicateMember;
     kind: string;
     candidates?: DuplicateMember[];
-    referenceKept?: boolean;
-    candidateKept?: boolean;
-    referenceSelected?: boolean;
-    candidateSelected?: boolean;
-    referenceProcessed?: boolean;
-    candidateProcessed?: boolean;
-    disabled?: boolean;
     canMore?: boolean;
     loadingMore?: boolean;
   }>(),
   {
     candidates: () => [],
-    referenceKept: false,
-    candidateKept: false,
-    referenceSelected: false,
-    candidateSelected: false,
-    referenceProcessed: false,
-    candidateProcessed: false,
-    disabled: false,
     canMore: false,
     loadingMore: false,
   },
@@ -35,10 +21,7 @@ const props = withDefaults(
 const emit = defineEmits<{
   close: [];
   change: [member: DuplicateMember];
-  keep: [member: DuplicateMember];
-  select: [member: DuplicateMember];
   more: [];
-  manage: [];
 }>();
 const index = computed(() =>
   props.candidates.findIndex(
@@ -125,22 +108,11 @@ onUnmounted(() => {
       >
       <button
         class="soft-button compact"
-        :disabled="
-          disabled ||
-          loadingMore ||
-          (index >= candidates.length - 1 && !canMore)
-        "
+        :disabled="loadingMore || (index >= candidates.length - 1 && !canMore)"
         aria-label="下一张候选"
         @click="step(1)"
       >
         {{ loadingMore ? "读取中…" : "下一张" }}
-      </button>
-      <button
-        class="soft-button compact primary"
-        :disabled="disabled"
-        @click="emit('manage')"
-      >
-        处理选中项
       </button>
     </header>
     <p
@@ -150,51 +122,8 @@ onUnmounted(() => {
       文件已变化，本次结果可能失效。关闭比对后请更新结果。
     </p>
     <div class="duplicate-comparison-body">
-      <PanImage :member="reference" label="参考图"
-        ><template #review
-          ><div class="duplicate-compare-actions">
-            <button
-              class="soft-button compact"
-              :aria-label="'保留：' + reference.image.fileName"
-              :aria-pressed="referenceKept"
-              :disabled="disabled || referenceProcessed"
-              @click="emit('keep', reference)"
-            >
-              {{ referenceKept ? "已保留" : "保留参考图" }}</button
-            ><label
-              ><input
-                type="checkbox"
-                :aria-label="'待处理：' + reference.image.fileName"
-                :checked="referenceSelected"
-                :disabled="disabled || referenceKept || reference.stale || referenceProcessed"
-                @change="emit('select', reference)"
-              />待处理</label
-            >
-          </div></template
-        ></PanImage
-      ><PanImage :member="candidate" label="候选图"
-        ><template #review
-          ><div class="duplicate-compare-actions">
-            <button
-              class="soft-button compact"
-              :aria-label="'保留：' + candidate.image.fileName"
-              :aria-pressed="candidateKept"
-              :disabled="disabled || candidateProcessed"
-              @click="emit('keep', candidate)"
-            >
-              {{ candidateKept ? "已保留" : "保留候选图" }}</button
-            ><label
-              ><input
-                type="checkbox"
-                :aria-label="'待处理：' + candidate.image.fileName"
-                :checked="candidateSelected"
-                :disabled="disabled || candidateKept || candidate.stale || candidateProcessed"
-                @change="emit('select', candidate)"
-              />待处理</label
-            >
-          </div></template
-        ></PanImage
-      >
+      <PanImage :member="reference" label="参考图" />
+      <PanImage :member="candidate" label="候选图" />
     </div>
     <footer v-if="kind === 'near'" class="duplicate-comparison-footer">
       候选筛选指标：pHash 距离 {{ candidate.metric.phashDistance ?? "—" }} ·

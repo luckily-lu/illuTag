@@ -54,6 +54,30 @@ fn trashed(f: &Fixture, index: usize) -> bool {
 }
 
 #[test]
+fn physical_alias_preflight_releases_library_readers_before_pause_acknowledgement() {
+    let f = Fixture::new(1005);
+    f.run().unwrap();
+    let db = Connection::open(&f.state.database_path).unwrap();
+    db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA busy_timeout=40;")
+        .unwrap();
+    let cache = cache::open_existing(&f.state, false).unwrap();
+    let target = item(&cache, &db, 1, None).unwrap();
+    db.execute("UPDATE images SET trashed=1 WHERE image_pk=1", [])
+        .unwrap();
+    let mut calls = 0;
+    validate_physical_aliases(&[&target],&f.state,&mut ||{
+        db.execute("INSERT OR REPLACE INTO task_runs(id,kind,state,payload,updated_at) VALUES('alias-pause','duplicateManagement','paused','{}',1)",[]).map_err(|e|format!("pause writer blocked: {e}"))?;
+        calls+=1;
+        Ok(())
+    }).unwrap();
+    assert!(calls >= 3);
+    assert!(
+        f.paths.iter().all(|p| p.exists()),
+        "preflight must not move any file"
+    );
+}
+
+#[test]
 fn management_auto_exact_batch_keeps_one_per_exact_group_and_excludes_near() {
     let f = Fixture::new(13);
     let second = image::RgbImage::from_fn(64, 48, |x, y| {

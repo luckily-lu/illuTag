@@ -34,6 +34,7 @@ function record(state: string): JobRecord {
       duplicateOperationId: null,
       duplicateOptions: {
         sensitivity: "standard",
+        verificationMode: "verified",
         forceRecompute: false,
         regroupOnly: false,
       },
@@ -90,6 +91,7 @@ describe("查重任务事件", () => {
     await flushPromises();
     const options = {
       sensitivity: "loose",
+      verificationMode: "verified",
       forceRecompute: true,
       regroupOnly: false,
     };

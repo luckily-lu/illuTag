@@ -347,10 +347,7 @@ pub fn pause_background_scan(state: &AppState) -> Result<bool, String> {
     if let Ok(mut pause_requested) = state.background_scan_pause_requested.lock() {
         *pause_requested = true;
     }
-    update_scan_progress(&state.background_scan_progress, |progress| {
-        progress.paused = true;
-        progress.phase = "paused".to_string();
-    });
+    // The executor marks progress paused when it reaches its next safe point.
     Ok(true)
 }
 
@@ -611,10 +608,7 @@ pub fn pause_thumbnail_generation(state: &AppState) -> Result<bool, String> {
     if let Ok(mut pause_requested) = state.thumbnail_generation_pause_requested.lock() {
         *pause_requested = true;
     }
-    update_thumbnail_progress(&state.thumbnail_generation_progress, |progress| {
-        progress.paused = true;
-        progress.phase = "paused".to_string();
-    });
+    // The executor marks progress paused when it reaches its next safe point.
     Ok(true)
 }
 
@@ -829,10 +823,7 @@ pub fn pause_natural_language_scan(state: &AppState) -> Result<bool, String> {
     if let Ok(mut pause_requested) = state.natural_language_scan_pause_requested.lock() {
         *pause_requested = true;
     }
-    update_natural_language_scan_progress(&state.natural_language_scan_progress, |progress| {
-        progress.paused = true;
-        progress.phase = "paused".to_string();
-    });
+    // The executor marks progress paused when it reaches its next safe point.
     Ok(true)
 }
 

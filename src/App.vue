@@ -14,20 +14,27 @@ import GalleryToolbar from "./features/gallery/GalleryToolbar.vue";
 import GalleryWall from "./features/gallery/GalleryWall.vue";
 import SearchBar from "./features/search/SearchBar.vue";
 import ImageViewer from "./features/viewer/ImageViewer.vue";
-import TagManager from "./features/tags/TagManager.vue";
+import { useViewerRemoval } from "./features/viewer/useViewerRemoval";
+import TagManager from "./features/tags/TagWorkbench.vue";
+import { useTagWorkbench } from "./features/tags/useTagWorkbench";
 import TaskCenter from "./features/jobs/TaskCenter.vue";
 import SettingsPage from "./features/settings/SettingsPage.vue";
 import DuplicatePage from "./features/duplicates/DuplicatePage.vue";
 import { useDuplicates } from "./features/duplicates/useDuplicates";
-import { useDuplicateReview } from "./features/duplicates/useDuplicateReview";
+import { useDuplicateBatches } from "./features/duplicates/useDuplicateBatches";
+import { useRecycleBin } from "./features/gallery/useRecycleBin";
+import RecycleBinPanel from "./features/gallery/RecycleBinPanel.vue";
 import SoftDialog from "./shared/ui/SoftDialog.vue";
+import ErrorDialog from "./shared/ui/ErrorDialog.vue";
 import type { GalleryImage } from "./shared/contracts/GalleryImage";
 import type { LibraryFolder } from "./shared/contracts/LibraryFolder";
 import type { ImageMutation } from "./shared/contracts/ImageMutation";
 import type { UserFolderRuleCondition } from "./shared/contracts/UserFolderRuleCondition";
 import type { DuplicateOptions } from "./shared/contracts/DuplicateOptions";
 const gallery = useGallery(),
+  tagWorkspace = useTagWorkbench(),
   selection = useSelection(),
+  recycleBin = useRecycleBin(),
   folders = useFolders(),
   preferences = usePreferences();
 provideWorkspace({ gallery, selection });
@@ -39,8 +46,8 @@ const page = ref("gallery"),
   notice = ref(""),
   pinned = ref(false);
 const duplicateRefreshVersion = ref(0);
-const duplicates = useDuplicates(), duplicateReview = useDuplicateReview();
-watch(() => duplicates.status.value?.generation, value => duplicateReview.adopt(value ?? null));
+const duplicates = useDuplicates(),
+  duplicateBatches = useDuplicateBatches();
 const jobs = useJobs(
   () => {
     duplicateRefreshVersion.value++;
@@ -48,12 +55,59 @@ const jobs = useJobs(
     if (page.value === "gallery") void gallery.search();
   },
   (job) => {
-    if (["duplicates", "duplicateManagement", "duplicateUndo"].includes(job.request.kind)) {
-      duplicateReview.observe(job);
+    if (
+      ["duplicates", "duplicateManagement", "duplicateUndo"].includes(
+        job.request.kind,
+      )
+    ) {
+      duplicateBatches.observe(job);
       duplicateRefreshVersion.value++;
     }
   },
 );
+const recycleJob = computed(() =>
+  jobs.rows.value.find((j) =>
+    ["recycleRestore", "recycleDelete"].includes(j.request.kind),
+  ),
+);
+const viewerRemoval = useViewerRemoval(
+  viewer,
+  () => {
+    if (page.value === "tags")
+      return {
+        key: "tags:" + JSON.stringify(tagWorkspace.selected.value),
+        images: tagWorkspace.images.value,
+        total: tagWorkspace.total.value,
+        remove: tagWorkspace.removeImage,
+        restore: tagWorkspace.restoreImage,
+        more: () => tagWorkspace.preview(true),
+      };
+    return {
+      key: "gallery:" + JSON.stringify(gallery.query.value),
+      images: gallery.images.value,
+      total: gallery.total.value,
+      remove: gallery.removeImage,
+      restore: gallery.restoreImage,
+      more: gallery.more,
+    };
+  },
+  () => {
+    duplicateRefreshVersion.value++;
+    void refresh();
+  },
+);
+const recycleStateNames: Record<string, string> = {
+  queued: "排队中",
+  running: "处理中",
+  paused: "已暂停",
+  pausing: "正在暂停",
+  cancelling: "正在停止",
+  cancelled: "已停止",
+  interrupted: "已中断",
+  completed: "已完成",
+  partial: "部分完成",
+  failed: "失败",
+};
 const scopeName = computed(() =>
   gallery.query.value.unclassifiedOnlyParentFolderId !== null
     ? (folders.folders.value.find(
@@ -103,6 +157,111 @@ async function go(scope: string, folderId: number | null = null) {
   selection.clear();
   await gallery.search();
 }
+const hasGalleryFilters = computed(() => {
+  const q = gallery.query.value;
+  return !!(
+    q.tags.length ||
+    q.englishQuery ||
+    q.fileName ||
+    q.naturalLanguage ||
+    q.folderId !== null ||
+    q.unclassifiedOnlyParentFolderId !== null
+  );
+});
+const recycleSelectedBytes = computed(() => {
+  if (!selection.allSelection.value)
+    return selection.count.value
+      ? gallery.images.value
+          .filter((i) => selection.ids.value.has(i.id))
+          .reduce((n, i) => n + i.fileSize, 0)
+      : 0;
+  const loaded = new Map(gallery.images.value.map((i) => [i.id, i.fileSize]));
+  return Math.max(
+    0,
+    recycleBin.totalBytes.value -
+      Array.from(selection.excludedIds.value).reduce(
+        (n, id) => n + (loaded.get(id) ?? 0),
+        0,
+      ),
+  );
+});
+let frozenRecycleQuery = "",
+  frozenRecycleRevision = -1;
+watch(
+  [() => JSON.stringify(gallery.query.value), gallery.revision],
+  ([queryKey, revision]) => {
+    if (
+      selection.allSelection.value &&
+      (queryKey !== frozenRecycleQuery || revision !== frozenRecycleRevision)
+    ) {
+      selection.clear();
+      recycleBin.selectionId.value = null;
+    }
+  },
+);
+async function selectRecycleResults() {
+  try {
+    const query = {
+      ...gallery.query.value,
+      tags: [...gallery.query.value.tags],
+    };
+    const queryKey = JSON.stringify(query),
+      revision = gallery.revision.value;
+    const snapshot = await recycleBin.selectAll(query);
+    if (
+      JSON.stringify(gallery.query.value) !== queryKey ||
+      gallery.revision.value !== revision
+    ) {
+      recycleBin.selectionId.value = null;
+      return;
+    }
+    frozenRecycleQuery = queryKey;
+    frozenRecycleRevision = revision;
+    selection.selectAllResults(snapshot.count);
+  } catch (e) {
+    error.value = errorMessage(e);
+  }
+}
+async function prepareRecycleAction(action: "restore" | "systemTrash") {
+  try {
+    await recycleBin.apply(
+      action,
+      gallery.query.value,
+      Array.from(selection.ids.value),
+      selection.allSelection.value ? recycleBin.selectionId.value : null,
+      selection.allSelection.value
+        ? Array.from(selection.excludedIds.value)
+        : [],
+      !selection.active.value,
+    );
+  } catch (e) {
+    error.value = errorMessage(e);
+  }
+}
+async function emptyRecycleBin() {
+  try {
+    await recycleBin.empty(gallery.query.value);
+  } catch (e) {
+    error.value = errorMessage(e);
+  }
+}
+async function retryRecycleOperation(operationId: string, kind: string) {
+  try {
+    await recycleBin.resume(
+      operationId,
+      kind === "recycleDelete" ? "systemTrash" : "restore",
+    );
+  } catch (e) {
+    error.value = errorMessage(e);
+  }
+}
+async function commitRecycleAction() {
+  await recycleBin.confirmApply();
+  if (!recycleBin.confirm.value) {
+    selection.clear();
+    await gallery.search();
+  }
+}
 async function mutate(
   action: string,
   ids = Array.from(selection.ids.value),
@@ -123,6 +282,10 @@ async function mutate(
       ...extra,
     });
     gallery.patch(result.images);
+    const updates = new Map(result.images.map((image) => [image.id, image]));
+    tagWorkspace.images.value = tagWorkspace.images.value.map(
+      (image) => updates.get(image.id) ?? image,
+    );
     if (viewer.value)
       viewer.value =
         result.images.find((i) => i.id === viewer.value?.id) ?? viewer.value;
@@ -141,7 +304,10 @@ async function mutate(
   }
 }
 function favorite(id: string) {
-  const image = gallery.images.value.find((i) => i.id === id);
+  const image =
+    gallery.images.value.find((i) => i.id === id) ??
+    tagWorkspace.images.value.find((i) => i.id === id) ??
+    (viewer.value?.id === id ? viewer.value : null);
   if (image) void mutate("favorite", [id], { favorite: !image.isFavorite });
 }
 function openDialog(
@@ -217,14 +383,35 @@ async function startDuplicates(options: DuplicateOptions) {
   return jobs.start("duplicates", preferences.thumbnails.value, null, options);
 }
 function openDuplicateOperation(operationId?: string | null) {
-  if (operationId) duplicateReview.activeOperationId.value = operationId;
+  if (operationId) duplicateBatches.activeOperationId.value = operationId;
   page.value = "duplicates";
 }
 function tagSearch(tag: string) {
   viewer.value = null;
+  if (page.value === "tags") {
+    if (!tagWorkspace.selected.value.includes(tag))
+      tagWorkspace.selected.value = [...tagWorkspace.selected.value, tag];
+    return;
+  }
   page.value = "gallery";
   if (!gallery.query.value.tags.includes(tag))
     gallery.query.value.tags.push(tag);
+  void gallery.search();
+}
+function browseTags(tags: string[]) {
+  selection.clear();
+  gallery.query.value = {
+    ...gallery.query.value,
+    scope: "all",
+    folderId: null,
+    unclassifiedOnlyParentFolderId: null,
+    tags: [...tags],
+    englishQuery: "",
+    fileName: "",
+    naturalLanguage: "",
+    offset: 0,
+  };
+  page.value = "gallery";
   void gallery.search();
 }
 async function unclassified(id: number) {
@@ -291,7 +478,13 @@ function openImage(image: GalleryImage) {
   if (!suppressOpen) viewer.value = image;
 }
 function key(e: KeyboardEvent) {
-  if (e.key !== "Escape" || dialog.value || viewer.value) return;
+  if (
+    e.key !== "Escape" ||
+    dialog.value ||
+    viewer.value ||
+    document.querySelector(".soft-dialog")
+  )
+    return;
   if (drawer.value) {
     drawer.value = false;
     e.preventDefault();
@@ -305,7 +498,20 @@ function key(e: KeyboardEvent) {
 function windowAction(command: string) {
   void invoke(command).catch((e) => (error.value = errorMessage(e)));
 }
+function startWindowDrag(event: PointerEvent) {
+  if (
+    event.button !== 0 ||
+    !(event.target instanceof Element) ||
+    event.target.closest("button, a, input, select, textarea, [role='button']")
+  )
+    return;
+  event.preventDefault();
+  windowAction("window_start_dragging_command");
+}
 onMounted(async () => {
+  void duplicateBatches.connect().catch((e) => {
+    error.value = errorMessage(e);
+  });
   window.addEventListener("keydown", key);
   window.addEventListener("pointermove", dragMove);
   window.addEventListener("pointerup", dragEnd);
@@ -325,6 +531,7 @@ onMounted(async () => {
 });
 onUnmounted(() => {
   duplicates.dispose();
+  duplicateBatches.dispose();
   clearTimeout(dragTimer);
   window.removeEventListener("keydown", key);
   window.removeEventListener("pointermove", dragMove);
@@ -342,14 +549,14 @@ onUnmounted(() => {
       'auto-title': preferences.hideTitle.value,
     }"
   >
-    <header class="titlebar">
-      <div
-        class="brand"
-        @pointerdown.self="windowAction('window_start_dragging_command')"
-      >
-        illuTag <small>画廊工作台</small>
-      </div>
-      <span class="spacer" data-tauri-drag-region /><button
+    <div
+      v-if="preferences.hideTitle.value"
+      class="titlebar-reveal"
+      aria-hidden="true"
+    />
+    <header class="titlebar" @pointerdown="startWindowDrag">
+      <div class="brand">illuTag <small>画廊工作台</small></div>
+      <span class="spacer" /><button
         class="window-control"
         :aria-pressed="pinned"
         aria-label="窗口置顶"
@@ -442,10 +649,18 @@ onUnmounted(() => {
             :total="gallery.total.value"
             :active="selection.active.value"
             :count="selection.count.value"
-            :busy="busy"
+            :busy="busy || recycleBin.busy.value"
             :scope="gallery.query.value.scope"
+            :selection-bytes="recycleSelectedBytes"
+            :selected-count="selection.count.value"
+            :has-filters="hasGalleryFilters"
             @select-all="selection.all(gallery.images.value)"
             @select="selection.active.value = true"
+            @select-all-results="selectRecycleResults"
+            @clear-selection="selection.clear()"
+            @restore="prepareRecycleAction('restore')"
+            @empty-trash="emptyRecycleBin"
+            @system-trash-selected="prepareRecycleAction('systemTrash')"
             @done="selection.clear()"
             @favorite="mutate('favorite', undefined, { favorite: true })"
             @dialog="(kind, title) => openDialog(kind, title)"
@@ -457,14 +672,67 @@ onUnmounted(() => {
             @immersive="
               preferences.immersive.value = !preferences.immersive.value
             "
-            @random="go('random')" />
-          <p v-if="error" class="inline-error" role="alert">
-            {{ error
-            }}<button aria-label="关闭提示" @click="error = ''">
-              <AppIcon name="close" :size="16" />
+            @random="go('random')"
+          />
+          <div
+            v-if="gallery.query.value.scope === 'trash' && recycleJob"
+            class="recycle-job-status"
+            role="status"
+          >
+            <span
+              >{{
+                recycleJob.request.kind === "recycleRestore"
+                  ? "还原图片"
+                  : "移入 Windows 回收站"
+              }}
+              ·
+              {{
+                recycleStateNames[recycleJob.state] ?? recycleJob.state
+              }}</span
+            >
+            <span
+              >{{ recycleJob.processed.toLocaleString() }} /
+              {{ recycleJob.total.toLocaleString() }} 张<span
+                v-if="recycleJob.failures"
+              >
+                · {{ recycleJob.failures }} 项失败</span
+              ></span
+            >
+            <progress
+              v-if="recycleJob.total > 0"
+              :value="recycleJob.processed"
+              :max="recycleJob.total"
+            />
+            <button
+              v-if="recycleJob.state === 'running'"
+              class="text-button"
+              @click="jobs.control(recycleJob.id, 'pause')"
+            >
+              暂停
             </button>
-          </p>
-          <p v-else-if="notice" class="inline-notice" role="status">
+            <button
+              v-if="recycleJob.state === 'paused'"
+              class="text-button"
+              @click="jobs.control(recycleJob.id, 'resume')"
+            >
+              继续
+            </button>
+            <button
+              v-if="
+                ['queued', 'running', 'pausing', 'paused'].includes(
+                  recycleJob.state,
+                )
+              "
+              class="text-button"
+              @click="jobs.control(recycleJob.id, 'cancel')"
+            >
+              停止
+            </button>
+            <button class="text-button" @click="page = 'tasks'">
+              查看任务详情
+            </button>
+          </div>
+          <p v-if="notice" class="inline-notice" role="status">
             {{ notice
             }}<button aria-label="关闭提示" @click="notice = ''">
               <AppIcon name="close" :size="16" />
@@ -474,8 +742,12 @@ onUnmounted(() => {
             :thumbnails="preferences.thumbnails.value"
             @open="openImage"
             @favorite="favorite"
-            @drag="beginDrag"
-        /></template>
+            @drag="
+              (id, event) =>
+                gallery.query.value.scope !== 'trash' && beginDrag(id, event)
+            "
+          />
+        </template>
         <template v-else
           ><button
             class="soft-button page-nav-opener"
@@ -488,8 +760,14 @@ onUnmounted(() => {
             :rows="jobs.rows.value"
             :error="jobs.error.value"
             :thumbnails="preferences.thumbnails.value"
+            :sources="sources"
+            :controlling="jobs.controlling.value"
+            @retry="jobs.retry"
+            @history-cleared="jobs.forgetHistory"
             @start="(kind, options) => start(kind, null, options ?? null)"
             @duplicates="openDuplicateOperation"
+            @recycle-bin="go('trash')"
+            @recycle-retry="retryRecycleOperation"
             @control="jobs.control" /><DuplicatePage
             v-else-if="page === 'duplicates'"
             :jobs="jobs.rows.value"
@@ -497,14 +775,15 @@ onUnmounted(() => {
             :task-error="jobs.error.value"
             :start-job="startDuplicates"
             :workspace="duplicates"
-            :review="duplicateReview"
+            :batches="duplicateBatches"
             :folders="folders.folders.value"
-            :sources="sources"
             :control-job="jobs.control"
             @job-created="jobs.refresh()"
             @tasks="page = 'tasks'" /><TagManager
             v-else-if="page === 'tags'"
-            @search="tagSearch" /><SettingsPage
+            :workspace="tagWorkspace"
+            @browse="browseTags"
+            @open="viewer = $event" /><SettingsPage
             v-else
             :sources="sources"
             v-model:thumbnails="preferences.thumbnails.value"
@@ -514,17 +793,76 @@ onUnmounted(() => {
         /></template>
       </main>
     </div>
+    <RecycleBinPanel
+      :open="!!recycleBin.confirm.value"
+      :title="recycleBin.confirm.value?.title ?? ''"
+      :scope="recycleBin.confirm.value?.scope ?? ''"
+      :action="recycleBin.confirm.value?.action ?? 'restore'"
+      :busy="recycleBin.busy.value"
+      :error="recycleBin.error.value"
+      @close="recycleBin.confirm.value = null"
+      @confirm="commitRecycleAction"
+    />
     <ImageViewer
       v-if="viewer"
       :image="viewer"
-      :images="gallery.images.value"
+      :removal-busy="viewerRemoval.busy.value"
+      :removal-error="viewerRemoval.error.value"
+      :can-undo-removal="!!viewerRemoval.undo.value"
+      :images="
+        page === 'tags' ? tagWorkspace.images.value : gallery.images.value
+      "
       :folders="folders.folders.value"
+      :read-only="page === 'gallery' && gallery.query.value.scope === 'trash'"
+      :total="page === 'tags' ? tagWorkspace.total.value : gallery.total.value"
+      :loading-more="
+        page === 'tags'
+          ? tagWorkspace.pageLoading.value
+          : gallery.pageLoading.value
+      "
+      :can-load-more="
+        page === 'tags'
+          ? tagWorkspace.hasMore.value
+          : gallery.images.value.length < gallery.total.value
+      "
+      :load-error="
+        page === 'tags' ? tagWorkspace.previewError.value : gallery.error.value
+      "
       @close="viewer = null"
       @change="viewer = $event"
       @favorite="favorite"
+      @trash="viewerRemoval.trash"
+      @undo-trash="viewerRemoval.restore"
+      @load-more="page === 'tags' ? tagWorkspace.preview(true) : gallery.more()"
       @tag-search="tagSearch"
-      @metadata-changed="gallery.search()"
+      @metadata-changed="
+        page === 'tags' ? tagWorkspace.preview() : gallery.search()
+      "
     />
+    <div
+      v-if="!viewer && viewerRemoval.undo.value"
+      class="viewer-removal-toast"
+      role="status"
+    >
+      <span>已移入应用回收站</span
+      ><button
+        class="text-button"
+        :disabled="viewerRemoval.busy.value"
+        @click="viewerRemoval.restore"
+      >
+        撤销
+      </button>
+      <button
+        class="icon-button"
+        aria-label="关闭删除提示"
+        @click="viewerRemoval.undo.value = null"
+      >
+        <AppIcon name="close" :size="16" />
+      </button>
+      <span v-if="viewerRemoval.error.value" role="alert">{{
+        viewerRemoval.error.value
+      }}</span>
+    </div>
     <SoftDialog v-if="dialog" :title="dialog.title" @close="dialog = null"
       ><form id="workspace-dialog" @submit.prevent="saveDialog">
         <label v-if="['create', 'rename', 'tags'].includes(dialog.kind)"
@@ -615,7 +953,12 @@ onUnmounted(() => {
       <template #actions
         ><button class="text-button" @click="dialog = null">取消</button
         ><button
-          class="soft-button primary"
+          class="soft-button"
+          :class="
+            ['delete', 'systemTrash', 'remove'].includes(dialog.kind)
+              ? 'danger'
+              : 'primary'
+          "
           form="workspace-dialog"
           type="submit"
           :disabled="busy"
@@ -624,6 +967,14 @@ onUnmounted(() => {
         </button></template
       ></SoftDialog
     >
+    <ErrorDialog
+      v-if="!dialog"
+      :errors="[error, page === 'duplicates' ? '' : jobs.error.value]"
+      @close="
+        error = '';
+        page !== 'duplicates' && (jobs.error.value = '');
+      "
+    />
     <div
       v-if="drag?.active"
       class="drag-ghost"

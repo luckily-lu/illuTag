@@ -18,7 +18,13 @@ const id = useId(),
   popup = ref<HTMLElement>(),
   expanded = ref(false),
   active = ref(0),
-  position = ref({ left: "0px", top: "0px", width: "0px", maxHeight: "240px" });
+  position = ref({
+    left: "0px",
+    top: "0px",
+    bottom: "auto",
+    width: "0px",
+    maxHeight: "240px",
+  });
 const label = computed(
   () =>
     props.options.find((o) => o.value === props.modelValue)?.label ??
@@ -28,14 +34,15 @@ const label = computed(
 function locate() {
   if (!trigger.value) return;
   const r = trigger.value.getBoundingClientRect();
-  const below = innerHeight - r.bottom - 12,
-    above = r.top - 12,
-    h = Math.min(300, Math.max(below, above));
+  const below = Math.max(0, innerHeight - r.bottom - 16),
+    above = Math.max(0, r.top - 16),
+    down = below >= Math.min(220, above);
   position.value = {
     left: `${Math.max(8, Math.min(r.left, innerWidth - r.width - 8))}px`,
-    top: `${below >= Math.min(220, h) ? r.bottom + 8 : Math.max(8, r.top - h - 8)}px`,
+    top: down ? `${r.bottom + 8}px` : "auto",
+    bottom: down ? "auto" : `${innerHeight - r.top + 8}px`,
     width: `${r.width}px`,
-    maxHeight: `${Math.max(90, h)}px`,
+    maxHeight: `${Math.min(300, down ? below : above)}px`,
   };
 }
 async function open() {
@@ -102,8 +109,7 @@ function outside(event: PointerEvent) {
     close(false);
 }
 function scroll(event: Event) {
-  if (expanded.value && !popup.value?.contains(event.target as Node))
-    locate();
+  if (expanded.value && !popup.value?.contains(event.target as Node)) locate();
 }
 onMounted(() => {
   window.addEventListener("keydown", key, true);

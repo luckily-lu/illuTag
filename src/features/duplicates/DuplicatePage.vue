@@ -2,30 +2,20 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { isTauri } from "@tauri-apps/api/core";
 import type { DuplicateOptions } from "../../shared/contracts/DuplicateOptions";
-import type { DuplicateMember } from "../../shared/contracts/DuplicateMember";
+import type { DuplicateRoundStatus } from "../../shared/contracts/DuplicateRoundStatus";
 import type { JobRecord } from "../../shared/contracts/JobRecord";
-import type { DuplicateGroup } from "../../shared/contracts/DuplicateGroup";
-import type { ImageDetail } from "../../shared/contracts/ImageDetail";
 import type { UserFolder } from "../../shared/contracts/UserFolder";
-import type { LibraryFolder } from "../../shared/contracts/LibraryFolder";
 import AppIcon from "../../shared/ui/AppIcon.vue";
 import SoftDialog from "../../shared/ui/SoftDialog.vue";
+import ErrorDialog from "../../shared/ui/ErrorDialog.vue";
 import SoftSelect from "../../shared/ui/SoftSelect.vue";
-import DuplicateImage from "./DuplicateImage.vue";
-import DuplicateComparison from "./DuplicateComparison.vue";
-import DuplicateReviewGrid from "./DuplicateReviewGrid.vue";
-import DuplicateActionDialog from "./DuplicateActionDialog.vue";
 import DuplicateOperationPanel from "./DuplicateOperationPanel.vue";
-import type { DuplicateReview } from "./useDuplicateReview";
+import DuplicateWorkflowReview from "./DuplicateWorkflowReview.vue";
+import type { DuplicateBatches } from "./useDuplicateBatches";
 import { useDuplicateOperations } from "./useDuplicateOperations";
-import {
-  bytes,
-  checkedDate,
-  duration,
-  sensitivityNames,
-  stateNames,
-} from "./format";
+import { useDuplicateWorkflow } from "./useDuplicateWorkflow";
 import type { useDuplicates } from "./useDuplicates";
+import { bytes, checkedDate, stateName } from "./format";
 import { api, errorMessage } from "../../shared/ipc";
 const props = defineProps<{
   jobs: JobRecord[];
@@ -33,830 +23,898 @@ const props = defineProps<{
   taskError: string;
   startJob: (options: DuplicateOptions) => Promise<boolean>;
   workspace: ReturnType<typeof useDuplicates>;
-  review: DuplicateReview;
+  batches: DuplicateBatches;
   folders: UserFolder[];
-  sources: LibraryFolder[];
   controlJob: (id: string, action: string) => Promise<void>;
 }>();
 const emit = defineEmits<{ tasks: []; jobCreated: [job: JobRecord] }>();
-const d = props.workspace,
-  review = props.review;
+const w = useDuplicateWorkflow(),
+  batches = props.batches;
 const section = ref<HTMLElement>(),
-  confirmClear = ref(false),
+  advanced = ref(false),
+  force = ref(false);
+const starting = ref(false),
+  submitting = ref(false);
+const preparingKind = ref<"exact" | "near" | null>(null);
+const confirmClear = ref(false),
   confirmRecords = ref(false),
-  starting = ref(false);
-const comparison = ref<{
-  reference: DuplicateMember;
-  candidate: DuplicateMember;
-  kind: string;
-  groupId: string;
-} | null>(null);
-const auditGroupId = ref<string | null>(null);
-const auditGroup = computed(() =>
-  d.groups.value.find((group) => group.id === auditGroupId.value),
-);
-const auditMembers = computed(() =>
-  auditGroup.value
-    ? [
-        ...new Map(
-          [auditGroup.value.reference, ...auditGroup.value.members]
-            .filter((member) => !review.processed.value.has(member.image.id))
-            .map((member) => [member.image.id, member]),
-        ).values(),
-      ]
-    : [],
-);
-const details = ref<Record<string, ImageDetail>>({}),
-  detailLoading = ref(new Set<string>()),
-  detailErrors = ref<Record<string, string>>({});
-const management = useDuplicateOperations(d, review, {
+  localError = ref(""),
+  notice = ref("");
+const refreshingResults = ref(false);
+const sampleMode = !isTauri();
+let overviewScroll = 0;
+const management = useDuplicateOperations(props.workspace, batches, {
   jobs: () => props.jobs,
   created: (job) => emit("jobCreated", job),
-  advance: nextGroup,
 });
 const activeJob = computed(() =>
   props.jobs.find(
-    (j) =>
-      j.request.kind === "duplicates" &&
-      ["queued", "running", "paused", "cancelling"].includes(j.state),
+    (job) =>
+      job.request.kind === "duplicates" &&
+      ["queued", "running", "pausing", "paused", "cancelling"].includes(
+        job.state,
+      ),
   ),
 );
-const busy = computed(
-  () => starting.value || !!activeJob.value || management.busy.value,
+const activeWork = computed(() =>
+  props.jobs.some(
+    (job) =>
+      ["duplicates", "duplicateManagement", "duplicateUndo"].includes(
+        job.request.kind,
+      ) &&
+      ["queued", "running", "pausing", "paused", "cancelling"].includes(
+        job.state,
+      ),
+  ),
 );
-const comparisonGroup = computed(() =>
-  d.groups.value.find((group) => group.id === comparison.value?.groupId),
-);
-const comparisonCandidates = computed(
+const activeOperation = computed(() => {
+  const id = props.jobs.find(
+    (job) =>
+      job.request.duplicateOperationId &&
+      ["queued", "running", "pausing", "paused", "cancelling"].includes(
+        job.state,
+      ),
+  )?.request.duplicateOperationId;
+  return (
+    batches.operations.value.get(
+      id ?? batches.currentOperationId.value ?? "",
+    ) ?? null
+  );
+});
+const lastOperation = computed(
   () =>
-    comparisonGroup.value?.members.filter(
-      (member) =>
-        member.image.id !== comparison.value?.reference.image.id &&
-        !review.processed.value.has(member.image.id),
-    ) ?? [],
+    batches.operations.value.get(w.status.value?.lastOperationId ?? "") ??
+    (activeOperation.value?.preview.groupId.startsWith("workflow:")
+      ? activeOperation.value
+      : null),
 );
-const sampleMode = !isTauri();
-watch(
-  () => props.refreshVersion,
-  async () => {
-    await d.refresh();
-    await management.syncAll();
-  },
+const undoable = computed(() => !!lastOperation.value?.status?.undoable);
+const operationRunning = computed(
+  () =>
+    !!activeOperation.value &&
+    ["queued", "running", "pausing", "paused", "cancelling"].includes(
+      props.jobs.find((job) => job.id === activeOperation.value?.jobId)
+        ?.state ??
+        activeOperation.value.status?.state ??
+        activeOperation.value.jobState,
+    ),
 );
-watch(
-  () => review.version.value,
-  () => void management.syncAll(),
+const busy = computed(
+  () =>
+    starting.value ||
+    submitting.value ||
+    w.statusLoading.value ||
+    ["loading", "error"].includes(w.status.value?.stage ?? "") ||
+    !!activeJob.value ||
+    management.busy.value ||
+    operationRunning.value,
 );
-watch(
-  () => review.activeOperationId.value,
-  () => void management.syncAll(),
-);
-watch(
-  () => d.groups.value,
-  (groups) => {
-    review.reconcileActive(
-      groups.flatMap((group) => [group.reference, ...group.members]),
-    );
-    if (
-      auditGroupId.value &&
-      !groups.some((group) => group.id === auditGroupId.value)
-    )
-      auditGroupId.value = null;
-    if (comparison.value) {
-      const group = groups.find(
-        (value) => value.id === comparison.value!.groupId,
-      );
-      const candidate = group?.members.find(
-        (member) => member.image.id === comparison.value!.candidate.image.id,
-      );
-      if (
-        !group ||
-        group.reference.image.id !== comparison.value.reference.image.id ||
-        !candidate
-      )
-        comparison.value = null;
-      else {
-        comparison.value.reference = group.reference;
-        comparison.value.candidate = candidate;
-      }
-    }
-  },
-);
-function pageKey(event: KeyboardEvent) {
+// Refinement writes unpublished classifications. Manual choices are serialized
+// by the backend and merged when that classification is published.
+const reviewBlockedReason = computed(() => {
   if (
-    event.defaultPrevented ||
-    event.key !== "Escape" ||
-    comparison.value ||
-    auditGroupId.value ||
-    confirmClear.value ||
-    management.confirmation.value ||
-    document.querySelector(".select-popover")
+    submitting.value ||
+    management.submitting.value ||
+    management.preparing.value ||
+    operationRunning.value ||
+    props.jobs.some(
+      (job) =>
+        ["duplicateManagement", "duplicateUndo"].includes(job.request.kind) &&
+        ["queued", "running", "pausing", "paused", "cancelling"].includes(
+          job.state,
+        ),
+    )
   )
-    return;
-  const id = review.activeGroupId.value;
-  if (id && review.selection(id).size) {
-    review.clearSelection(id);
-    event.preventDefault();
-    event.stopImmediatePropagation();
+    return "正在整理或撤销图片，暂不可修改保留项；仍可切组和查看原图。";
+  const mode = activeJob.value?.request.duplicateOptions?.verificationMode;
+  const cascadeReviewReady = mode === "cascade" &&
+    ["第一轮", "第二轮", "第三轮", "生成分类整理计划"].some((prefix) =>
+      activeJob.value?.stage?.startsWith(prefix),
+    );
+  if (activeJob.value && !(["refine", "organize"].includes(mode ?? "") || cascadeReviewReady))
+    return "全库检索正在更新图片指纹，暂不可修改保留项；仍可浏览已发布结果。";
+  if (starting.value) return "正在启动任务，请稍后修改保留项。";
+  return "";
+});
+const reviewNotice = computed(() =>
+  ["refine", "organize", "cascade"].includes(
+    activeJob.value?.request.duplicateOptions?.verificationMode ?? "",
+  )
+    ? "检索在后台进行，可浏览已保存结果；最终发布会合并最新人工选择。"
+    : "",
+);
+const scan = computed(() => w.status.value?.scan),
+  stage = computed(() => w.status.value?.stage ?? "empty");
+const currentPolicy = computed(
+  () => w.status.value?.policy === "illuTag-three-pass-v1",
+);
+const rows = computed(() =>
+  ["exact", "near", "similar", "uncertain"].map((kind) => {
+    const item = w.status.value?.categories.find((row) => row.kind === kind);
+    return {
+      kind,
+      images: item?.images ?? 0,
+      groups: item?.groups ?? 0,
+      cleanupCount: item?.cleanupCount ?? 0,
+    };
+  }),
+);
+const names: Record<string, string> = {
+  exact: "完全相同",
+  near: "近似图片",
+  similar: "类似图片",
+  uncertain: "无法确认",
+};
+const descriptions: Record<string, string> = {
+  exact: "尺寸与全部像素一致，每组保留一张。",
+  near: "重压缩、等比例缩放等近似版本，可先查看并调整保留项。",
+  similar: "存在内容或局部细节差异，默认保留。",
+  uncertain: "读取失败或证据不足，保留图片，不视为内容不同。",
+};
+const roundNames = ["宽筛候选", "收紧内容差异", "严格确认相同"];
+const liveRound = computed(() => {
+  if (!activeJob.value) return null;
+  const stage = activeJob.value.stage;
+  if (/第三轮|第3轮|严格|零容差|完整像素/.test(stage)) return 3;
+  if (/第二轮|第2轮|收紧|容差复检|内容复检/.test(stage)) return 2;
+  return 1;
+});
+const rounds = computed(() =>
+  roundNames.map((name, index) => {
+    const round = index + 1;
+    const saved = currentPolicy.value
+      ? w.status.value?.rounds?.find(
+          (r: DuplicateRoundStatus) => r.round === round,
+        )
+      : undefined;
+    if (activeJob.value)
+      return {
+        round,
+        name,
+        counts: null,
+        state:
+          round < liveRound.value!
+            ? "completed"
+            : round === liveRound.value
+              ? activeJob.value.state
+              : "pending",
+      };
+    return {
+      round,
+      name,
+      state:
+        saved?.state ??
+        (currentPolicy.value && stage.value === "refined"
+          ? "completed"
+          : "pending"),
+      counts: saved ?? null,
+    };
+  }),
+);
+const roundState = (value: string) =>
+  value === "pending" ? "待开始" : stateName(value);
+const recentAttempt = computed(() => {
+  const job = props.jobs.find((row) => row.request.kind === "duplicates");
+  if (
+    job &&
+    ["partial", "failed", "cancelled", "interrupted"].includes(job.state)
+  )
+    return {
+      state: job.state,
+      errors: job.errors,
+      label:
+        job.request.duplicateOptions?.verificationMode === "cascade"
+          ? "三轮检索"
+          : job.request.duplicateOptions?.verificationMode === "refine"
+            ? "近似图片复检"
+            : "全库检索",
+    };
+  if (job?.state === "completed") return null;
+  return scan.value?.lastAttempt
+    ? { ...scan.value.lastAttempt, label: "全库检索" }
+    : null;
+});
+const failed = (state: string) =>
+  ["partial", "failed", "interrupted"].includes(state);
+const errors = computed(() => {
+  const jobs = ["duplicates", "duplicateManagement", "duplicateUndo"]
+    .map((kind) => props.jobs.find((job) => job.request.kind === kind))
+    .filter((job) => job && failed(job.state));
+  const operations = new Set([activeOperation.value, batches.latest.value]);
+  return [
+    localError.value,
+    w.error.value,
+    management.error.value,
+    props.taskError,
+    ...(w.status.value?.errors ?? []),
+    ...jobs.flatMap((job) =>
+      job!.errors.length
+        ? job!.errors
+        : ["重复图片任务未完成，请到任务中心查看详情。"],
+    ),
+    ...(recentAttempt.value && failed(recentAttempt.value.state)
+      ? recentAttempt.value.errors
+      : []),
+    ...[...operations].flatMap((operation) =>
+      operation
+        ? [
+            operation.error,
+            ...(failed(operation.status?.state ?? operation.jobState)
+              ? (operation.status?.errors ?? [])
+              : []),
+          ]
+        : [],
+    ),
+  ];
+});
+const errorDescription = computed(() =>
+  errors.value.some((message) =>
+    /database or disk is full|缓存.*容量|磁盘.*空间/i.test(message),
+  )
+    ? "查重缓存暂时无法继续写入。已保存的结果和检查记录保留，详情中可查看容量或磁盘原因。"
+    : errors.value.some((message) =>
+    /invalid uri authority|unable to open database file/i.test(message),
+  )
+    ? "暂时无法读取图库数据。请确认数据目录可访问，再刷新结果。"
+    : "操作遇到问题。可展开查看详情，或刷新已保存的结果。",
+);
+const operationOptions = computed(() =>
+  [...batches.operations.value.values()].reverse().map((op) => ({
+    value: op.preview.operationId,
+    label: `${op.preview.action === "restore" ? "撤销整理" : op.preview.groupId.startsWith("workflow:") && op.preview.groupId.endsWith(":exact") ? "整理完全相同" : op.preview.groupId.startsWith("workflow:") && op.preview.groupId.endsWith(":near") ? "整理近似图片" : "历史整理"} · ${stateName(op.status?.state ?? op.jobState)}`,
+  })),
+);
+async function hydrateLast() {
+  const id = w.status.value?.lastOperationId;
+  if (!id || batches.operations.value.has(id)) return;
+  try {
+    const status = await api.duplicateOperationStatus(id);
+    const job = props.jobs.find(
+      (job) => job.request.duplicateOperationId === id,
+    ) ?? {
+      id,
+      request: {
+        kind:
+          status.action === "restore" ? "duplicateUndo" : "duplicateManagement",
+        thumbnails: false,
+        sourceFolderId: null,
+        duplicateOptions: null,
+        duplicateOperationId: id,
+      },
+      state: status.state,
+      stage: status.stage,
+      processed: status.processed,
+      total: status.total,
+      failures: status.failed,
+      errors: status.errors,
+      updatedAt: status.updatedAt,
+    };
+    batches.register(
+      {
+        operationId: id,
+        generation: status.generation,
+        groupId: status.groupId,
+        action: status.action,
+        targetCount: status.total,
+        totalBytes: 0,
+        protectedCount: 0,
+        skippedCount: status.skipped,
+        metadata: {
+          favoriteCount: 0,
+          classifiedCount: 0,
+          customTaggedCount: 0,
+          supplementTaggedCount: 0,
+        },
+        sample: [],
+        warnings: [],
+        expiresAt: 0,
+        requiresSystemConfirmation: false,
+      },
+      job,
+      false,
+    );
+    const op = batches.operations.value.get(id)!;
+    op.status = status;
+    op.handled = ![
+      "queued",
+      "running",
+      "pausing",
+      "paused",
+      "cancelling",
+    ].includes(status.state);
+  } catch (e) {
+    localError.value = errorMessage(e);
   }
 }
+let refreshPending: Promise<void> | null = null;
+async function refresh(force = false, reload = false, retry = false) {
+  // Progress already reaches the job row and batch event store. A status query
+  // aggregates the full candidate pool, so only terminal/external changes reload it.
+  if (!force && activeWork.value) return;
+  if (refreshPending) return refreshPending;
+  refreshPending = (async () => {
+    await management.syncAll();
+    await w.refresh(reload, retry);
+    await hydrateLast();
+  })().finally(() => {
+    refreshPending = null;
+  });
+  return refreshPending;
+}
+async function refreshResults() {
+  if (refreshingResults.value || activeWork.value) return;
+  refreshingResults.value = true;
+  localError.value = "";
+  management.error.value = "";
+  try {
+    // Only read saved state. Never repeat a scan, review edit, cleanup or undo.
+    await refresh(true, true, w.status.value?.stage === "error");
+  } finally {
+    refreshingResults.value = false;
+  }
+}
+watch(
+  [() => props.refreshVersion, () => batches.version.value],
+  () => void refresh(),
+);
+watch(
+  () => batches.activeOperationId.value,
+  () => void management.syncAll(),
+);
+watch(
+  () =>
+    props.jobs
+      .filter((job) =>
+        ["duplicates", "duplicateManagement", "duplicateUndo"].includes(
+          job.request.kind,
+        ),
+      )
+      .map((job) => `${job.id}:${job.state}`)
+      .join("|"),
+  () => {
+    if (activeWork.value) void management.syncAll();
+    else void refresh();
+  },
+);
 onMounted(async () => {
-  await d.refresh();
-  await management.syncAll();
+  await refresh(true);
   await nextTick();
-  section.value?.scrollTo({ top: review.scrollTop.value });
-  window.addEventListener("keydown", pageKey);
+  if (section.value) section.value.scrollTop = batches.scrollTop.value;
 });
 onUnmounted(() => {
-  review.scrollTop.value = section.value?.scrollTop ?? 0;
-  window.removeEventListener("keydown", pageKey);
+  batches.scrollTop.value = section.value?.scrollTop ?? 0;
+  w.dispose();
 });
-async function start(regroupOnly = false) {
+async function start() {
   if (busy.value) return;
   starting.value = true;
+  localError.value = "";
+  notice.value = "";
   try {
-    if (await props.startJob(d.options(regroupOnly))) await d.refresh();
+    if (await props.startJob(w.options("cascade", "standard", force.value))) {
+      await w.refresh();
+    }
+  } catch (e) {
+    localError.value = errorMessage(e);
   } finally {
     starting.value = false;
   }
 }
-async function filter(kind: string) {
-  section.value?.scrollTo({ top: 0 });
-  await d.setKind(kind);
+async function cleanup(kind: "exact" | "near") {
+  const snapshot = w.status.value;
+  if (
+    !snapshot?.generation ||
+    !currentPolicy.value ||
+    snapshot.stage !== "refined" ||
+    busy.value ||
+    w.editing.value
+  )
+    return;
+  submitting.value = true;
+  preparingKind.value = kind;
+  localError.value = "";
+  notice.value = "";
+  try {
+    const preview = await api.prepareDuplicateWorkflow(
+      {
+        generation: snapshot.generation,
+        revision: snapshot.revision,
+      },
+      kind,
+    );
+    if (!preview.targetCount) {
+      notice.value = "当前没有需要清理的图片。";
+      await w.refresh();
+      return;
+    }
+    const job = await api.applyDuplicateAction({
+      operationId: preview.operationId,
+      confirmed: true,
+    });
+    batches.register(preview, job);
+    emit("jobCreated", job);
+    await management.sync(batches.operations.value.get(preview.operationId)!);
+    await w.refresh(true);
+  } catch (e) {
+    localError.value = errorMessage(e);
+    await w.refresh(true);
+  } finally {
+    submitting.value = false;
+    preparingKind.value = null;
+  }
 }
-async function clear() {
+async function undo() {
+  const op = lastOperation.value;
+  if (!op || busy.value) return;
+  await management.undo(op);
+  await w.refresh(true);
+}
+async function openReview(kind: string) {
+  overviewScroll = section.value?.scrollTop ?? 0;
+  await w.open(kind);
+}
+async function closeReview() {
+  w.close();
+  await nextTick();
+  if (section.value) section.value.scrollTop = overviewScroll;
+  section.value
+    ?.querySelector<HTMLElement>(`[data-review-kind="${w.kind.value}"]`)
+    ?.focus({ preventScroll: true });
+}
+async function clearCache() {
   confirmClear.value = false;
-  await d.clear();
+  try {
+    await api.clearDuplicateCache();
+    await w.refresh(true);
+    notice.value = "查重缓存已清理，图库原图与整理记录保留。";
+  } catch (e) {
+    localError.value = errorMessage(e);
+  }
 }
 async function clearRecords() {
   confirmRecords.value = false;
   try {
     await api.clearDuplicateManagementRecords();
-    review.operations.value = new Map();
-    review.activeOperationId.value = null;
-    management.error.value = "";
-    management.notice.value = "处理记录已清理，已回收图片的状态不变。";
-  } catch (error) {
-    management.error.value = errorMessage(error);
+    batches.operations.value = new Map();
+    batches.activeOperationId.value = null;
+    batches.currentOperationId.value = null;
+    notice.value = "整理记录已清理。";
+    await w.refresh();
+  } catch (e) {
+    localError.value = errorMessage(e);
   }
-}
-function compare(
-  reference: DuplicateMember,
-  candidate: DuplicateMember,
-  kind: string,
-  groupId: string,
-) {
-  review.activeGroupId.value = groupId;
-  if (kind === "near") {
-    void openAudit(groupId);
-    return;
-  }
-  comparison.value = { reference, candidate, kind, groupId };
-}
-async function openAudit(groupId: string) {
-  review.activeGroupId.value = groupId;
-  auditGroupId.value = groupId;
-  const group = d.groups.value.find((value) => value.id === groupId);
-  if (group?.nextCursor) await d.moreMembers(groupId);
-}
-async function manageAudit() {
-  const group = auditGroup.value;
-  if (!group) return;
-  if (
-    !auditMembers.value.some((member) => review.kept.value.has(member.image.id))
-  ) {
-    management.error.value = "先按 K 或点击保留，明确留下至少一张图片。";
-    return;
-  }
-  await management.prepare(group, "selected", false);
-}
-function keptCount(group: DuplicateGroup) {
-  return [
-    ...new Set(
-      [group.reference, ...group.members]
-        .filter((member) => review.kept.value.has(member.image.id))
-        .map((member) => member.image.id),
-    ),
-  ].length;
-}
-function select(group: DuplicateGroup, member: DuplicateMember) {
-  review.activeGroupId.value = group.id;
-  review.toggle(group.id, member);
-}
-async function loadDetail(member: DuplicateMember) {
-  const id = member.image.id;
-  if (detailLoading.value.has(id) || details.value[id]) return;
-  detailLoading.value = new Set([...detailLoading.value, id]);
-  try {
-    details.value = { ...details.value, [id]: await api.detail(id) };
-  } catch (error) {
-    detailErrors.value = { ...detailErrors.value, [id]: errorMessage(error) };
-  } finally {
-    detailLoading.value = new Set(
-      [...detailLoading.value].filter((value) => value !== id),
-    );
-  }
-}
-function folderLabels(id: string) {
-  return (
-    details.value[id]?.folderIds.map(
-      (folderId) =>
-        props.folders.find((folder) => folder.id === folderId)?.name ??
-        `分类 ${folderId}`,
-    ) ?? []
-  );
-}
-async function nextGroup(groupId: string, followingIds: string[] = []) {
-  const reviewing = auditGroupId.value !== null;
-  comparison.value = null;
-  auditGroupId.value = null;
-  const index = d.groups.value.findIndex((group) => group.id === groupId);
-  const ordered = followingIds.length
-    ? followingIds
-    : d.groups.value.slice(index + 1).map((group) => group.id);
-  let next = ordered
-    .map((id) => d.groups.value.find((group) => group.id === id))
-    .find((group) => group && !review.decision(group.id));
-  if (!next && d.nextCursor.value) {
-    const known = new Set(d.groups.value.map((group) => group.id));
-    await d.loadGroups(true);
-    next = d.groups.value.find(
-      (group) => !known.has(group.id) && !review.decision(group.id),
-    );
-  }
-  if (!next) {
-    management.notice.value =
-      "当前加载的分组已查看完，可以加载更多、切换筛选或更新结果。";
-    return;
-  }
-  review.activeGroupId.value = next.id;
-  if (reviewing && next.kind === "near") {
-    await openAudit(next.id);
-    return;
-  }
-  await nextTick();
-  const element = [
-    ...(section.value?.querySelectorAll<HTMLElement>(
-      "[data-duplicate-group-id]",
-    ) ?? []),
-  ].find((node) => node.dataset.duplicateGroupId === next!.id);
-  element?.scrollIntoView({ block: "start" });
-  element?.focus({ preventScroll: true });
-}
-async function skip(group: DuplicateGroup) {
-  review.decide(group.id, "skipped");
-  await nextGroup(group.id);
-}
-async function moreComparison() {
-  const groupId = comparison.value?.groupId;
-  if (!groupId) return;
-  const count = comparisonCandidates.value.length;
-  await d.moreMembers(groupId);
-  const next = comparisonCandidates.value[count];
-  if (comparison.value && next) comparison.value.candidate = next;
 }
 </script>
 <template>
-  <section ref="section" class="page duplicate-page">
-    <header class="page-header">
-      <div>
-        <p class="page-kicker">图库工具</p>
-        <h1>重复检索</h1>
-        <p>找出副本与近似画面，选择保留后逐组处理。</p>
-      </div>
-      <button
-        class="soft-button primary"
-        :disabled="busy || d.loading.value"
-        @click="start()"
-      >
-        <AppIcon name="duplicates" :size="18" />{{
-          busy
-            ? "任务处理中"
-            : d.status.value?.generation
-              ? "更新结果"
-              : "开始查重"
-        }}
-      </button>
-    </header>
-    <p v-if="sampleMode" class="duplicate-preview-note">
-      布局预览 · 当前是虚构示例，不会检索或修改真实图库。
-    </p>
-    <div class="duplicate-controls">
-      <button
-        class="soft-button"
-        :disabled="
-          busy || !d.status.value?.generation || !d.status.value.exactGroups
-        "
-        @click="management.autoExact()"
-      >
-        一键整理完全相同图片
-      </button>
-      <div class="duplicate-type-filter" role="group" aria-label="结果类型">
+  <section
+    ref="section"
+    class="page duplicate-page duplicate-workflow-page"
+    :class="{ 'is-review': w.reviewOpen.value }"
+  >
+    <DuplicateWorkflowReview
+      v-if="w.reviewOpen.value"
+      :workflow="w"
+      :busy="!!reviewBlockedReason"
+      :blocked-reason="reviewBlockedReason"
+      :notice="reviewNotice"
+      :undoable="undoable"
+      :undo-busy="busy"
+      @close="closeReview"
+      @undo="undo"
+    />
+    <template v-else>
+      <header class="workflow-heading">
+        <div>
+          <h1>重复检索</h1>
+          <p>宽筛候选，收紧差异，再严格确认完全相同。</p>
+        </div>
         <button
-          v-for="[key, label] in [
-            ['all', '全部'],
-            ['exact', '文件完全相同'],
-            ['near', '近似候选'],
-          ]"
-          :key="key"
-          class="soft-button compact"
-          :aria-pressed="d.kind.value === key"
-          @click="filter(key)"
+          class="text-button"
+          :aria-expanded="advanced"
+          @click="advanced = !advanced"
         >
-          {{ label }}
+          <AppIcon name="more" :size="19" />更多
+        </button>
+      </header>
+      <p v-if="sampleMode" class="workflow-fixture-note">
+        布局预览 · 仅合成示例
+      </p>
+      <div class="workflow-run-summary">
+        <span
+          >{{
+            scan?.coverage.processed?.toLocaleString() ?? "0"
+          }}
+          张已检查</span
+        >
+        <button
+          v-if="currentPolicy || activeJob"
+          class="soft-button primary"
+          :disabled="busy"
+          @click="start()"
+        >
+          {{ starting ? "准备中…" : "重新三轮检索" }}
         </button>
       </div>
-      <label class="duplicate-sensitivity"
-        ><span>近似筛选</span
-        ><SoftSelect
-          :model-value="d.sensitivity.value"
-          :options="[
-            { value: 'strict', label: '严格' },
-            { value: 'standard', label: '标准' },
-            { value: 'loose', label: '宽松' },
-          ]"
-          aria-label="近似筛选严格度"
-          @update:model-value="d.sensitivity.value = String($event)"
-      /></label>
-      <button
-        class="soft-button"
-        :disabled="busy || !d.status.value?.generation || d.loading.value"
-        @click="start(true)"
-      >
-        重新检索
-      </button>
-      <label class="duplicate-force"
-        ><input
-          v-model="d.forceRecompute.value"
-          type="checkbox"
-          :disabled="busy"
-        />强制重新计算</label
-      >
-    </div>
-    <p
-      v-if="d.pendingSensitivity.value"
-      class="duplicate-state-note"
-      role="status"
-    >
-      已选{{ sensitivityNames[d.sensitivity.value] }}，当前结果仍使用{{
-        sensitivityNames[d.status.value?.sensitivity || "standard"]
-      }}。点击“重新检索”后生效。
-    </p>
-    <p v-if="d.forceRecompute.value" class="duplicate-state-note">
-      强制重新计算将重新读取原图，用于检查大小和修改时间未变的文件。任务不会删除或合并图片。
-    </p>
-    <div
-      v-if="d.status.value"
-      class="duplicate-summary"
-      aria-label="检索覆盖统计"
-    >
-      <span
-        ><strong>{{
-          d.status.value.coverage.processed.toLocaleString()
-        }}</strong>
-        / {{ d.status.value.coverage.total.toLocaleString() }} 张已检查</span
-      >
-      <span>失败 {{ d.status.value.coverage.failed.toLocaleString() }}</span>
-      <span
-        >跳过近似
-        {{ d.status.value.coverage.skippedNear.toLocaleString() }}</span
-      >
-      <span
-        >低信息
-        {{ d.status.value.coverage.lowInformation.toLocaleString() }}</span
-      >
-      <span>过密 {{ d.status.value.coverage.tooDense.toLocaleString() }}</span>
-      <span>缓存 {{ bytes(d.status.value.cacheBytes) }}</span>
-      <span>{{ checkedDate(d.status.value.checkedAt) }}</span>
-      <span v-if="d.status.value.durationMs !== null"
-        >上次用时 {{ duration(d.status.value.durationMs) }}</span
-      >
-      <button
-        class="text-button compact"
-        :disabled="busy || d.loading.value || !d.status.value.cacheBytes"
-        @click="confirmClear = true"
-      >
-        清理查重缓存
-      </button>
-      <button
-        class="text-button compact"
-        :disabled="busy"
-        @click="confirmRecords = true"
-      >
-        清理处理记录
-      </button>
-    </div>
-    <div v-if="activeJob" class="duplicate-state-note" role="status">
-      <div class="button-row">
-        <span
-          >{{ stateNames[activeJob.state] || activeJob.state }} ·
-          {{ activeJob.stage }} · {{ activeJob.processed.toLocaleString()
-          }}<template v-if="activeJob.total">
-            / {{ activeJob.total.toLocaleString() }}</template
-          ></span
-        ><button class="text-button" @click="emit('tasks')">到任务中心</button>
-      </div>
-      <progress
-        v-if="activeJob.total"
-        :value="activeJob.processed"
-        :max="activeJob.total"
-      />
-      <p>切换页面不会停止任务。新结果完成前，保留上一次结果。</p>
-    </div>
-    <p
-      v-if="d.status.value?.needsUpdate"
-      class="duplicate-warning"
-      role="status"
-    >
-      图库或源文件已变化，结果需要更新。点击“更新结果”检查缺失或失效项；不会自动开始任务。
-    </p>
-    <p
-      v-if="
-        d.status.value &&
-        ['invalid', 'partial', 'failed', 'error'].includes(d.status.value.state)
-      "
-      class="duplicate-warning"
-      role="status"
-    >
-      {{ stateNames[d.status.value.state] }}：当前结果不能代表全库检查完成。
-    </p>
-    <details
-      v-if="d.status.value?.lastAttempt && !activeJob"
-      class="duplicate-last-attempt"
-    >
-      <summary>
-        最近一次任务：{{
-          stateNames[d.status.value.lastAttempt.state] ||
-          d.status.value.lastAttempt.state
-        }}
-        · {{ checkedDate(d.status.value.lastAttempt.updatedAt) }}
-      </summary>
-      <p>
-        {{ d.status.value.lastAttempt.coverage.processed.toLocaleString() }} /
-        {{ d.status.value.lastAttempt.coverage.total.toLocaleString() }}
-        张已处理 ·
-        {{ d.status.value.lastAttempt.coverage.failed.toLocaleString() }} 项失败
-        ·
-        {{ d.status.value.lastAttempt.coverage.skippedNear.toLocaleString() }}
-        项跳过近似
-      </p>
-      <p
-        v-for="(message, index) in d.status.value.lastAttempt.errors"
-        :key="index"
-        class="error-text"
-      >
-        {{ message }}
-      </p>
-    </details>
-    <p v-if="d.error.value || taskError" class="error-message" role="alert">
-      {{ d.error.value || taskError }}
-      <button v-if="d.error.value" class="text-button" @click="d.refresh()">
-        重试读取结果
-      </button>
-    </p>
-    <details
-      v-if="d.status.value?.errors.length"
-      class="duplicate-last-attempt"
-    >
-      <summary>查看检查提示（{{ d.status.value.errors.length }}）</summary>
-      <p
-        v-for="(message, index) in d.status.value.errors"
-        :key="index"
-        class="error-text"
-      >
-        {{ message }}
-      </p>
-    </details>
-    <p class="duplicate-explanation">
-      近似组以参考图为中心，成员不一定彼此相似，部分图片可能出现在多组中。保留标记保护所有分组中的对应图片；近似候选只处理你明确选中的项。
-    </p>
-    <div class="duplicate-review-summary" aria-label="会话审核进度">
-      <strong>本次会话</strong
-      ><span>已处理 {{ review.reviewedCount.value }} 组</span
-      ><span>暂不处理 {{ review.skippedCount.value }} 组</span
-      ><span>保护 {{ review.kept.value.size }} 张</span
-      ><span class="muted">审核草稿切换页面后保留</span>
-    </div>
-    <p v-if="management.error.value" class="error-message" role="alert">
-      {{ management.error.value }}
-    </p>
-    <p v-else-if="management.notice.value" class="inline-notice" role="status">
-      {{ management.notice.value }}
-    </p>
-    <label
-      v-if="review.operations.value.size > 1"
-      class="duplicate-operation-history"
-      >查看操作<SoftSelect
-        :model-value="review.latest.value?.preview.operationId ?? null"
-        :options="
-          [...review.operations.value.values()].reverse().map((operation) => ({
-            value: operation.preview.operationId,
-            label: `${operation.preview.action === 'restore' ? '撤销' : operation.preview.action === 'systemTrash' ? '原文件清理' : '软回收'} · ${operation.status?.total ?? operation.preview.targetCount} 项 · ${stateNames[operation.status?.state ?? operation.jobState] || operation.jobState}`,
-          }))
-        "
-        aria-label="选择查重处理记录"
-        @update:model-value="review.activeOperationId.value = String($event)"
-    /></label>
-    <DuplicateOperationPanel
-      v-if="review.latest.value"
-      :operation="review.latest.value"
-      :job="jobs.find((job) => job.id === review.latest.value?.jobId)"
-      :busy="busy"
-      @refresh="management.sync(review.latest.value!, true)"
-      @more="management.results(review.latest.value!, true)"
-      @undo="management.undo(review.latest.value!)"
-      @system="management.system(review.latest.value!)"
-      @retry="management.retry(review.latest.value!)"
-      @control="controlJob(review.latest.value!.jobId, $event)"
-    />
-    <div v-if="d.loading.value" class="empty-state" role="status">
-      <p>正在读取分组…</p>
-    </div>
-    <div v-else-if="!d.status.value?.generation" class="empty-state">
-      <AppIcon name="duplicates" :size="36" />
-      <h2>{{ busy ? "正在建立内容索引" : "开始一次全库检查" }}</h2>
-      <p>
-        文件完全相同通过 SHA-256
-        检查；近似候选使用画面指纹。首次任务需要读取原图，大图库可能耗时较长。
-      </p>
-      <p>
-        回收站图片不参与检索。动态
-        GIF／WebP、超大图、低信息图或解码失败的图片只进行文件相同检查，并显示跳过数量。
-      </p>
-    </div>
-    <div v-else-if="!d.groups.value.length" class="empty-state">
-      <h2>当前筛选没有结果</h2>
-      <p
-        v-if="d.status.value.needsUpdate || d.status.value.state === 'partial'"
-      >
-        结果需要更新或仅部分完成，不能据此确认图库没有重复图片。
-      </p>
-      <p v-else>
-        本次检查没有发现符合{{
-          d.kind.value === "exact"
-            ? "文件完全相同"
-            : d.kind.value === "near"
-              ? "近似候选"
-              : "当前"
-        }}条件的分组。
-      </p>
-    </div>
-    <div v-else class="duplicate-group-list">
-      <p class="duplicate-result-count">
-        {{ d.totalGroups.value.toLocaleString() }} 组 ·
-        {{ d.status.value.exactGroups.toLocaleString() }} 组文件完全相同 ·
-        {{ d.status.value.nearGroups.toLocaleString() }} 组近似候选
-      </p>
-      <article
-        v-for="group in d.groups.value"
-        :key="group.id"
-        class="duplicate-group"
-        :class="{
-          'duplicate-group-active': review.activeGroupId.value === group.id,
-        }"
-        :data-duplicate-group-id="group.id"
-        tabindex="-1"
-      >
-        <header>
-          <strong>{{
-            group.kind === "exact" ? "文件完全相同" : "近似候选"
-          }}</strong
-          ><small>共 {{ group.totalMembers.toLocaleString() }} 张</small>
-          <span
-            v-if="review.decision(group.id)"
-            class="duplicate-group-decision"
-            >{{
-              review.decision(group.id) === "handled"
-                ? "本次已处理"
-                : "暂不处理"
-            }}</span
+      <ol class="workflow-rounds" aria-label="三轮检索流程">
+        <li
+          v-for="round in rounds"
+          :key="round.round"
+          :data-round="round.round"
+          :class="{
+            'is-complete': ['completed', 'complete'].includes(round.state),
+            'is-active': [
+              'running',
+              'pausing',
+              'paused',
+              'cancelling',
+            ].includes(round.state),
+          }"
+        >
+          <span class="workflow-round-number"
+            ><AppIcon
+              v-if="['completed', 'complete'].includes(round.state)"
+              name="check"
+              :size="14"
+            /><template v-else>{{ round.round }}</template></span
           >
-          <span class="spacer" />
-          <span
-            >已保护 {{ keptCount(group) }} 张 · 待处理
-            {{ review.selection(group.id).size }} 张</span
+          <div>
+            <strong
+              >第{{ ["一", "二", "三"][round.round - 1] }}轮 ·
+              {{ round.name }}</strong
+            >
+            <small>{{ roundState(round.state) }}</small>
+            <p v-if="round.counts">
+              通过 {{ round.counts.passedPairs.toLocaleString() }} /
+              {{ round.counts.inputPairs.toLocaleString() }} 对<span
+                >排除 {{ round.counts.filteredPairs.toLocaleString() }} ·
+                无法确认
+                {{ round.counts.uncertainPairs.toLocaleString() }}</span
+              >
+            </p>
+          </div>
+        </li>
+      </ol>
+      <section
+        v-if="activeJob"
+        class="workflow-progress"
+        aria-label="当前检索任务"
+      >
+        <div>
+          <strong>三轮检索 · {{ stateName(activeJob.state) }}</strong
+          ><span>{{ activeJob.stage }}</span
+          ><small v-if="activeJob.total"
+            >{{ activeJob.processed.toLocaleString() }} /
+            {{ activeJob.total.toLocaleString() }}</small
+          ><small v-else-if="activeJob.processed"
+            >{{ activeJob.processed.toLocaleString() }}
+            {{
+              activeJob.meta?.unit === "pairs" ? "对已检查" : "张已检查"
+            }}</small
           >
-        </header>
-        <p v-if="group.needsReview" class="duplicate-warning">
-          原参考图已移出。本组幸存图片与新参考图不一定直接匹配，请逐张重新目视审核；未知距离显示为“—”。
-        </p>
-        <div class="duplicate-group-toolbar">
-          <button
-            v-if="group.kind === 'exact'"
-            class="soft-button compact"
-            :disabled="busy"
-            @click="management.autoExact(group.id)"
-          >
-            一键保留一张
-          </button>
-          <button
-            v-else
-            class="soft-button compact primary"
-            :disabled="busy"
-            @click="openAudit(group.id)"
-          >
-            多图键盘审核
-          </button>
-          <button
-            v-if="group.kind === 'exact'"
-            class="soft-button compact primary"
-            :disabled="busy || keptCount(group) === 0"
-            :aria-label="
-              '保留所选并处理整组其他图片：' + group.reference.image.fileName
-            "
-            @click="management.prepare(group, 'exactOthers')"
-          >
-            保留这些，处理整组其他
-          </button>
-          <button
-            class="soft-button compact"
-            :class="group.kind === 'near' ? 'primary' : ''"
-            :disabled="busy || review.selection(group.id).size === 0"
-            :aria-label="'处理选中项：' + group.reference.image.fileName"
-            @click="management.prepare(group, 'selected')"
-          >
-            处理选中项
-          </button>
-          <button
-            class="text-button compact"
-            :disabled="busy || !review.selection(group.id).size"
-            @click="review.clearSelection(group.id)"
-          >
-            清空本组选择
-          </button>
-          <button
-            class="text-button compact"
-            :disabled="busy"
-            @click="skip(group)"
-          >
-            暂不处理，下一组
-          </button>
-          <span v-if="group.kind === 'exact'" class="muted"
-            >整组操作包含尚未展开的图片</span
-          >
-          <span v-else class="muted">先比对，再勾选明确不需要的候选</span>
         </div>
-        <div class="duplicate-group-images">
-          <DuplicateImage
-            :member="group.reference"
-            reference
-            :kept="review.kept.value.has(group.reference.image.id)"
-            :selected="review.selection(group.id).has(group.reference.image.id)"
-            :processed="review.processed.value.has(group.reference.image.id)"
-            :disabled="busy"
-            :detail="details[group.reference.image.id]"
-            :detail-loading="detailLoading.has(group.reference.image.id)"
-            :detail-error="detailErrors[group.reference.image.id]"
-            :folder-labels="folderLabels(group.reference.image.id)"
-            @keep="review.protect(group.reference)"
-            @select="select(group, group.reference)"
-            @details="loadDetail(group.reference)"
-            @compare="
-              compare(
-                group.reference,
-                group.members.find(
-                  (m) => m.image.id !== group.reference.image.id,
-                ) ?? group.reference,
-                group.kind,
-                group.id,
+        <progress
+          v-if="activeJob.total"
+          :value="activeJob.processed"
+          :max="activeJob.total"
+        /><progress v-else />
+        <div class="workflow-progress-actions">
+          <button
+            v-if="activeJob.state === 'running'"
+            class="text-button"
+            @click="controlJob(activeJob.id, 'pause')"
+          >
+            暂停</button
+          ><button
+            v-if="activeJob.state === 'paused'"
+            class="text-button"
+            @click="controlJob(activeJob.id, 'resume')"
+          >
+            继续</button
+          ><button
+            v-if="
+              ['queued', 'running', 'pausing', 'paused'].includes(
+                activeJob.state,
               )
             "
-          />
-          <DuplicateImage
-            v-for="member in group.members.filter(
-              (m) => m.image.id !== group.reference.image.id,
-            )"
-            :key="member.image.id"
-            :member="member"
-            :kept="review.kept.value.has(member.image.id)"
-            :selected="review.selection(group.id).has(member.image.id)"
-            :processed="review.processed.value.has(member.image.id)"
-            :disabled="busy"
-            :detail="details[member.image.id]"
-            :detail-loading="detailLoading.has(member.image.id)"
-            :detail-error="detailErrors[member.image.id]"
-            :folder-labels="folderLabels(member.image.id)"
-            @keep="review.protect(member)"
-            @select="select(group, member)"
-            @details="loadDetail(member)"
-            @compare="compare(group.reference, member, group.kind, group.id)"
-          />
+            class="text-button"
+            @click="controlJob(activeJob.id, 'cancel')"
+          >
+            停止检索</button
+          ><button class="text-button" @click="emit('tasks')">任务中心</button>
         </div>
+      </section>
+      <section
+        v-if="(!w.status.value && w.statusLoading.value) || stage === 'loading'"
+        class="workflow-empty"
+        role="status"
+        aria-live="polite"
+      >
+        <h2>正在读取检索结果</h2>
+        <p>正在同步已保存的计数与计划，检索任务的进度会独立更新。</p>
+        <progress aria-label="读取检索结果" />
+      </section>
+      <section
+        v-else-if="stage === 'error'"
+        class="workflow-empty"
+        role="status"
+      >
+        <h2>检索结果暂未读取完成</h2>
+        <p>已有指纹和完整结果仍然保留，可以重试读取。</p>
         <button
-          v-if="group.nextCursor"
-          class="soft-button compact"
-          :disabled="d.memberLoading.value.has(group.id)"
-          @click="d.moreMembers(group.id)"
+          class="soft-button"
+          :disabled="w.statusLoading.value"
+          @click="w.refresh(false, true)"
         >
-          {{
-            d.memberLoading.value.has(group.id)
-              ? "读取中…"
-              : "展开更多图片（每次 50 张）"
-          }}
+          重试读取
         </button>
-      </article>
-      <button
-        v-if="d.nextCursor.value"
-        class="soft-button duplicate-more"
-        :disabled="d.pageLoading.value"
-        @click="d.loadGroups(true)"
-      >
-        {{ d.pageLoading.value ? "读取中…" : "加载更多分组（每次 20 组）" }}
-      </button>
-    </div>
-    <Teleport to="body">
-      <SoftDialog
-        v-if="confirmRecords"
-        title="清理处理记录"
-        @close="confirmRecords = false"
-        ><p>
-          仅清理查重管理的操作记录，并放弃这些批次的撤销能力。原图、图库回收状态和指纹缓存不变；未修复的系统文件移动记录不能清理。
+      </section>
+      <section v-else-if="stage === 'empty'" class="workflow-empty">
+        <AppIcon name="duplicates" :size="32" />
+        <h2>从三轮检索开始</h2>
+        <p>
+          先广泛找出相近图片，再排除细节差异，最后确认尺寸与全部像素相同的图片。检索不会直接回收图片。
         </p>
-        <template #actions
-          ><button class="text-button" @click="confirmRecords = false">
-            取消</button
-          ><button class="soft-button primary" @click="clearRecords">
-            清理记录
-          </button></template
-        ></SoftDialog
+        <button class="soft-button primary" :disabled="busy" @click="start()">
+          开始三轮检索
+        </button>
+      </section>
+      <section
+        v-else-if="!currentPolicy"
+        class="workflow-empty workflow-legacy"
+        role="status"
       >
-      <DuplicateReviewGrid
-        v-if="auditGroup"
-        :members="auditMembers"
-        :total="auditGroup.totalMembers"
-        :kept="review.kept.value"
-        :selected="review.selection(auditGroup.id)"
-        :disabled="busy"
-        :can-more="!!auditGroup.nextCursor"
-        :loading-more="d.memberLoading.value.has(auditGroup.id)"
-        :error="management.error.value"
-        @keep="review.protect($event)"
-        @select="select(auditGroup, $event)"
-        @manage="manageAudit()"
-        @more="d.moreMembers(auditGroup.id)"
-        @next="skip(auditGroup)"
-        @close="auditGroupId = null"
-      />
-      <DuplicateComparison
-        v-if="comparison"
-        v-bind="comparison"
-        :candidates="comparisonCandidates"
-        :reference-kept="review.kept.value.has(comparison.reference.image.id)"
-        :candidate-kept="review.kept.value.has(comparison.candidate.image.id)"
-        :reference-selected="
-          review
-            .selection(comparison.groupId)
-            .has(comparison.reference.image.id)
-        "
-        :candidate-selected="
-          review
-            .selection(comparison.groupId)
-            .has(comparison.candidate.image.id)
-        "
-        :reference-processed="
-          review.processed.value.has(comparison.reference.image.id)
-        "
-        :candidate-processed="
-          review.processed.value.has(comparison.candidate.image.id)
-        "
-        :disabled="busy"
-        :can-more="!!comparisonGroup?.nextCursor"
-        :loading-more="d.memberLoading.value.has(comparison.groupId)"
-        @change="comparison.candidate = $event"
-        @keep="review.protect($event)"
-        @select="comparisonGroup && select(comparisonGroup, $event)"
-        @more="moreComparison"
-        @manage="
-          comparisonGroup && management.prepare(comparisonGroup, 'selected')
-        "
-        @close="comparison = null"
-      />
-      <DuplicateActionDialog
-        v-if="management.confirmation.value"
-        :preview="management.confirmation.value.preview"
-        :mode="management.confirmation.value.request.mode"
-        :advance="management.confirmation.value.advance"
-        :busy="management.submitting.value"
-        :error="management.error.value"
-        @close="management.confirmation.value = null"
-        @confirm="management.apply"
-        @retry="management.retryConfirmation"
-      />
-      <SoftDialog
-        v-if="confirmClear"
-        title="清理查重缓存"
-        @close="confirmClear = false"
-        ><p>
-          仅清理内容指纹和查重分组。图片、标签、分类、收藏及主数据库保持完整。下次查重需要重新读取原图。
+        <h2>已保存旧版检索结果</h2>
+        <p>
+          旧版分类不直接作为本轮整理依据。重新执行三轮检索会复用有效指纹，重新区分完全相同、近似与类似图片。
         </p>
-        <template #actions
-          ><button class="text-button" @click="confirmClear = false">
-            取消</button
-          ><button class="soft-button primary" @click="clear">
-            清理缓存
-          </button></template
-        ></SoftDialog
+        <button class="soft-button primary" :disabled="busy" @click="start()">
+          开始三轮检索
+        </button>
+        <small>人工保留和整理撤销记录会保留。</small>
+      </section>
+      <template v-else>
+        <header class="workflow-results-heading">
+          <div>
+            <h2>三轮检索结果</h2>
+            <p>
+              {{ checkedDate(scan?.checkedAt ?? null) }} ·
+              分类分组含参考图，图片可能跨组出现，不将各类张数相加
+            </p>
+          </div>
+        </header>
+        <section class="workflow-results" aria-label="三轮分类结果">
+          <article
+            v-for="row in rows"
+            :key="row.kind"
+            class="workflow-result-row"
+            :data-category="row.kind"
+          >
+            <div class="workflow-result-name">
+              <AppIcon
+                :name="row.kind === 'exact' ? 'copy' : 'images'"
+                :size="19"
+              /><strong>{{ names[row.kind] }}</strong>
+            </div>
+            <div class="workflow-result-count">
+              <strong>{{ row.images.toLocaleString() }}</strong
+              ><span>张</span
+              ><small
+                >{{ row.groups.toLocaleString() }} 组<template
+                  v-if="row.kind === 'exact' || row.kind === 'near'"
+                >
+                  · 可整理 {{ row.cleanupCount.toLocaleString() }} 张</template
+                ></small
+              >
+            </div>
+            <p>{{ descriptions[row.kind] }}</p>
+            <div class="workflow-view-actions">
+              <button
+                v-if="row.kind === 'exact' || row.kind === 'near'"
+                class="soft-button workflow-cleanup-button"
+                :data-cleanup-kind="row.kind"
+                :aria-label="
+                  row.kind === 'exact'
+                    ? '一键整理完全相同图片'
+                    : '一键整理近似图片'
+                "
+                :disabled="
+                  busy ||
+                  w.editing.value ||
+                  stage !== 'refined' ||
+                  !row.cleanupCount
+                "
+                @click="cleanup(row.kind === 'exact' ? 'exact' : 'near')"
+              >
+                {{ preparingKind === row.kind ? "准备中…" : "一键整理" }}
+              </button>
+              <button
+                class="text-button"
+                :data-review-kind="row.kind"
+                :aria-label="'查看' + names[row.kind]"
+                :disabled="w.loading.value || !row.groups"
+                @click="openReview(row.kind)"
+              >
+                查看<AppIcon name="right" :size="15" />
+              </button>
+            </div>
+          </article>
+        </section>
+        <p class="workflow-evidence-note">
+          完全相同与近似图片分别整理；近似图片可先进入“查看”人工审查。类似与无法确认项默认保留。整理仅移入应用回收站，可整批撤销，原文件暂时保留。
+        </p>
+        <p v-if="w.status.value?.protectedCount" class="workflow-evidence-note">
+          {{ w.status.value.protectedCount.toLocaleString() }}
+          张人工保留，整理计划以你的选择为准。
+        </p>
+        <div v-if="undoable" class="workflow-completed" role="status">
+          <AppIcon name="check" :size="18" /><span
+            >已整理
+            {{ (lastOperation?.status?.succeeded ?? 0).toLocaleString() }}
+            张图片，结果已自动更新。</span
+          ><button class="text-button" :disabled="busy" @click="undo">
+            撤销本次整理
+          </button>
+        </div>
+      </template>
+      <DuplicateOperationPanel
+        v-if="
+          activeOperation &&
+          (operationRunning ||
+            ['partial', 'cancelled', 'interrupted', 'failed'].includes(
+              activeOperation.status?.state ?? activeOperation.jobState,
+            ))
+        "
+        :operation="activeOperation"
+        :job="jobs.find((job) => job.id === activeOperation!.jobId)"
+        :busy="busy"
+        error-in-dialog
+        @refresh="management.sync(activeOperation!, true)"
+        @more="management.results(activeOperation!, true)"
+        @undo="management.undo(activeOperation!)"
+        @retry="management.retry(activeOperation!)"
+        @control="controlJob(activeOperation!.jobId, $event)"
+      />
+      <p v-if="notice" class="workflow-notice" role="status">{{ notice }}</p>
+      <div
+        v-if="
+          recentAttempt &&
+          ['partial', 'failed', 'cancelled', 'interrupted'].includes(
+            recentAttempt.state,
+          )
+        "
+        class="workflow-attempt"
       >
-    </Teleport>
+        <strong
+          >上次{{ recentAttempt.label
+          }}{{ stateName(recentAttempt.state) }}</strong
+        ><span>保留上一次完整结果及已提交的检查记录。</span>
+        <details v-if="recentAttempt.errors.length">
+          <summary>查看任务提示</summary>
+          <p v-for="message in recentAttempt.errors" :key="message">
+            {{ message }}
+          </p>
+        </details>
+      </div>
+      <section
+        v-if="advanced"
+        class="workflow-advanced"
+        aria-label="更多检索选项"
+      >
+        <h2>检索选项</h2>
+        <div class="workflow-options">
+          <label
+            ><input v-model="force" type="checkbox" />强制重新计算指纹</label
+          ><button class="soft-button" :disabled="busy" @click="start()">
+            重新三轮检索
+          </button>
+        </div>
+        <p>默认复用有效指纹；强制重算只在再次检索时生效。</p>
+        <div v-if="scan" class="workflow-diagnostics">
+          <span>查重缓存 {{ bytes(scan?.cacheBytes ?? 0) }}</span
+          ><span
+            >失败 {{ scan?.coverage.failed ?? 0 }} · 跳过近似检查
+            {{ scan?.coverage.skippedNear ?? 0 }}</span
+          ><button
+            class="text-button danger"
+            :disabled="busy"
+            @click="confirmClear = true"
+          >
+            清理查重缓存
+          </button>
+        </div>
+        <p v-else>缓存信息待读取。</p>
+        <details class="workflow-history">
+          <summary>
+            整理历史 <span>{{ batches.operations.value.size }} 个批次</span>
+          </summary>
+          <SoftSelect
+            v-if="operationOptions.length"
+            v-model="batches.activeOperationId.value"
+            aria-label="选择整理批次"
+            :options="operationOptions"
+          /><DuplicateOperationPanel
+            v-if="batches.latest.value"
+            :operation="batches.latest.value"
+            :job="jobs.find((job) => job.id === batches.latest.value!.jobId)"
+            :busy="busy"
+            error-in-dialog
+            @refresh="management.sync(batches.latest.value!, true)"
+            @more="management.results(batches.latest.value!, true)"
+            @undo="management.undo(batches.latest.value!)"
+            @retry="management.retry(batches.latest.value!)"
+            @control="controlJob(batches.latest.value!.jobId, $event)"
+          />
+          <p v-else>暂无整理记录。</p>
+          <button
+            class="text-button danger"
+            :disabled="busy"
+            @click="confirmRecords = true"
+          >
+            清除整理记录…
+          </button>
+        </details>
+      </section>
+    </template>
+    <SoftDialog
+      v-if="confirmClear"
+      title="清理查重缓存？"
+      @close="confirmClear = false"
+      ><p>
+        只清理可重建的查重索引、分组与本轮人工选择；图库、原图和整理撤销记录保留。下次需要重新检索。
+      </p>
+      <template #actions
+        ><button class="text-button" @click="confirmClear = false">取消</button
+        ><button class="soft-button danger" @click="clearCache">
+          清理缓存
+        </button></template
+      ></SoftDialog
+    >
+    <SoftDialog
+      v-if="confirmRecords"
+      title="清除整理记录？"
+      @close="confirmRecords = false"
+      ><p>
+        清除后无法再通过这些批次撤销整理。图库图片和当前回收站状态保持不变。
+      </p>
+      <template #actions
+        ><button class="text-button" @click="confirmRecords = false">
+          取消</button
+        ><button class="soft-button danger" @click="clearRecords">
+          清除记录
+        </button></template
+      ></SoftDialog
+    >
+    <ErrorDialog
+      :errors="errors"
+      title="重复检索操作未完成"
+      :description="errorDescription"
+      retry-label="刷新结果"
+      :retrying="refreshingResults"
+      :retry-disabled="activeWork"
+      @retry="refreshResults"
+    />
   </section>
 </template>
+<style scoped>
+@import "./workflow.css";
+</style>

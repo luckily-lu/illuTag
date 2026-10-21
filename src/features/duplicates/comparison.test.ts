@@ -37,6 +37,10 @@ describe("原图比对", () => {
       attachTo: document.body,
     });
     const stages = wrapper.findAll(".duplicate-pan-stage");
+    expect(wrapper.findAll('input[type="checkbox"]')).toHaveLength(0);
+    expect(wrapper.text()).not.toMatch(
+      /保留参考图|保留候选图|待处理|处理选中项/,
+    );
     await stages[0].trigger("wheel", { deltaY: -100 });
     expect(wrapper.findAll("img")[0].attributes("style")).toContain(
       "scale(1.2)",

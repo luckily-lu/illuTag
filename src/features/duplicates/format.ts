@@ -34,5 +34,17 @@ export const stateNames: Record<string, string> = {
   error: "检查失败",
   queued: "排队中",
   paused: "已暂停",
+  pausing: "正在暂停",
   cancelling: "正在停止",
+  prepared: "准备中",
+};
+export function stateName(state: string) {
+  return stateNames[state] ?? "状态待更新";
+}
+export const batchStageNames: Record<string, string> = {
+  snapshot: "读取已有结果",
+  workflowSnapshot: "读取统一整理计划",
+  planning: "选择保留图片",
+  applying: "校验并回收",
+  undoSnapshot: "准备撤销",
 };

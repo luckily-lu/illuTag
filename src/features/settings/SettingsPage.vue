@@ -26,6 +26,9 @@ const section = ref("appearance"),
   confirm = ref<null | {
     title: string;
     text: string;
+    path?: string;
+    danger?: boolean;
+    actionLabel?: string;
     run: () => Promise<void>;
   }>(null);
 const pathMappings = ref<BackupPathMapping[]>([]);
@@ -57,6 +60,12 @@ async function run(work: () => Promise<void>) {
     busy.value = false;
   }
 }
+function confirmAction() {
+  const action = confirm.value;
+  if (!action || busy.value) return;
+  confirm.value = null;
+  void action.run();
+}
 async function folder() {
   const p = await open({ directory: true, multiple: false });
   return typeof p === "string" ? p : null;
@@ -81,7 +90,10 @@ function removeSource(source: LibraryFolder) {
   pathMappings.value = [];
   confirm.value = {
     title: "移除磁盘来源",
-    text: "移除该来源的图库索引和相关归属，磁盘上的原始图片保留。完整恢复需要之前的备份。",
+    path: source.path,
+    text: "将删除此来源的图库索引和相关归属，磁盘上的原始图片保留。完整恢复这些数据需要之前的备份。",
+    danger: true,
+    actionLabel: "移除来源",
     run: () =>
       run(async () => {
         await invoke("remove_gallery_folder_command", {
@@ -90,6 +102,16 @@ function removeSource(source: LibraryFolder) {
         emit("refresh");
         message.value = "来源已移除";
       }),
+  };
+}
+function cleanupMissing() {
+  pathMappings.value = [];
+  confirm.value = {
+    title: "清理缺失索引",
+    text: "将检查所有来源，删除已确认缺失图片的图库索引和相关归属。磁盘上的现存原始图片保留；离线来源目录会跳过。完整恢复已删除的索引需要之前的备份。",
+    danger: true,
+    actionLabel: "开始清理",
+    run: async () => emit("task", "cleanup"),
   };
 }
 function backup() {
@@ -270,27 +292,29 @@ onMounted(() => {
       <h2>磁盘来源目录</h2>
       <p>来源决定扫描的位置。左侧虚拟文件夹只改变分类归属。</p>
       <article v-for="source in sources" :key="source.id" class="source-row">
-        <div>
-          <p class="path-text">{{ source.path }}</p>
+        <div class="source-details">
+          <p class="path-text" :title="source.path">{{ source.path }}</p>
           <small>{{
             source.lastScannedAt
               ? "最近扫描：" + new Date(source.lastScannedAt).toLocaleString()
               : "尚未扫描"
           }}</small>
         </div>
-        <button
-          class="soft-button compact"
-          @click="emit('task', 'scan', source.id)"
-        >
-          扫描此来源
-        </button>
-        <button
-          class="soft-button compact"
-          :disabled="busy"
-          @click="removeSource(source)"
-        >
-          移除来源
-        </button>
+        <div class="source-actions">
+          <button
+            class="soft-button compact"
+            @click="emit('task', 'scan', source.id)"
+          >
+            扫描此来源
+          </button>
+          <button
+            class="soft-button compact danger"
+            :disabled="busy"
+            @click="removeSource(source)"
+          >
+            移除来源
+          </button>
+        </div>
       </article>
       <div class="button-row">
         <button class="soft-button" :disabled="busy" @click="addSource">
@@ -309,7 +333,11 @@ onMounted(() => {
           打开目录</button
         ><button class="soft-button" :disabled="busy" @click="migrate">
           迁移目录</button
-        ><button class="soft-button" @click="emit('task', 'cleanup')">
+        ><button
+          class="soft-button danger"
+          :disabled="busy"
+          @click="cleanupMissing"
+        >
           手动清理缺失索引
         </button>
       </div>
@@ -343,7 +371,8 @@ onMounted(() => {
       </div>
     </div>
     <SoftDialog v-if="confirm" :title="confirm.title" @close="confirm = null"
-      ><p>{{ confirm.text }}</p>
+      ><p v-if="confirm.path" class="path-text">来源目录：{{ confirm.path }}</p>
+      <p>{{ confirm.text }}</p>
       <div v-if="pathMappings.length" class="restore-mappings">
         <p>
           来源目录位置有变化时，可指定新的位置。保持原路径会保留已有引用；恢复包不包含这些目录的原图。
@@ -363,14 +392,12 @@ onMounted(() => {
       <template #actions
         ><button class="text-button" @click="confirm = null">取消</button
         ><button
-          class="soft-button primary"
-          @click="
-            const c = confirm;
-            confirm = null;
-            c.run();
-          "
+          class="soft-button"
+          :class="confirm.danger ? 'danger' : 'primary'"
+          :disabled="busy"
+          @click="confirmAction"
         >
-          确认
+          {{ confirm.actionLabel ?? "确认" }}
         </button></template
       ></SoftDialog
     >

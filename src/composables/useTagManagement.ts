@@ -47,6 +47,7 @@ export function useTagManagement(options: UseTagManagementOptions) {
   const dictTags = ref<TagDictionaryBrowserItem[]>([])
   const dictLoaded = ref(false)
   const dictGroupId = ref('all')
+  const dictFavoriteTags = ref(new Set<string>())
   const dictQuery = ref('')
   const dictOnlyUsed = ref(false)
   const dictSort = ref<'count' | 'index' | 'zh' | 'en'>('count')
@@ -253,6 +254,7 @@ export function useTagManagement(options: UseTagManagementOptions) {
     }
     return [
       { id: 'all', zh: '全部', count: total },
+      { id: 'favorites', zh: '收藏', count: dictTags.value.filter(tag => dictFavoriteTags.value.has(tag.tagEn) && (!dictOnlyUsed.value || tag.imageCount > 0)).length },
       ...dictGroups.value.map((group) => ({
         id: group.id,
         zh: group.zh,
@@ -262,9 +264,11 @@ export function useTagManagement(options: UseTagManagementOptions) {
   })
 
   const filteredDictTags = computed(() => {
-    const query = dictQuery.value.trim().toLowerCase()
+    const query = dictQuery.value.trim().toLowerCase().replaceAll('_', ' ')
     let rows = dictTags.value
-    if (dictGroupId.value !== 'all') {
+    if (dictGroupId.value === 'favorites') {
+      rows = rows.filter((tag) => dictFavoriteTags.value.has(tag.tagEn))
+    } else if (dictGroupId.value !== 'all') {
       rows = rows.filter((tag) => tag.group === dictGroupId.value)
     }
     if (dictOnlyUsed.value) {
@@ -273,7 +277,7 @@ export function useTagManagement(options: UseTagManagementOptions) {
     if (query) {
       rows = rows.filter(
         (tag) =>
-          tag.tagEn.toLowerCase().includes(query) ||
+          tag.tagEn.toLowerCase().replaceAll('_', ' ').includes(query) ||
           (tag.tagZh ?? '').toLowerCase().includes(query),
       )
     }
@@ -312,6 +316,7 @@ export function useTagManagement(options: UseTagManagementOptions) {
     dictOnlyUsed,
     dictSort,
     dictGroupItems,
+    dictFavoriteTags,
     filteredDictTags,
     visibleDictTags,
     openTagManager,
@@ -326,6 +331,7 @@ export function useTagManagement(options: UseTagManagementOptions) {
     deleteTagManagerFolder,
     loadMoreDictTags,
     dictGroups,
+    allDictTags: dictTags,
     dictHasMore: computed(() => visibleDictTags.value.length < filteredDictTags.value.length),
     loadDictionaryBrowser,
   }

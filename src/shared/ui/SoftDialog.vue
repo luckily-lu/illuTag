@@ -6,8 +6,11 @@ const emit = defineEmits<{ close: [] }>();
 const panel = ref<HTMLElement>();
 let previous: HTMLElement | null = null;
 function key(event: KeyboardEvent) {
+  if (Array.from(document.querySelectorAll(".soft-dialog")).at(-1) !== panel.value)
+    return;
   if (document.querySelector(".select-popover")) return;
   if (event.key === "Escape") {
+    event.preventDefault();
     event.stopImmediatePropagation();
     emit("close");
   }

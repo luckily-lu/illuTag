@@ -102,6 +102,5 @@ function key(e: KeyboardEvent) {
     <p class="duplicate-pan-path" :title="member.image.id">
       {{ member.image.id }}
     </p>
-    <slot name="review" />
   </section>
 </template>

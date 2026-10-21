@@ -21,7 +21,7 @@ fn main() -> Result<(), String> {
     let started = Instant::now();
     let mut last = Instant::now() - Duration::from_secs(5);
     let mut last_stage = String::new();
-    let result = duplicates::run_job(DuplicateOptions { sensitivity: "standard".into(), force_recompute: false, regroup_only: false }, &state, &mut || Ok(()), &mut |stage, coverage| {
+    let result = duplicates::run_job(DuplicateOptions { sensitivity: "standard".into(), force_recompute: false, regroup_only: false, verification_mode: "candidate".into() }, &state, &mut || Ok(()), &mut |stage, coverage| {
         if last.elapsed() >= Duration::from_secs(5) || stage != last_stage {
             last = Instant::now(); last_stage = stage.into();
             println!("{}", serde_json::json!({"stage":stage,"elapsedMs":started.elapsed().as_millis(),"coverage":coverage}));

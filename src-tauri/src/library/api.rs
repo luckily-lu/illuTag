@@ -268,6 +268,41 @@ pub fn get_image_detail(image_id: String, state: &AppState) -> Result<ImageDetai
     })
 }
 
+pub fn undo_viewer_trash(
+    image_id: String,
+    revision: i64,
+    state: &AppState,
+) -> Result<MutationResult, String> {
+    if state.read_only || state.maintenance.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("图库只读或正在维护".into());
+    }
+    let _write = state.write_lock.lock().map_err(|e| e.to_string())?;
+    if *state
+        .startup_cleanup_generation
+        .lock()
+        .map_err(|e| e.to_string())?
+        != revision
+    {
+        return Err("图库已有后续修改，请到应用回收站还原这张图片".into());
+    }
+    let conn = open_database(&state.database_path)?;
+    if !load_image_record(&conn, &image_id)?.trashed {
+        return Err("图片状态已变化，无需撤销".into());
+    }
+    drop(conn);
+    mutate_images_locked(
+        ImageMutation {
+            action: "restore".into(),
+            image_ids: vec![image_id],
+            folder_id: None,
+            favorite: None,
+            custom_tags: vec![],
+            supplement_tags: vec![],
+        },
+        state,
+    )
+}
+
 pub fn mutate_images(request: ImageMutation, state: &AppState) -> Result<MutationResult, String> {
     if state.read_only {
         return Err("此测试图库只允许浏览".into());
@@ -276,10 +311,18 @@ pub fn mutate_images(request: ImageMutation, state: &AppState) -> Result<Mutatio
         return Err("维护中或已切换数据，请重启应用后继续".into());
     }
     let _write = state.write_lock.lock().map_err(|e| e.to_string())?;
+    mutate_images_locked(request, state)
+}
+
+fn mutate_images_locked(
+    request: ImageMutation,
+    state: &AppState,
+) -> Result<MutationResult, String> {
     let mut conn = open_database(&state.database_path)?;
     let image_ids = normalize_batch_image_ids(request.image_ids);
     if ["trash", "restore", "systemTrash"].contains(&request.action.as_str()) {
         crate::duplicates::management::revoke_for_ids(&image_ids, state)?;
+        super::recycle::revoke_for_ids(&image_ids, state)?;
     }
     let mut successful_ids = Vec::new();
     let mut failures = Vec::new();
@@ -364,7 +407,7 @@ pub fn mutate_images(request: ImageMutation, state: &AppState) -> Result<Mutatio
     if ["trash", "restore", "systemTrash"].contains(&request.action.as_str()) {
         invalidate_all_similarity_caches(state);
         if !successful_ids.is_empty() {
-            crate::duplicates::invalidate(state);
+            crate::duplicates::membership_invalidated(state);
         }
     }
     Ok(MutationResult {

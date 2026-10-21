@@ -17,6 +17,8 @@ use tauri::AppHandle;
 const MAX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_ITEMS: usize = 20_000;
 const TTL: i64 = 30 * 60 * 1000;
+#[path = "management_bulk.rs"]
+mod bulk;
 const LOG_SCHEMA: &str = r#"
 CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE operations(id INTEGER PRIMARY KEY,generation TEXT NOT NULL,group_id TEXT NOT NULL,action TEXT NOT NULL,state TEXT NOT NULL,request TEXT NOT NULL,created INTEGER NOT NULL,updated INTEGER NOT NULL,expires INTEGER NOT NULL,errors TEXT NOT NULL DEFAULT '[]',affected TEXT NOT NULL DEFAULT '[]',truncated INTEGER NOT NULL DEFAULT 0);
@@ -70,6 +72,8 @@ pub(crate) struct Item {
     pub canonical: String,
     #[serde(default)]
     keeper_pks: Vec<i64>,
+    #[serde(default)]
+    manual_review: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Plan {
@@ -84,6 +88,10 @@ fn timestamp() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+fn next_operation_id() -> i64 {
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    timestamp() * 1024 + (SERIAL.fetch_add(1, Ordering::SeqCst) % 1024) as i64
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -139,7 +147,10 @@ fn journal(state: &AppState, create: bool) -> Result<Connection, String> {
     if version != 1 {
         return Err("处理日志版本不兼容".into());
     }
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA cache_size=-2048; PRAGMA mmap_size=0; PRAGMA wal_autocheckpoint=128; PRAGMA journal_size_limit=1048576; PRAGMA max_page_count=7168;").map_err(|e|e.to_string())?;
+    // Bulk audit grows on disk with the run; RAM and individual legacy plans remain bounded.
+    // Reset the old persisted 32 MiB page ceiling before adding resumable bulk records.
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA cache_size=-2048; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA wal_autocheckpoint=128; PRAGMA journal_size_limit=1048576; PRAGMA max_page_count=2147483646;").map_err(|e|e.to_string())?;
+    bulk::schema(&conn)?;
     Ok(conn)
 }
 fn writable(state: &AppState) -> Result<(), String> {
@@ -165,7 +176,7 @@ fn canonical(path: &Path) -> Result<String, String> {
     Ok(if cfg!(windows) { p.to_lowercase() } else { p })
 }
 pub(crate) fn main_image(conn: &Connection, pk: i64) -> Result<Option<GalleryImage>, String> {
-    conn.query_row("SELECT id,path,file_name,ext,COALESCE(width,0),COALESCE(height,0),file_size,modified_at,imported_at,folder_id,missing,trashed,is_favorite,source FROM images WHERE image_pk=?1",[pk],|r|Ok(GalleryImage{id:r.get(0)?,path:r.get(1)?,thumbnail_path:None,file_name:r.get(2)?,ext:r.get(3)?,width:r.get(4)?,height:r.get(5)?,file_size:r.get(6)?,modified_at:r.get(7)?,imported_at:r.get(8)?,folder_id:r.get(9)?,missing:r.get::<_,i64>(10)?!=0,trashed:r.get::<_,i64>(11)?!=0,is_favorite:r.get::<_,i64>(12)?!=0,source:r.get(13)?})).optional().map_err(|e|e.to_string())
+    conn.prepare_cached("SELECT id,path,file_name,ext,COALESCE(width,0),COALESCE(height,0),file_size,modified_at,imported_at,folder_id,missing,trashed,is_favorite,source FROM images WHERE image_pk=?1").map_err(|e|e.to_string())?.query_row([pk],|r|Ok(GalleryImage{id:r.get(0)?,path:r.get(1)?,thumbnail_path:None,file_name:r.get(2)?,ext:r.get(3)?,width:r.get(4)?,height:r.get(5)?,file_size:r.get(6)?,modified_at:r.get(7)?,imported_at:r.get(8)?,folder_id:r.get(9)?,missing:r.get::<_,i64>(10)?!=0,trashed:r.get::<_,i64>(11)?!=0,is_favorite:r.get::<_,i64>(12)?!=0,source:r.get(13)?})).optional().map_err(|e|e.to_string())
 }
 fn item(
     conn: &Connection,
@@ -213,6 +224,7 @@ fn item(
         sha,
         near,
         keeper_pks: vec![],
+        manual_review: false,
     })
 }
 fn public_item(conn: &Connection, db: &Connection, id: &str) -> Result<Item, String> {
@@ -709,8 +721,7 @@ fn append_operation(plan: Plan, targets: &[Item], state: &AppState) -> Result<St
     if used as u64 + reserve > 26 * 1024 * 1024 {
         return Err("本批次会超过32 MiB处理日志预算，请缩小选择范围".into());
     }
-    static SERIAL: AtomicU64 = AtomicU64::new(0);
-    let id = timestamp() * 1024 + (SERIAL.fetch_add(1, Ordering::SeqCst) % 1024) as i64;
+    let id = next_operation_id();
     conn.execute("INSERT INTO operations(id,generation,group_id,action,state,request,created,updated,expires) VALUES(?1,?2,?3,?4,'preparing',?5,?6,?6,?7)",params![id,plan.request.generation,plan.request.group_id,plan.request.action,plan_json,timestamp(),timestamp()+TTL]).map_err(|e|e.to_string())?;
     for (chunk_no, chunk) in payloads.chunks(100).enumerate() {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -744,6 +755,9 @@ pub fn prepare(
 ) -> Result<DuplicateActionPreview, String> {
     writable(state)?;
     let _write = state.write_lock.lock().map_err(|e| e.to_string())?;
+    if bulk::is_request(&request) {
+        return bulk::prepare(request, state);
+    }
     let (plan, targets, protected, mut warnings) = build_prepare(&request, state)?;
     if targets.is_empty() {
         return Err("没有可处理的非保留图片".into());
@@ -899,7 +913,8 @@ fn operation_active(operation: &str, state: &AppState) -> Result<bool, String> {
     Ok(is_running(state)
         || state.jobs.list()?.iter().any(|j| {
             j.request.duplicate_operation_id.as_deref() == Some(operation)
-                && ["queued", "running", "paused", "cancelling"].contains(&j.state.as_str())
+                && ["queued", "running", "pausing", "paused", "cancelling"]
+                    .contains(&j.state.as_str())
         }))
 }
 fn recover_interrupted(
@@ -917,11 +932,10 @@ fn recover_interrupted(
     }
     Ok(())
 }
-pub fn apply(
-    request: DuplicateApplyRequest,
+pub(crate) fn validate_apply(
+    request: &DuplicateApplyRequest,
     state: &AppState,
-    app: AppHandle,
-) -> Result<crate::jobs::JobRecord, String> {
+) -> Result<(), String> {
     writable(state)?;
     if !request.confirmed {
         return Err("请先确认处理预览".into());
@@ -930,16 +944,31 @@ pub fn apply(
     {
         let conn = journal(state, false)?;
         recover_interrupted(&conn, id, &request.operation_id, state)?;
-        let (_, phase, expires) = load_plan(&conn, id)?;
-        if !["prepared", "partial", "cancelled", "interrupted"].contains(&phase.as_str()) {
+        let (plan, phase, expires) = load_plan(&conn, id)?;
+        if plan.request.action != "restore" {
+            super::workflow::validate_plan(&plan.request, state)?;
+        }
+        let bulk = bulk::exists(&conn, id)?;
+        if !["prepared", "partial", "cancelled", "interrupted"].contains(&phase.as_str())
+            && !(bulk && phase == "failed")
+        {
             return Err("此批次已提交或正在执行，不能重复应用".into());
         }
         if phase == "prepared" && timestamp() > expires {
             return Err("处理预览已过期，请重新预览".into());
         }
     }
+    Ok(())
+}
+pub fn apply(
+    request: DuplicateApplyRequest,
+    state: &AppState,
+    app: AppHandle,
+) -> Result<crate::jobs::JobRecord, String> {
+    validate_apply(&request, state)?;
     let record = crate::jobs::start_job(
         crate::jobs::JobRequest {
+            recycle_operation_id: None,
             kind: "duplicateManagement".into(),
             thumbnails: false,
             source_folder_id: None,
@@ -951,6 +980,10 @@ pub fn apply(
     )?;
     Ok(record)
 }
+pub(super) fn prepare_workflow_category(request:&DuplicateWorkflowRequest,source:&Connection,plan:i64,kind:Option<&str>,state:&AppState)->Result<DuplicateActionPreview,String>{
+    writable(state)?;
+    bulk::prepare_workflow_category(request,source,plan,kind,state)
+}
 pub fn undo(
     operation: String,
     state: &AppState,
@@ -959,6 +992,7 @@ pub fn undo(
     let id = prepare_undo(&operation, state)?;
     crate::jobs::start_job(
         crate::jobs::JobRequest {
+            recycle_operation_id: None,
             kind: "duplicateUndo".into(),
             thumbnails: false,
             source_folder_id: None,
@@ -978,40 +1012,12 @@ pub(crate) fn prepare_undo(operation: &str, state: &AppState) -> Result<String, 
     if plan.request.action != "trash" {
         return Err("只有应用回收站操作可以撤销".into());
     }
-    let mut targets = Vec::new();
-    for (_, item, phase, _) in item_rows(&conn, source)? {
-        if phase != "succeeded" {
-            continue;
-        }
-        let owner: Option<i64> = conn
-            .query_row(
-                "SELECT operation FROM owners WHERE image_pk=?1 AND public_hash=?2",
-                params![item.pk, item.public_hash],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        if owner == Some(source) {
-            targets.push(item);
-        }
+    if operation_active(operation, state)? {
+        return Err("请先暂停并取消当前整理任务，再撤销本批次".into());
     }
-    if targets.is_empty() {
-        return Err("该批次没有仍可撤销的成功项".into());
-    }
-    let mut req = plan.request;
-    req.action = "restore".into();
-    req.source_operation_id = Some(operation.into());
-    req.image_ids.clear();
-    append_operation(
-        Plan {
-            request: req,
-            keepers: vec![],
-            targets: targets.len() as i64,
-            batches: vec![],
-        },
-        &targets,
-        state,
-    )
+    // Legacy history shares this journal with scalable runs. Stream every undo
+    // through the resumable path so later bulk audit cannot exhaust its budget.
+    bulk::prepare_undo(operation, plan, state)
 }
 pub fn revoke_for_ids(ids: &[String], state: &AppState) -> Result<(), String> {
     if !journal_path(state).exists() {
@@ -1076,14 +1082,24 @@ pub fn operation_status(
     if phase == "running" && !operation_active(operation, state)? {
         phase = "interrupted".into();
     }
-    let counts=conn.query_row("SELECT COUNT(*),SUM(state<>'pending'),SUM(state='succeeded'),SUM(state='failed'),SUM(state='skipped') FROM items WHERE operation=?1",[id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<i64>>(1)?.unwrap_or(0),r.get::<_,Option<i64>>(2)?.unwrap_or(0),r.get::<_,Option<i64>>(3)?.unwrap_or(0),r.get::<_,Option<i64>>(4)?.unwrap_or(0)))).map_err(|e|e.to_string())?;
-    let owners: i64 = conn
+    let counts = if let Some(counts) = bulk::status_counts(&conn, id)? {
+        counts
+    } else {
+        conn.query_row("SELECT COUNT(*),SUM(state<>'pending'),SUM(state='succeeded'),SUM(state='failed'),SUM(state='skipped') FROM items WHERE operation=?1",[id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<i64>>(1)?.unwrap_or(0),r.get::<_,Option<i64>>(2)?.unwrap_or(0),r.get::<_,Option<i64>>(3)?.unwrap_or(0),r.get::<_,Option<i64>>(4)?.unwrap_or(0)))).map_err(|e|e.to_string())?
+    };
+    let (stage, stage_processed, stage_total) =
+        bulk::stage_progress(&conn, id)?.unwrap_or_else(|| (String::new(), counts.1, counts.0));
+    let owners: i64 = if bulk::exists(&conn, id)? {
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM owners o JOIN items i ON i.operation=o.operation AND i.ordinal=o.image_pk WHERE o.operation=?1 AND i.state='succeeded' AND i.file_moved=0)",[id],|r|r.get(0)).map_err(|e|e.to_string())?
+    } else {
+        conn
         .query_row(
             "SELECT COUNT(*) FROM owners o JOIN items i ON i.operation=o.operation AND i.image_pk=o.image_pk WHERE o.operation=?1 AND i.state='succeeded' AND i.file_moved=0",
             [id],
             |r| r.get(0),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+    };
     let (extra, errors, truncated, updated): (String, String, bool, i64) = conn
         .query_row(
             "SELECT affected,errors,truncated,updated FROM operations WHERE id=?1",
@@ -1097,6 +1113,9 @@ pub fn operation_status(
         group_id: plan.request.group_id,
         action: plan.request.action.clone(),
         state: phase,
+        stage,
+        stage_processed,
+        stage_total,
         processed: counts.1,
         total: counts.0,
         succeeded: counts.2,
@@ -1215,7 +1234,7 @@ fn main_write(state: &AppState, binding: &str) -> Result<Connection, String> {
         .map_err(|e| e.to_string())?;
     Ok(conn)
 }
-// One streamed alias check; cached identities avoid touching unrelated files.
+// Bounded alias pages; cached identities avoid touching unrelated files.
 // If the disposable cache was cleared, only file metadata is inspected.
 fn validate_physical_aliases(
     targets: &[&Item],
@@ -1245,40 +1264,56 @@ fn validate_physical_aliases(
         .map_err(|e| e.to_string())?;
     }
     let sql = if indexed {
-        "SELECT i.image_pk,i.id,i.path,f.identity,f.public_hash FROM images i LEFT JOIN derived.fingerprints f ON f.image_pk=i.image_pk WHERE COALESCE(i.trashed,0)=0 AND COALESCE(i.source,'')<>'reference' ORDER BY i.image_pk"
+        "SELECT i.image_pk,i.id,i.path,f.identity,f.public_hash FROM images i LEFT JOIN derived.fingerprints f ON f.image_pk=i.image_pk WHERE COALESCE(i.trashed,0)=0 AND COALESCE(i.source,'')<>'reference' AND i.image_pk>?1 ORDER BY i.image_pk LIMIT 1000"
     } else {
-        "SELECT image_pk,id,path,NULL,NULL FROM images WHERE COALESCE(trashed,0)=0 AND COALESCE(source,'')<>'reference' ORDER BY image_pk"
+        "SELECT image_pk,id,path,NULL,NULL FROM images WHERE COALESCE(trashed,0)=0 AND COALESCE(source,'')<>'reference' AND image_pk>?1 ORDER BY image_pk LIMIT 1000"
     };
-    let mut stmt = db.prepare(sql).map_err(|e| e.to_string())?;
-    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-    let mut n = 0;
-    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        n += 1;
-        if n % 1000 == 0 {
-            control()?;
-        }
-        let id: String = row.get(1).map_err(|e| e.to_string())?;
-        let cached_identity: Option<Vec<u8>> = row.get(3).map_err(|e| e.to_string())?;
-        let public: Option<Vec<u8>> = row.get(4).map_err(|e| e.to_string())?;
-        if cached_identity
-            .as_ref()
-            .is_some_and(|i| !identities.contains(&hex(i)))
-            && public
-                .as_ref()
-                .is_some_and(|p| hex(p) == digest(id.as_bytes()))
-        {
-            continue;
-        }
-        let path: String = row.get(2).map_err(|e| e.to_string())?;
-        let Ok(signature) = fingerprint::source_signature(Path::new(&path)) else {
-            continue;
+    let mut after = i64::MIN;
+    loop {
+        // A pause acknowledgement writes task_runs. Do not retain a main-library
+        // reader across this callback when the main DB uses rollback journaling.
+        control()?;
+        let page = {
+            let mut stmt = db.prepare(sql).map_err(|e| e.to_string())?;
+            let page = stmt
+                .query_map([after], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<Vec<u8>>>(3)?,
+                        r.get::<_, Option<Vec<u8>>>(4)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            page
         };
-        if actual_identities.contains(signature.identity.as_str())
-            || canonical(Path::new(&path)).is_ok_and(|p| paths.contains(p.as_str()))
-        {
-            return Err(format!(
-                "samePhysicalFile:仍有未批准的图库项指向该物理文件，未移动：{path}"
-            ));
+        if page.is_empty() {
+            break;
+        }
+        for (pk, id, path, cached_identity, public) in page {
+            after = pk;
+            if cached_identity
+                .as_ref()
+                .is_some_and(|i| !identities.contains(&hex(i)))
+                && public
+                    .as_ref()
+                    .is_some_and(|p| hex(p) == digest(id.as_bytes()))
+            {
+                continue;
+            }
+            let Ok(signature) = fingerprint::source_signature(Path::new(&path)) else {
+                continue;
+            };
+            if actual_identities.contains(signature.identity.as_str())
+                || canonical(Path::new(&path)).is_ok_and(|p| paths.contains(p.as_str()))
+            {
+                return Err(format!(
+                    "samePhysicalFile:仍有未批准的图库项指向该物理文件，未移动：{path}"
+                ));
+            }
         }
     }
     Ok(())
@@ -1307,6 +1342,11 @@ pub fn run_operation(
         .map_err(|e| e.to_string())?;
     let id = op_id(operation)?;
     let (plan, phase, expires) = load_plan(&conn, id)?;
+    if bulk::exists(&conn, id)? {
+        return bulk::run(
+            operation, &conn, plan, &phase, expires, state, control, progress,
+        );
+    }
     if !["prepared", "partial", "cancelled", "interrupted"].contains(&phase.as_str()) {
         return Err("此处理批次已完成或正在运行".into());
     }
@@ -1453,6 +1493,28 @@ pub fn run_operation(
         } else {
             hash_file(&target, control)
         };
+        let checked = checked.and_then(|_| {
+            if action == "restore" || moved {
+                return Ok(());
+            }
+            // Historical/manual plans must not bypass the new safety boundary.
+            for keep in &relevant {
+                let exact = plan.request.mode == "autoExact"
+                    || plan.request.mode == "autoExactAll"
+                    || (!target.sha.is_empty() && target.sha == keep.sha);
+                if super::verification::verify_pair(
+                    Path::new(&keep.image.path),
+                    Path::new(&target.image.path),
+                    exact,
+                    control,
+                )?
+                .is_equivalent()
+                {
+                    return Ok(());
+                }
+            }
+            Err("逐字节或局部内容复核未通过，保留此图".into())
+        });
         let result = checked.and_then(|_| -> Result<(), String> {
             let _write = state.write_lock.lock().map_err(|e| e.to_string())?;
             writable(state)?;
@@ -1673,7 +1735,7 @@ pub fn run_operation(
     )
     .map_err(|e| e.to_string())?;
     if !changed.is_empty() {
-        cache::invalidate(state);
+        cache::membership_invalidated(state);
         if let Ok(mut library) = state.library.lock() {
             *library = None;
         }
@@ -1703,7 +1765,8 @@ pub fn clear_records(confirmed: bool, state: &AppState) -> Result<(), String> {
         .contains(&journal_path(state))
         || state.jobs.list()?.iter().any(|j| {
             ["duplicateManagement", "duplicateUndo"].contains(&j.request.kind.as_str())
-                && ["queued", "running", "paused", "cancelling"].contains(&j.state.as_str())
+                && ["queued", "running", "pausing", "paused", "cancelling"]
+                    .contains(&j.state.as_str())
         })
     {
         return Err("整理任务运行中，不能清理记录".into());
@@ -1730,7 +1793,8 @@ pub fn clear_records(confirmed: bool, state: &AppState) -> Result<(), String> {
     if pending > 0 {
         return Err("仍有系统文件移动待确认或索引待修复项，不能清理记录".into());
     }
-    conn.execute_batch("DELETE FROM owners;DELETE FROM items;DELETE FROM operations;PRAGMA wal_checkpoint(TRUNCATE);VACUUM;").map_err(|e|e.to_string())?;
+    bulk::schema(&conn)?;
+    conn.execute_batch("DELETE FROM bulk_group_keepers;DELETE FROM bulk_keepers;DELETE FROM bulk_members;DELETE FROM bulk_candidates;DELETE FROM bulk_runs;DELETE FROM owners;DELETE FROM items;DELETE FROM operations;PRAGMA wal_checkpoint(TRUNCATE);VACUUM;").map_err(|e|e.to_string())?;
     conn.execute(
         "UPDATE meta SET value=?1 WHERE key='binding'",
         [cache::db_binding(state)?],

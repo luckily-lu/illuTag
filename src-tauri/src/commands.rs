@@ -610,6 +610,22 @@ pub(super) async fn unassign_user_tag_from_folder_command(
 }
 
 #[tauri::command]
+pub(super) async fn list_tag_covers_command(tags: Vec<String>, app: tauri::AppHandle) -> Result<Vec<TagCover>, AppError> {
+    off_main(app, move |state| list_tag_covers(tags, &state)).await.map_err(Into::into)
+}
+#[tauri::command]
+pub(super) async fn save_tag_cover_command(request: TagCoverRequest, app: tauri::AppHandle) -> Result<TagCover, AppError> {
+    off_main_write(app, move |state| save_tag_cover(request, &state)).await.map_err(Into::into)
+}
+#[tauri::command]
+pub(super) async fn query_tag_preview_command(tags: Vec<String>, offset: i64, limit: i64, app: tauri::AppHandle) -> Result<QueryPage, AppError> {
+    off_main(app, move |state| query_tag_preview(tags, offset, limit, &state)).await.map_err(Into::into)
+}
+#[tauri::command]
+pub(super) async fn query_tag_cover_candidates_command(tag: String, offset: i64, limit: i64, app: tauri::AppHandle) -> Result<QueryPage, AppError> {
+    off_main(app, move |state| query_tag_cover_candidates(tag, offset, limit, &state)).await.map_err(Into::into)
+}
+#[tauri::command]
 pub(super) async fn suggest_known_auto_tags_command(
     query: String,
     limit: Option<i64>,
@@ -1160,6 +1176,18 @@ pub(super) async fn mutate_images(
     .map_err(Into::into)
 }
 #[tauri::command]
+pub(super) async fn undo_viewer_trash(image_id: String, revision: i64, app: tauri::AppHandle) -> Result<MutationResult, AppError> {
+    off_main(app,move |state| illutag_core::library::undo_viewer_trash(image_id,revision,&state)).await.map_err(Into::into)
+}
+#[tauri::command]
+pub(super) async fn list_favorite_tags(app: tauri::AppHandle) -> Result<Vec<String>, AppError> {
+    off_main(app,move |state| illutag_core::library::list_favorite_tags(&state)).await.map_err(Into::into)
+}
+#[tauri::command]
+pub(super) async fn set_favorite_tag(tag: String, favorite: bool, app: tauri::AppHandle) -> Result<Vec<String>, AppError> {
+    off_main(app,move |state| illutag_core::library::set_favorite_tag(tag,favorite,&state)).await.map_err(Into::into)
+}
+#[tauri::command]
 pub(super) async fn start_job(
     app: tauri::AppHandle,
     request: illutag_core::jobs::JobRequest,
@@ -1190,10 +1218,39 @@ pub(super) fn list_jobs(
 ) -> Result<Vec<illutag_core::jobs::JobRecord>, illutag_core::library::AppError> {
     state.jobs.list().map_err(Into::into)
 }
+#[tauri::command]
+pub(super) async fn job_history(query: illutag_core::jobs::JobHistoryQuery, app: tauri::AppHandle) -> Result<illutag_core::jobs::JobHistoryPage, AppError> {
+    off_main(app,move |state| illutag_core::jobs::history(query,&state)).await.map_err(Into::into)
+}
+#[tauri::command]
+pub(super) async fn retry_job(id: String, app: tauri::AppHandle) -> Result<illutag_core::jobs::JobRecord, AppError> {
+    let handle=app.clone();off_main(app,move |state| illutag_core::jobs::retry_job(id,&state,handle)).await.map_err(Into::into)
+}
+#[tauri::command]
+pub(super) async fn clear_job_history(confirmed: bool, app: tauri::AppHandle) -> Result<i64, AppError> {
+    off_main(app,move |state| illutag_core::jobs::clear_history(confirmed,&state)).await.map_err(Into::into)
+}
 
 #[tauri::command]
 pub(super) async fn duplicate_status(app: tauri::AppHandle) -> Result<illutag_core::duplicates::DuplicateStatus, AppError> {
     off_main(app, |state| illutag_core::duplicates::status(&state)).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub(super) async fn duplicate_workflow_status(retry:Option<bool>,app:tauri::AppHandle)->Result<illutag_core::duplicates::DuplicateWorkflowStatus,AppError>{
+    off_main(app,move |s|if retry.unwrap_or(false) {illutag_core::duplicates::workflow::retry_status_snapshot(&s)} else {illutag_core::duplicates::workflow::status_snapshot(&s)}).await.map_err(Into::into)
+}
+#[tauri::command]
+pub(super) async fn query_duplicate_workflow(query:illutag_core::duplicates::DuplicateWorkflowQuery,app:tauri::AppHandle)->Result<illutag_core::duplicates::DuplicateWorkflowPage,AppError>{
+    off_main(app,move|s|illutag_core::duplicates::workflow::query(query,&s)).await.map_err(Into::into)
+}
+#[tauri::command]
+pub(super) async fn edit_duplicate_review(request:illutag_core::duplicates::DuplicateReviewEdit,app:tauri::AppHandle)->Result<illutag_core::duplicates::DuplicateWorkflowStatus,AppError>{
+    off_main(app,move|s|illutag_core::duplicates::workflow::edit(request,&s)).await.map_err(Into::into)
+}
+#[tauri::command]
+pub(super) async fn prepare_duplicate_workflow(request:illutag_core::duplicates::DuplicateWorkflowRequest,kind:Option<String>,app:tauri::AppHandle)->Result<illutag_core::duplicates::DuplicateActionPreview,AppError>{
+    off_main(app,move|s|illutag_core::duplicates::workflow::prepare_category(request,kind.as_deref(),&s)).await.map_err(Into::into)
 }
 
 #[tauri::command]
@@ -1225,6 +1282,23 @@ pub(super) async fn prepare_duplicate_action(request: illutag_core::duplicates::
 pub(super) async fn apply_duplicate_action(request: illutag_core::duplicates::DuplicateApplyRequest, app: tauri::AppHandle) -> Result<illutag_core::jobs::JobRecord, AppError> {
     let handle = app.clone();
     off_main(app, move |state| illutag_core::duplicates::management::apply(request, &state, handle)).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub(super) async fn prepare_recycle_selection(request:illutag_core::library::recycle::RecycleSelectionRequest,app:tauri::AppHandle)->Result<illutag_core::library::recycle::RecycleSelection,AppError>{
+    off_main(app,move|s|illutag_core::library::recycle::prepare(request,&s)).await.map_err(Into::into)
+}
+#[tauri::command]
+pub(super) async fn apply_recycle_action(request:illutag_core::library::recycle::RecycleApplyRequest,app:tauri::AppHandle)->Result<illutag_core::jobs::JobRecord,AppError>{
+    let handle=app.clone();off_main(app,move|s|illutag_core::library::recycle::apply(request,&s,handle)).await.map_err(Into::into)
+}
+#[tauri::command]
+pub(super) async fn recycle_operation_status(operation_id:String,app:tauri::AppHandle)->Result<illutag_core::library::recycle::RecycleOperationStatus,AppError>{
+    off_main(app,move|s|illutag_core::library::recycle::status(&operation_id,&s)).await.map_err(Into::into)
+}
+#[tauri::command]
+pub(super) async fn recycle_operation_results(query:illutag_core::library::recycle::RecycleOperationQuery,app:tauri::AppHandle)->Result<illutag_core::library::recycle::RecycleOperationPage,AppError>{
+    off_main(app,move|s|illutag_core::library::recycle::results(query,&s)).await.map_err(Into::into)
 }
 
 #[tauri::command]

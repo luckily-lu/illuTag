@@ -2,4 +2,4 @@
 import type { DuplicateAttempt } from "./DuplicateAttempt";
 import type { DuplicateCoverage } from "./DuplicateCoverage";
 
-export type DuplicateStatus = { generation: string | null, sensitivity: string, checkedAt: number | null, durationMs: number | null, state: string, needsUpdate: boolean, coverage: DuplicateCoverage, cacheBytes: number, exactGroups: number, nearGroups: number, uniqueImages: number, errors: Array<string>, lastAttempt: DuplicateAttempt | null, };
+export type DuplicateStatus = { generation: string | null, sensitivity: string, verificationMode: string, checkedAt: number | null, durationMs: number | null, state: string, needsUpdate: boolean, coverage: DuplicateCoverage, cacheBytes: number, exactGroups: number, nearGroups: number, uniqueImages: number, errors: Array<string>, lastAttempt: DuplicateAttempt | null, };

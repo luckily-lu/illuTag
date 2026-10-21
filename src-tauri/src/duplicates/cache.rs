@@ -4,7 +4,7 @@ use crate::library::{AppState, GalleryImage};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -17,8 +17,7 @@ use std::{
 
 const CACHE_VERSION: i64 = 1;
 const ALGORITHM: &str = fingerprint::ALGORITHM_VERSION;
-const MAX_CACHE_BYTES: u64 = 512 * 1024 * 1024;
-const MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MIN_FREE_BYTES: u64 = super::cache_capacity::MIN_FREE_BYTES;
 const MAX_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ERRORS: usize = 24;
 const ACTIVE: &str = "COALESCE(i.source,'') <> 'reference' AND COALESCE(i.trashed,0)=0";
@@ -58,6 +57,29 @@ struct Runtime {
     active: AtomicBool,
     invalidated: AtomicBool,
     revision: AtomicU64,
+    membership_revision: AtomicU64,
+    live: Mutex<Option<Arc<LiveView>>>,
+    disk_allowance: AtomicU64,
+}
+#[derive(Clone)]
+struct LiveGroup {
+    id: i64,
+    source_group: i64,
+    kind: i64,
+    reference: i64,
+    total: i64,
+    recalculate_metrics: bool,
+    // Most groups retain their published member order without another copy.
+    // Only a near star whose original content unit disappeared needs a subset.
+    members: Option<Vec<(i64, i64)>>,
+}
+struct LiveView {
+    generation: i64,
+    revision: u64,
+    groups: BTreeMap<i64, LiveGroup>,
+    exact: i64,
+    near: i64,
+    unique: i64,
 }
 fn runtime(state: &AppState) -> Arc<Runtime> {
     runtime_for_path(cache_path(state))
@@ -76,7 +98,7 @@ impl Drop for RunGuard {
         self.0.active.store(false, Ordering::SeqCst);
     }
 }
-fn cache_path(state: &AppState) -> PathBuf {
+pub(super) fn cache_path(state: &AppState) -> PathBuf {
     state.data_dir.join("cache").join("duplicates.sqlite")
 }
 fn now() -> i64 {
@@ -116,14 +138,18 @@ pub(crate) fn library(state: &AppState) -> Result<Connection, String> {
     }
     Ok(conn)
 }
-fn configure(conn: &Connection, writable: bool) -> Result<(), String> {
+fn configure(conn: &Connection, writable: bool, path: &Path) -> Result<(), String> {
     conn.busy_timeout(Duration::from_secs(2))
         .map_err(|e| e.to_string())?;
     conn.execute_batch("PRAGMA cache_size=-8192; PRAGMA mmap_size=0; PRAGMA temp_store=MEMORY;")
         .map_err(|e| e.to_string())?;
     if writable {
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=4194304; PRAGMA max_page_count=122880;")
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=4194304;")
             .map_err(|e| format!("无法配置查重缓存：{e}"))?;
+        let images: u64 = conn
+            .query_row("SELECT COUNT(*) FROM fingerprints", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        configure_capacity(conn, path, images)?;
     } else {
         conn.execute_batch("PRAGMA query_only=ON;")
             .map_err(|e| e.to_string())?;
@@ -161,8 +187,50 @@ pub(crate) fn open_existing(state: &AppState, writable: bool) -> Result<Connecti
     let conn = Connection::open_with_flags(cache_path(state), flags)
         .map_err(|e| format!("查重缓存无法打开，请清理缓存后重新检索：{e}"))?;
     validate(&conn, state)?;
-    configure(&conn, writable)?;
+    configure(&conn, writable, &cache_path(state))?;
     Ok(conn)
+}
+
+/// Retry only an atomic statement (or BEGIN IMMEDIATE) that SQLite has not
+/// committed. Never retain a write transaction while waiting or pausing.
+pub(super) fn controlled_write<T>(
+    conn: &Connection,
+    control: &mut dyn FnMut() -> Result<(), String>,
+    mut write: impl FnMut() -> rusqlite::Result<T>,
+) -> Result<T, String> {
+    conn.busy_timeout(Duration::from_millis(50))
+        .map_err(|e| e.to_string())?;
+    let result = (|| {
+        let mut waited = Duration::ZERO;
+        loop {
+            // Pause time is not charged to the contention budget. No statement
+            // or writer is held while this hook waits for resume/cancel.
+            control()?;
+            let started = Instant::now();
+            match write() {
+                Ok(value) => return Ok(value),
+                Err(rusqlite::Error::SqliteFailure(error, message))
+                    if matches!(
+                        error.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) =>
+                {
+                    waited += started.elapsed();
+                    if !conn.is_autocommit() || waited >= Duration::from_secs(30) {
+                        return Err(format!(
+                            "查重缓存持续被其他写入占用，已保留已有结果，请稍后重试。技术信息：{}",
+                            message.unwrap_or_else(|| error.to_string())
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                    waited += Duration::from_millis(20);
+                }
+                Err(error) => return Err(write_error(conn, &error)),
+            }
+        }
+    })();
+    let _ = conn.busy_timeout(Duration::from_secs(2));
+    result
 }
 fn create_or_open(state: &AppState) -> Result<Connection, String> {
     if cache_path(state).exists() {
@@ -176,7 +244,7 @@ fn create_or_open(state: &AppState) -> Result<Connection, String> {
         .map_err(|e| e.to_string())?;
     conn.execute_batch(SCHEMA)
         .map_err(|e| format!("创建查重缓存失败：{e}"))?;
-    configure(&conn, true)?;
+    configure(&conn, true, &cache_path(state))?;
     set_meta(&conn, "algorithm", ALGORITHM)?;
     set_meta(&conn, "database", &db_binding(state)?)?;
     set_meta(&conn, "dirty", "1")?;
@@ -185,11 +253,22 @@ fn create_or_open(state: &AppState) -> Result<Connection, String> {
 
 /// No cache, image decode or directory creation happens on application startup.
 pub fn status(state: &AppState) -> Result<DuplicateStatus, String> {
+    status_inner(state, true)
+}
+
+/// Read the published generation and dirty/attempt headers only. Starting work
+/// or polling workflow status must not build the active-membership view.
+pub fn published_status(state: &AppState) -> Result<DuplicateStatus, String> {
+    status_inner(state, false)
+}
+
+fn status_inner(state: &AppState, active_members: bool) -> Result<DuplicateStatus, String> {
     let path = cache_path(state);
     let running = runtime(state).active.load(Ordering::SeqCst);
     let mut result = DuplicateStatus {
         generation: None,
         sensitivity: "standard".into(),
+        verification_mode: "candidate".into(),
         checked_at: None,
         duration_ms: None,
         state: if running { "running" } else { "empty" }.into(),
@@ -213,6 +292,9 @@ pub fn status(state: &AppState) -> Result<DuplicateStatus, String> {
             return Ok(result);
         }
     };
+    if active_members {
+        attach_live(&conn, state)?;
+    }
     // A generation and its metadata must be read from one SQLite snapshot.
     conn.execute_batch("BEGIN DEFERRED;")
         .map_err(|e| e.to_string())?;
@@ -230,6 +312,8 @@ pub fn status(state: &AppState) -> Result<DuplicateStatus, String> {
             let row = conn.query_row("SELECT sensitivity,checked_at,state,coverage,errors,exact_groups,near_groups,unique_images FROM generations WHERE generation=?1", [&id], |r| {
                 Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,i64>(5)?,r.get::<_,i64>(6)?,r.get::<_,i64>(7)?))
             }).map_err(|e| e.to_string())?;
+            result.verification_mode =
+                meta(&conn, &format!("verification:{id}"))?.unwrap_or_else(|| "candidate".into());
             result.generation = Some(id);
             result.sensitivity = row.0;
             result.checked_at = Some(row.1);
@@ -246,8 +330,32 @@ pub fn status(state: &AppState) -> Result<DuplicateStatus, String> {
             result.exact_groups = row.5;
             result.near_groups = row.6;
             result.unique_images = row.7;
+            if active_members {
+                let view = live_view(
+                    &conn,
+                    result
+                        .generation
+                        .as_ref()
+                        .unwrap()
+                        .parse()
+                        .map_err(|_| "重复检索代次无效")?,
+                    state,
+                )?;
+                result.exact_groups = view.exact;
+                result.near_groups = view.near;
+                result.unique_images = view.unique;
+            }
         }
-        let dirty = runtime(state).invalidated.load(Ordering::SeqCst)
+        let verification_stale = result.verification_mode == "verified"
+            && result.generation.as_ref().is_some_and(|id| {
+                meta(&conn, &format!("verifier:{id}"))
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    != Some(super::verification::ALGORITHM_VERSION)
+            });
+        let dirty = verification_stale
+            || runtime(state).invalidated.load(Ordering::SeqCst)
             || meta(&conn, "dirty")?.as_deref() != Some("0");
         result.needs_update = dirty || result.state != "ready";
         if dirty && result.state == "ready" {
@@ -270,8 +378,9 @@ pub fn status(state: &AppState) -> Result<DuplicateStatus, String> {
 /// Changes to source membership invalidate results without doing background work.
 pub fn invalidate(state: &AppState) {
     let rt = runtime(state);
-    rt.invalidated.store(true, Ordering::SeqCst);
     rt.revision.fetch_add(1, Ordering::SeqCst);
+    rt.membership_revision.fetch_add(1, Ordering::SeqCst);
+    rt.invalidated.store(true, Ordering::SeqCst);
     if !cache_path(state).exists() {
         return;
     }
@@ -288,8 +397,9 @@ pub fn invalidate_database(database_path: &Path) {
     };
     let path = dir.join("cache/duplicates.sqlite");
     let rt = runtime_for_path(path.clone());
-    rt.invalidated.store(true, Ordering::SeqCst);
     rt.revision.fetch_add(1, Ordering::SeqCst);
+    rt.membership_revision.fetch_add(1, Ordering::SeqCst);
+    rt.invalidated.store(true, Ordering::SeqCst);
     if !path.exists() {
         return;
     }
@@ -319,7 +429,8 @@ pub fn clear_cache(state: &AppState) -> Result<(), String> {
         || state.jobs.list()?.iter().any(|job| {
             ["duplicates", "duplicateManagement", "duplicateUndo"]
                 .contains(&job.request.kind.as_str())
-                && ["queued", "running", "paused", "cancelling"].contains(&job.state.as_str())
+                && ["queued", "running", "pausing", "paused", "cancelling"]
+                    .contains(&job.state.as_str())
         })
     {
         return Err("查重任务正在运行或排队，请取消后再清理缓存".into());
@@ -358,21 +469,152 @@ fn cache_bytes(path: &Path) -> Result<u64, String> {
     }
     Ok(size)
 }
-fn budget(cache_size: u64, free: u64, memory: u64) -> Result<(), String> {
-    if cache_size > MAX_CACHE_BYTES.saturating_sub(8 * 1024 * 1024) {
-        return Err("查重缓存已达到 512 MiB 预算，结果仅部分完成".into());
-    }
+fn budget(cache_size: u64, free: u64, memory: u64, limit: u64) -> Result<(), String> {
     if free < MIN_FREE_BYTES {
         return Err("磁盘剩余空间不足 2 GiB，查重已停止，保留已计算指纹".into());
+    }
+    if cache_size > super::cache_capacity::soft_limit(limit) {
+        return Err(format!("查重缓存接近容量预算（有效占用 {} MiB，预算 {} MiB），已保留上次完整结果和已提交检查记录。",cache_size.div_ceil(1024*1024),limit/(1024*1024)));
     }
     if memory > MAX_MEMORY_BYTES {
         return Err("查重索引预计超过 512 MiB 内存预算，结果仅部分完成".into());
     }
     Ok(())
 }
-fn check_disk(path: &Path) -> Result<(), String> {
+pub(super) fn check_disk(path: &Path) -> Result<(), String> {
     let dir = path.parent().ok_or("查重缓存路径无效")?;
-    budget(cache_bytes(path)?, free_bytes(dir)?, 0)
+    budget(
+        effective_cache_bytes(path)?,
+        free_bytes(dir)?,
+        0,
+        disk_allowance(path),
+    )
+}
+/// Use the active writer's own page view before publication. A separate reader
+/// would still see the pre-transaction freelist and miss consumed reusable pages.
+pub(super) fn check_disk_on(conn: &Connection, path: &Path) -> Result<(), String> {
+    let dir = path.parent().ok_or("查重缓存路径无效")?;
+    budget(
+        effective_cache_bytes_on(conn, path)?,
+        free_bytes(dir)?,
+        0,
+        disk_allowance(path),
+    )
+}
+fn effective_cache_bytes_on(conn: &Connection, path: &Path) -> Result<u64, String> {
+    let (pages,free,page_size):(u64,u64,u64)=conn.query_row("SELECT page_count,freelist_count,page_size FROM pragma_page_count(),pragma_freelist_count(),pragma_page_size()",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e|format!("无法检查当前查重事务占用：{e}"))?;
+    let db_allocated = fs::metadata(path).map_err(|e| e.to_string())?.len();
+    let sidecars = cache_bytes(path)?.saturating_sub(db_allocated);
+    Ok(pages
+        .saturating_sub(free)
+        .saturating_mul(page_size)
+        .saturating_add(sidecars))
+}
+// DELETE releases reusable SQLite pages without shrinking the allocated file.
+// Account for that reuse instead of demanding VACUUM or discarding fingerprints.
+fn effective_cache_bytes(path: &Path) -> Result<u64, String> {
+    let allocated = cache_bytes(path)?;
+    if !path.exists() {
+        return Ok(allocated);
+    }
+    let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("无法检查查重缓存占用：{e}"))?;
+    c.busy_timeout(Duration::from_millis(100))
+        .map_err(|e| e.to_string())?;
+    c.execute_batch("PRAGMA query_only=ON; PRAGMA mmap_size=0; PRAGMA cache_size=-256;")
+        .map_err(|e| e.to_string())?;
+    let reusable: u64 = c
+        .query_row(
+            "SELECT freelist_count*page_size FROM pragma_freelist_count(),pragma_page_size()",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("无法检查查重缓存可复用页：{e}"))?;
+    Ok(allocated.saturating_sub(reusable))
+}
+fn disk_allowance(path: &Path) -> u64 {
+    let configured = runtime_for_path(path.to_path_buf())
+        .disk_allowance
+        .load(Ordering::SeqCst);
+    if configured == 0 {
+        super::cache_capacity::BASE_BYTES
+    } else {
+        configured
+    }
+}
+
+fn configure_capacity(conn: &Connection, path: &Path, images: u64) -> Result<(), String> {
+    let dir = path.parent().ok_or("查重缓存路径无效")?;
+    let total = super::cache_capacity::configure(conn, images, free_bytes(dir)?)?;
+    runtime_for_path(path.to_path_buf())
+        .disk_allowance
+        .store(total, Ordering::SeqCst);
+    Ok(())
+}
+
+fn write_error(conn: &Connection, error: &rusqlite::Error) -> String {
+    write_error_with_limit(conn, error, None)
+}
+fn write_error_with_limit(
+    conn: &Connection,
+    error: &rusqlite::Error,
+    limit: Option<u64>,
+) -> String {
+    if error.sqlite_error_code() != Some(rusqlite::ErrorCode::DiskFull) {
+        return error.to_string();
+    }
+    if let Some(dir) = conn.path().map(Path::new).and_then(Path::parent) {
+        if let Ok(free) = free_bytes(dir) {
+            if free < MIN_FREE_BYTES {
+                return format!("查重缓存所在磁盘可用空间不足（剩余 {} MiB），已提交进度保留。技术信息：{error}",free/(1024*1024));
+            }
+        }
+    }
+    let pages = conn
+        .query_row("PRAGMA page_count", [], |r| r.get::<_, u64>(0))
+        .unwrap_or(0);
+    let page_size = conn
+        .query_row("PRAGMA page_size", [], |r| r.get::<_, u64>(0))
+        .unwrap_or(4096);
+    let maximum = limit
+        .map(|total| super::cache_capacity::max_pages(total, page_size, pages))
+        .unwrap_or_else(|| {
+            conn.query_row("PRAGMA max_page_count", [], |r| r.get::<_, u64>(0))
+                .unwrap_or(u64::MAX)
+        });
+    if maximum.saturating_sub(pages).saturating_mul(page_size) <= 32 * 1024 * 1024 {
+        return format!("查重数据库达到缓存容量上限（约 {} MiB），已保留上次完整结果和已提交检查记录。技术信息：{error}",maximum.saturating_mul(page_size).div_ceil(1024*1024));
+    }
+    "查重数据库写入空间不足，已保留上次完整结果和已提交检查记录；请检查数据目录及临时目录的可用空间。技术信息：database or disk is full".into()
+}
+
+pub(super) fn explain_storage_error(error: String, state: &AppState, stage: &str) -> String {
+    if error.contains("查重缓存接近容量") || error.contains("磁盘剩余空间不足") {
+        return format!("{stage}：{error}");
+    }
+    if !error.contains("database or disk is full") {
+        return error;
+    }
+    if error.contains("查重数据库") {
+        return format!("{stage}：{error}");
+    }
+    match open_existing(state, false) {
+        Ok(c) => {
+            let configured = runtime(state).disk_allowance.load(Ordering::SeqCst);
+            format!(
+                "{stage}：{}",
+                write_error_with_limit(
+                    &c,
+                    &rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+                        Some(error)
+                    ),
+                    (configured > 0).then_some(configured)
+                )
+            )
+        }
+        Err(_) => format!("{stage}：查重数据库写入空间不足，已提交记录保留。技术信息：{error}"),
+    }
 }
 
 #[cfg(windows)]
@@ -480,6 +722,121 @@ fn cached_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedFingerprint> {
         image_order: row.get(14)?,
     })
 }
+
+#[cfg(test)]
+pub(super) fn evidence_records(
+    state: &AppState,
+    control: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<Vec<index::IndexRecord>, String> {
+    evidence_records_with_progress(state, control, &mut |_, _| {})
+}
+
+pub(super) fn evidence_records_with_progress(
+    state: &AppState,
+    control: &mut dyn FnMut() -> Result<(), String>,
+    progress: &mut dyn FnMut(i64, i64),
+) -> Result<Vec<index::IndexRecord>, String> {
+    control()?;
+    let conn = open_existing(state, false)?;
+    let uri = super::workflow::readonly_uri(&state.database_path)?;
+    conn.execute("ATTACH DATABASE ?1 AS evidence_library", [uri])
+        .map_err(|e| e.to_string())?;
+    let version: i64 = conn
+        .query_row("PRAGMA evidence_library.user_version", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if version != 3 {
+        return Err("重复检索需要 schema 3 图库".into());
+    }
+    // Every callback may persist task state to the library, including pause
+    // acknowledgement. A long library read would block that write in DELETE
+    // journal mode. Materialize bounded keyset pages and release their readers
+    // before calling either callback. Membership revisions bind the whole load.
+    let membership = membership_token(state);
+    let active =
+        "i.trashed=0 AND i.missing=0 AND COALESCE(i.source,'')<>'reference' AND f.sha IS NOT NULL";
+    let count:usize=conn.query_row(&format!("SELECT COUNT(*) FROM fingerprints f JOIN evidence_library.images i ON i.image_pk=f.image_pk WHERE {active}"),[],|r|r.get(0)).map_err(|e|e.to_string())?;
+    progress(0, count as i64);
+    if index::estimate_memory_bytes(count).saturating_add(24 * 1024 * 1024) > MAX_MEMORY_BYTES {
+        return Err("当前索引超过512MiB预算，未替换已有结果".into());
+    }
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(count)
+        .map_err(|_| "索引内存不足")?;
+    let columns = FINGERPRINT_COLUMNS
+        .split(',')
+        .map(|c| format!("f.{c}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql=format!("SELECT {columns},i.id FROM fingerprints f CROSS JOIN evidence_library.images i ON i.image_pk=f.image_pk WHERE {active} AND f.image_pk>?1 ORDER BY f.image_pk LIMIT 1000");
+    let mut after = i64::MIN;
+    loop {
+        control()?;
+        if membership != membership_token(state) {
+            return Err("载入指纹期间图库成员已变化，保留原检索结果，请重新运行".into());
+        }
+        let page = {
+            let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let page = statement
+                .query_map([after], |r| Ok((cached_row(r)?, r.get::<_, String>(15)?)))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            page
+        }; // No library statement/transaction survives this boundary.
+        if page.is_empty() {
+            break;
+        }
+        for (row, public_id) in page {
+            after = row.image_pk;
+            if hash(public_id.as_bytes()) != row.public_hash {
+                mark_stale(state);
+                return Err("图片身份已变化，请重新检查指纹；保留原检索结果".into());
+            }
+            records.push(index::IndexRecord {
+                image_pk: row.image_pk,
+                image_order: row.image_order,
+                file_size: row.size as u64,
+                width: row.width,
+                height: row.height,
+                sha256: row.sha.unwrap(),
+                near: row.near,
+            });
+        }
+        if index::estimate_memory_bytes(records.len()).saturating_add(24 * 1024 * 1024)
+            > MAX_MEMORY_BYTES
+        {
+            return Err("当前索引超过512MiB预算，未替换已有结果".into());
+        }
+        progress(records.len() as i64, count as i64);
+    }
+    if index::estimate_memory_bytes(records.len()).saturating_add(24 * 1024 * 1024)
+        > MAX_MEMORY_BYTES
+    {
+        return Err("当前索引超过512MiB预算，未替换已有结果".into());
+    }
+    control()?;
+    if membership != membership_token(state) || records.len() != count {
+        return Err("载入指纹期间图库成员已变化，保留原检索结果，请重新运行".into());
+    }
+    progress(records.len() as i64, count as i64);
+    Ok(records)
+}
+
+pub(super) fn evidence_published(state: &AppState, membership: &str) {
+    let rt = runtime(state);
+    rt.invalidated.store(false, Ordering::SeqCst);
+    // A source change just after COMMIT must not be cleared by publication.
+    if membership != membership_token(state) {
+        rt.invalidated.store(true, Ordering::SeqCst);
+        if let Ok(conn) = open_existing(state, true) {
+            let _ = set_meta(&conn, "dirty", "1");
+        }
+    }
+    if let Ok(mut view) = rt.live.lock() {
+        *view = None;
+    };
+}
 const FINGERPRINT_COLUMNS:&str="image_pk,public_hash,signature,size,mtime,identity,sha,phash,dhash,color,width,height,low_info,skip,image_order";
 fn get_fingerprint(conn: &Connection, image_pk: i64) -> Result<Option<CachedFingerprint>, String> {
     conn.query_row(
@@ -489,6 +846,287 @@ fn get_fingerprint(conn: &Connection, image_pk: i64) -> Result<Option<CachedFing
     )
     .optional()
     .map_err(|e| format!("查重缓存指纹损坏，请清理缓存后重新检索：{e}"))
+}
+
+struct LiveSourceMember {
+    number: i64,
+    pk: i64,
+    sha: Option<[u8; 32]>,
+}
+
+fn insert_live_group(view: &mut LiveView, group: LiveGroup) {
+    if group.kind == 0 {
+        view.exact += 1;
+    } else {
+        view.near += 1;
+    }
+    view.groups.insert(group.id, group);
+}
+
+fn live_source_group(
+    conn: &Connection,
+    view: &mut LiveView,
+    source: i64,
+    kind: i64,
+    original_reference: i64,
+    members: &[LiveSourceMember],
+    threshold: index::Threshold,
+    next_id: &mut i64,
+    unique: &mut HashSet<i64>,
+) -> Result<(), String> {
+    if members.len() < 2 {
+        return Ok(());
+    }
+    let original = members.iter().find(|m| m.pk == original_reference);
+    let original_sha = match original {
+        Some(member) => member.sha,
+        None if kind == 1 => conn.query_row(
+            "SELECT f.sha FROM members m JOIN fingerprints f ON f.image_pk=m.image_pk AND f.signature=m.signature WHERE m.generation=?1 AND m.group_no=?2 AND m.image_pk=?3 LIMIT 1",
+            params![view.generation, source, original_reference],
+            |r| r.get::<_, Option<Vec<u8>>>(0)?.map(fixed).transpose(),
+        ).optional().map_err(|e| e.to_string())?.flatten(),
+        None => None,
+    };
+    let replacement = original
+        .or_else(|| original_sha.and_then(|sha| members.iter().find(|m| m.sha == Some(sha))));
+    // A near result requires at least two content units. Copies of the last
+    // surviving unit remain in exact results and must not keep a near star alive.
+    if kind == 1 && members[0].sha.is_some() && members.iter().all(|m| m.sha == members[0].sha) {
+        return Ok(());
+    }
+    let reference_changed = kind == 1
+        && meta(conn, &format!("review:{}:{source}", view.generation))?.as_deref() == Some("1");
+    if kind == 0 || (replacement.is_some() && !reference_changed) {
+        unique.extend(members.iter().map(|m| m.pk));
+        insert_live_group(
+            view,
+            LiveGroup {
+                id: source,
+                source_group: source,
+                kind,
+                reference: replacement.map(|m| m.pk).unwrap_or(members[0].pk),
+                total: members.len() as i64,
+                recalculate_metrics: replacement.is_some_and(|m| m.pk != original_reference),
+                members: None,
+            },
+        );
+        return Ok(());
+    }
+    // Losing a star's entire reference content unit does not make its leaves
+    // mutually similar. Rebuild only this star from already cached numbers;
+    // no file is opened, decoded or fingerprinted here, and no transitive
+    // component is formed. Multiple direct stars may survive the removal.
+    if index::estimate_memory_bytes(members.len()).saturating_add(48 * 1024 * 1024)
+        > MAX_MEMORY_BYTES
+    {
+        return Err("活跃查重分组超过内存预算，请手动更新结果".into());
+    }
+    let mut records = Vec::with_capacity(members.len());
+    let mut numbers = Vec::with_capacity(members.len());
+    for member in members {
+        let Some(cached) = get_fingerprint(conn, member.pk)? else {
+            continue;
+        };
+        // A partial newer scan may have replaced a fingerprint. Do not apply
+        // that new geometry to membership from an older published generation.
+        if cached.sha != member.sha || member.sha.is_none() {
+            continue;
+        }
+        records.push(index::IndexRecord {
+            image_pk: member.pk,
+            image_order: cached.image_order,
+            file_size: cached.size as u64,
+            sha256: cached.sha.unwrap(),
+            near: cached.near,
+            width: cached.width,
+            height: cached.height,
+        });
+        numbers.push(member.number);
+    }
+    let mut first = true;
+    let refined =
+        meta(conn, &format!("verification:{}", view.generation))?.as_deref() == Some("verified");
+    index::build_groups_filtered(
+        &records,
+        threshold,
+        &mut || Ok(()),
+        &mut |a, b, kind| {
+            if !refined {
+                return Ok(true);
+            }
+            super::verification_cache::accepted_cached(
+                conn,
+                records[a].image_pk,
+                records[b].image_pk,
+                kind == index::DuplicateKind::Exact,
+            )
+        },
+        &mut |group| {
+            if group.kind != index::DuplicateKind::Near {
+                return Ok(());
+            }
+            let id = if first {
+                first = false;
+                source
+            } else {
+                let id = *next_id;
+                *next_id += 1;
+                id
+            };
+            let mut selected: Vec<_> = group
+                .members
+                .iter()
+                .map(|m| {
+                    let pk = records[m.record_index].image_pk;
+                    unique.insert(pk);
+                    (numbers[m.record_index], pk)
+                })
+                .collect();
+            selected.sort_unstable();
+            insert_live_group(
+                view,
+                LiveGroup {
+                    id,
+                    source_group: source,
+                    kind: 1,
+                    reference: records[group.reference].image_pk,
+                    total: selected.len() as i64,
+                    recalculate_metrics: true,
+                    members: Some(selected),
+                },
+            );
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+/// A complete active-membership snapshot is computed once per published
+/// generation / operation revision, then shared by status and every result page.
+/// The main database and the published cache stay read-only. Normal groups only
+/// retain a small summary; member lists are retained solely for rebuilt stars.
+fn live_view(
+    conn: &Connection,
+    generation: i64,
+    state: &AppState,
+) -> Result<Arc<LiveView>, String> {
+    let rt = runtime(state);
+    let revision = rt.membership_revision.load(Ordering::SeqCst);
+    let mut memo = rt.live.lock().map_err(|e| e.to_string())?;
+    if let Some(view) = memo
+        .as_ref()
+        .filter(|v| v.generation == generation && v.revision == revision)
+    {
+        return Ok(view.clone());
+    }
+    let sensitivity: String = conn
+        .query_row(
+            "SELECT sensitivity FROM generations WHERE generation=?1",
+            [generation],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let threshold = match sensitivity.as_str() {
+        "strict" => index::Threshold::Strict,
+        "loose" => index::Threshold::Loose,
+        _ => index::Threshold::Standard,
+    };
+    let mut next_id: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(group_no),0)+1 FROM groups WHERE generation=?1",
+            [generation],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut view = LiveView {
+        generation,
+        revision,
+        groups: BTreeMap::new(),
+        exact: 0,
+        near: 0,
+        unique: 0,
+    };
+    let mut unique = HashSet::new();
+    let mut source = None;
+    let mut members = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT g.group_no,g.kind,g.reference_pk,m.member_no,m.image_pk,m.public_hash,i.id,CASE WHEN f.signature=m.signature THEN f.sha END FROM groups g CROSS JOIN members m ON m.generation=g.generation AND m.group_no=g.group_no CROSS JOIN live.images i ON i.image_pk=m.image_pk LEFT JOIN fingerprints f ON f.image_pk=m.image_pk WHERE g.generation=?1 AND COALESCE(i.trashed,0)=0 AND COALESCE(i.source,'')<>'reference' ORDER BY g.group_no,m.member_no"
+    ).map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([generation]).map_err(|e| e.to_string())?;
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let current = (
+            row.get::<_, i64>(0).map_err(|e| e.to_string())?,
+            row.get::<_, i64>(1).map_err(|e| e.to_string())?,
+            row.get::<_, i64>(2).map_err(|e| e.to_string())?,
+        );
+        if source != Some(current) {
+            if let Some((group, kind, reference)) = source {
+                live_source_group(
+                    conn,
+                    &mut view,
+                    group,
+                    kind,
+                    reference,
+                    &members,
+                    threshold,
+                    &mut next_id,
+                    &mut unique,
+                )?;
+            }
+            members.clear();
+            source = Some(current);
+        }
+        let public: Vec<u8> = row.get(5).map_err(|e| e.to_string())?;
+        let id: String = row.get(6).map_err(|e| e.to_string())?;
+        if hash(id.as_bytes()).as_slice() != public.as_slice() {
+            mark_stale(state);
+            continue;
+        }
+        members.push(LiveSourceMember {
+            number: row.get(3).map_err(|e| e.to_string())?,
+            pk: row.get(4).map_err(|e| e.to_string())?,
+            sha: row
+                .get::<_, Option<Vec<u8>>>(7)
+                .map_err(|e| e.to_string())?
+                .map(fixed)
+                .transpose()
+                .map_err(|e| e.to_string())?,
+        });
+    }
+    if let Some((group, kind, reference)) = source {
+        live_source_group(
+            conn,
+            &mut view,
+            group,
+            kind,
+            reference,
+            &members,
+            threshold,
+            &mut next_id,
+            &mut unique,
+        )?;
+    }
+    view.unique = unique.len() as i64;
+    let view = Arc::new(view);
+    *memo = Some(view.clone());
+    Ok(view)
+}
+
+/// Soft recycle, restore and confirmed deletion only change which published
+/// members remain active. They do not require a new scan and must not erase
+/// an existing dirty flag caused by added or externally changed source files.
+pub fn membership_invalidated(state: &AppState) {
+    let rt = runtime(state);
+    rt.membership_revision.fetch_add(1, Ordering::SeqCst);
+    rt.revision.fetch_add(1, Ordering::SeqCst);
+}
+pub(super) fn membership_token(state: &AppState) -> String {
+    static BOOT: OnceLock<i64> = OnceLock::new();
+    format!(
+        "{}:{}",
+        BOOT.get_or_init(now),
+        runtime(state).membership_revision.load(Ordering::SeqCst)
+    )
 }
 fn put_batch(
     conn: &mut Connection,
@@ -572,7 +1210,7 @@ fn checkpoint_foreground(
     }
     Ok(())
 }
-fn delete_unpublished(
+pub(super) fn delete_unpublished(
     conn: &mut Connection,
     checkpoint: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
@@ -600,8 +1238,6 @@ fn delete_unpublished(
             loop {
                 checkpoint()?;
                 let changed=conn.execute("DELETE FROM members WHERE (generation,group_no,member_no) IN (SELECT generation,group_no,member_no FROM members WHERE generation=?1 LIMIT 5000)",[generation]).map_err(|e|format!("清理旧查重缓存失败（可能达到预算或磁盘已满）：{e}"))?;
-                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-                    .map_err(|e| e.to_string())?;
                 if changed == 0 {
                     break;
                 }
@@ -614,7 +1250,7 @@ fn delete_unpublished(
             last = generation;
         }
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+    conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -632,6 +1268,11 @@ pub fn run_job(
     if options.force_recompute && options.regroup_only {
         return Err("强制重新计算不能与仅重新分组同时使用".into());
     }
+    let refined = match options.verification_mode.as_str() {
+        "" | "candidate" | "prepareEvidence" => false,
+        "verified" => true,
+        _ => return Err("近似复核模式无效".into()),
+    };
     let threshold = match options.sensitivity.as_str() {
         "strict" => index::Threshold::Strict,
         "standard" => index::Threshold::Standard,
@@ -658,6 +1299,7 @@ pub fn run_job(
             |r| r.get(0),
         )
         .map_err(|e| e.to_string())?;
+    configure_capacity(&conn, &cache_path(state), coverage.total as u64)?;
     let mut errors = Vec::new();
     attempt(&conn, "running", &coverage, &errors)?;
     set_meta(&conn, "dirty", "1")?;
@@ -854,6 +1496,13 @@ pub fn run_job(
         }
         put_batch(&mut conn, &mut rows_to_commit, run)?;
         check_disk(&cache_path(state))?;
+        if options.verification_mode == "prepareEvidence" {
+            // The replacement job owns discovery. Do not build/store the legacy
+            // coarse graph just to throw it away again in the next phase.
+            conn.execute("INSERT INTO generations(generation,sensitivity,checked_at,state,coverage,errors) VALUES(?1,?2,?3,'building',?4,?5)",params![run,options.sensitivity,now(),serde_json::to_string(&coverage).unwrap(),serde_json::to_string(&errors).unwrap()]).map_err(|e|e.to_string())?;
+            generation_started = true;
+            return Ok(());
+        }
         // Only numeric fingerprints enter the index; paths are fetched per result page.
         let count: usize = conn
             .query_row(
@@ -864,9 +1513,10 @@ pub fn run_job(
             .map_err(|e| e.to_string())?;
         let estimate = index::estimate_memory_bytes(count).saturating_add(24 * 1024 * 1024);
         budget(
-            cache_bytes(&cache_path(state))?,
+            effective_cache_bytes(&cache_path(state))?,
             free_bytes(cache_path(state).parent().unwrap())?,
             estimate,
+            disk_allowance(&cache_path(state)),
         )?;
         records
             .try_reserve_exact(count)
@@ -892,11 +1542,55 @@ pub fn run_job(
         }
         conn.execute("INSERT INTO generations(generation,sensitivity,checked_at,state,coverage,errors) VALUES(?1,?2,?3,'building',?4,?5)",params![run,options.sensitivity,now(),serde_json::to_string(&coverage).unwrap(),serde_json::to_string(&errors).unwrap()]).map_err(|e|e.to_string())?;
         generation_started = true;
+        set_meta(
+            &conn,
+            &format!("verification:{run}"),
+            if refined { "verified" } else { "candidate" },
+        )?;
+        set_meta(
+            &conn,
+            &format!("verifier:{run}"),
+            super::verification::ALGORITHM_VERSION,
+        )?;
+        let verifier = std::cell::RefCell::new(super::verification_cache::Verifier::new(
+            state,
+            options.force_recompute,
+        )?);
         emit("整理重复分组", &coverage);
         // The index and its output callback invoke checkpoints sequentially.
         // RefCell shares the same cancellation/pause hook without retaining
         // two simultaneous mutable borrows of the callback.
         let control = std::cell::RefCell::new(&mut *checkpoint);
+        let reporting = std::cell::RefCell::new(&mut emit);
+        let verification_progress = std::cell::RefCell::new(coverage.clone());
+        let mut accept_pair =
+            |a: usize, b: usize, kind: index::DuplicateKind| -> Result<bool, String> {
+                if kind == index::DuplicateKind::Near && !refined {
+                    return Ok(true);
+                }
+                checkpoint_foreground(state, &mut **control.borrow_mut())?;
+                let mut verifier = verifier.borrow_mut();
+                let result = verifier.check(
+                    records[a].image_pk,
+                    records[b].image_pk,
+                    kind == index::DuplicateKind::Exact,
+                    state,
+                    &mut **control.borrow_mut(),
+                )?;
+                let mut cov = verification_progress.borrow_mut();
+                cov.verified_pairs = verifier.accepted;
+                cov.content_variants = verifier.variants;
+                cov.uncertain_pairs = verifier.uncertain;
+                reporting.borrow_mut()(
+                    if kind == index::DuplicateKind::Exact {
+                        "逐字节确认完全相同图片"
+                    } else {
+                        "复核候选图片的局部内容"
+                    },
+                    &cov,
+                );
+                Ok(result.is_equivalent())
+            };
         let mut on_group = |group: index::DuplicateGroup| -> Result<(), String> {
             let kind = match group.kind {
                 index::DuplicateKind::Exact => 0,
@@ -912,9 +1606,10 @@ pub fn run_job(
                     .saturating_add(64 * 1024);
                 let free = free_bytes(cache_path(state).parent().unwrap())?;
                 budget(
-                    cache_bytes(&cache_path(state))?.saturating_add(growth),
+                    effective_cache_bytes(&cache_path(state))?.saturating_add(growth),
                     free.saturating_sub(growth),
                     0,
+                    disk_allowance(&cache_path(state)),
                 )?;
                 let tx = conn.transaction().map_err(|e| e.to_string())?;
                 if chunk_index == 0 {
@@ -953,12 +1648,33 @@ pub fn run_job(
                 }
                 conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                     .map_err(|e| e.to_string())?;
-                emit("整理重复分组", &coverage);
+                reporting.borrow_mut()("保存检索分组", &verification_progress.borrow());
             }
             Ok(())
         };
         let mut yielding = || checkpoint_foreground(state, &mut **control.borrow_mut());
-        match index::build_groups_each(&records, threshold, &mut yielding, &mut on_group) {
+        let grouping = index::build_groups_filtered(
+            &records,
+            threshold,
+            &mut yielding,
+            &mut accept_pair,
+            &mut on_group,
+        );
+        drop(on_group);
+        drop(reporting);
+        coverage.verified_pairs = verifier.borrow().accepted;
+        coverage.content_variants = verifier.borrow().variants;
+        coverage.uncertain_pairs = verifier.borrow().uncertain;
+        if coverage.uncertain_pairs > 0 {
+            add_error(
+                &mut errors,
+                format!(
+                    "{} 对图片无法完成逐字节或细节复核，已保留；本次结果不完整",
+                    coverage.uncertain_pairs
+                ),
+            );
+        }
+        match grouping {
             Ok(summary) => {
                 coverage.too_dense = summary.too_dense_references.len() as i64;
                 if coverage.too_dense > 0 {
@@ -998,6 +1714,7 @@ pub fn run_job(
     let complete = result.is_ok()
         && coverage.failed == 0
         && coverage.too_dense == 0
+        && coverage.uncertain_pairs == 0
         && !dirty
         && coverage.processed == coverage.total;
     let final_state = if cancelled {
@@ -1018,7 +1735,11 @@ pub fn run_job(
             .map_err(|e| e.to_string())?;
         conn.execute("UPDATE generations SET checked_at=?2,state=?3,coverage=?4,errors=?5,exact_groups=?6,near_groups=?7,unique_images=?8 WHERE generation=?1",params![run,now(),if complete {"ready"} else {"partial"},serde_json::to_string(&coverage).unwrap(),serde_json::to_string(&errors).unwrap(),exact,near,unique]).map_err(|e|e.to_string())?;
         // A partial run never replaces the last complete generation. First-run partials are labelled.
-        if complete || published.is_none() {
+        if options.verification_mode == "prepareEvidence" {
+            if complete {
+                set_meta(&conn, "prepared_index", &run.to_string())?;
+            }
+        } else if complete || published.is_none() {
             set_meta(&conn, "published", &run.to_string())?;
             set_meta(&conn, "dirty", if complete { "0" } else { "1" })?;
             if complete {
@@ -1041,7 +1762,7 @@ pub fn run_job(
     );
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .map_err(|e| e.to_string())?;
-    if complete {
+    if complete && options.verification_mode != "prepareEvidence" {
         let mut cleanup_checkpoint = || checkpoint_foreground(state, checkpoint);
         if let Err(error) = delete_unpublished(&mut conn, &mut cleanup_checkpoint) {
             // Publication is already complete and must survive a cancellation
@@ -1148,10 +1869,11 @@ fn image(db: &Connection, image_pk: i64) -> Result<Option<GalleryImage>, String>
         Ok(GalleryImage{id:r.get(0)?,path:r.get(1)?,thumbnail_path:r.get(2)?,file_name:r.get(3)?,ext:r.get(4)?,width:r.get(5)?,height:r.get(6)?,file_size:r.get(7)?,modified_at:r.get(8)?,imported_at:r.get(9)?,folder_id:r.get(10)?,missing:r.get::<_,i64>(11)?!=0,trashed:r.get::<_,i64>(12)?!=0,is_favorite:r.get::<_,i64>(13)?!=0,source:r.get(14)?})
     }).optional().map_err(|e|format!("无法核对查重图片：{e}"))
 }
-fn mark_stale(state: &AppState) {
+pub(crate) fn mark_stale(state: &AppState) {
     let rt = runtime(state);
-    let already = rt.invalidated.swap(true, Ordering::SeqCst);
     rt.revision.fetch_add(1, Ordering::SeqCst);
+    rt.membership_revision.fetch_add(1, Ordering::SeqCst);
+    let already = rt.invalidated.swap(true, Ordering::SeqCst);
     if !already {
         if let Ok(conn) = open_existing(state, true) {
             let _ = set_meta(&conn, "dirty", "1");
@@ -1164,7 +1886,6 @@ fn resolve(
     state: &AppState,
 ) -> Result<Option<DuplicateMember>, String> {
     let Some(mut image) = image(db, stored.image_pk)? else {
-        mark_stale(state);
         return Ok(None);
     };
     if hash(image.id.as_bytes()) != stored.public_hash {
@@ -1199,6 +1920,7 @@ fn resolve(
 }
 pub fn query_groups(query: DuplicateQuery, state: &AppState) -> Result<DuplicateGroupPage, String> {
     let conn = open_existing(state, false)?;
+    attach_live(&conn, state)?;
     conn.execute_batch("BEGIN DEFERRED;")
         .map_err(|e| e.to_string())?;
     let generation = published(&conn, &query.generation)?;
@@ -1210,29 +1932,30 @@ pub fn query_groups(query: DuplicateQuery, state: &AppState) -> Result<Duplicate
     };
     let limit = page_limit(query.limit, 20, 100);
     let (last_kind, last_group) = group_cursor(&query.cursor, &query.generation)?;
-    let total: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM groups WHERE generation=?1 AND (?2=-1 OR kind=?2)",
-            params![generation, kind],
-            |r| r.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    let mut stmt=conn.prepare("SELECT group_no,kind,reference_pk,total_members FROM groups WHERE generation=?1 AND (?2=-1 OR kind=?2) AND (kind>?3 OR (kind=?3 AND group_no>?4)) ORDER BY kind,group_no LIMIT ?5").map_err(|e|e.to_string())?;
-    let mut rows = stmt
-        .query_map(
-            params![generation, kind, last_kind, last_group, limit + 1],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            },
-        )
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
+    let view = live_view(&conn, generation, state)?;
+    let total = match kind {
+        0 => view.exact,
+        1 => view.near,
+        _ => view.exact + view.near,
+    };
+    let mut rows = Vec::new();
+    for local_kind in 0..=1 {
+        if kind != -1 && kind != local_kind {
+            continue;
+        }
+        for group in view.groups.values().filter(|g| g.kind == local_kind) {
+            if (group.kind, group.id) <= (last_kind, last_group) {
+                continue;
+            }
+            rows.push((group.id, group.kind));
+            if rows.len() > limit as usize {
+                break;
+            }
+        }
+        if rows.len() > limit as usize {
+            break;
+        }
+    }
     let has_more = rows.len() > limit as usize;
     rows.truncate(limit as usize);
     let next_cursor = if has_more {
@@ -1242,7 +1965,7 @@ pub fn query_groups(query: DuplicateQuery, state: &AppState) -> Result<Duplicate
         None
     };
     let mut groups = Vec::with_capacity(rows.len());
-    for (group, _, _, _) in rows {
+    for (group, _) in rows {
         if let Some(local) = query_group(
             DuplicateGroupQuery {
                 generation: query.generation.clone(),
@@ -1289,6 +2012,34 @@ fn live_members(
         .map_err(|e| e.to_string())?;
     Ok(result)
 }
+fn view_members(
+    conn: &Connection,
+    generation: i64,
+    group: &LiveGroup,
+    start: i64,
+    limit: i64,
+) -> Result<Vec<(i64, StoredMember)>, String> {
+    let Some(selected) = &group.members else {
+        return live_members(conn, generation, group.source_group, start, limit);
+    };
+    let mut result = Vec::new();
+    let mut stmt = conn
+        .prepare_cached(&format!(
+        "SELECT {MEMBER_COLUMNS} FROM members WHERE generation=?1 AND group_no=?2 AND member_no=?3"
+    ))
+        .map_err(|e| e.to_string())?;
+    for (number, _) in selected
+        .iter()
+        .filter(|(number, _)| *number >= start)
+        .take(limit as usize)
+    {
+        let member = stmt
+            .query_row(params![generation, group.source_group, number], member_row)
+            .map_err(|e| e.to_string())?;
+        result.push((*number, member));
+    }
+    Ok(result)
+}
 fn local_metric(
     conn: &Connection,
     reference: i64,
@@ -1317,24 +2068,15 @@ pub fn query_group(
     state: &AppState,
 ) -> Result<Option<DuplicateGroup>, String> {
     let conn = open_existing(state, false)?;
+    attach_live(&conn, state)?;
+    conn.execute_batch("BEGIN DEFERRED;")
+        .map_err(|e| e.to_string())?;
     let gen = published(&conn, &query.generation)?;
     let group = group_number(&query.group_id)?;
-    attach_live(&conn, state)?;
-    let info: Option<(i64, i64)> = conn
-        .query_row(
-            "SELECT kind,reference_pk FROM groups WHERE generation=?1 AND group_no=?2",
-            params![gen, group],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-    let Some((kind, original_ref)) = info else {
+    let view = live_view(&conn, gen, state)?;
+    let Some(active) = view.groups.get(&group) else {
         return Ok(None);
     };
-    let total:i64=conn.query_row("SELECT COUNT(*) FROM members m JOIN live.images i ON i.image_pk=m.image_pk WHERE m.generation=?1 AND m.group_no=?2 AND COALESCE(i.trashed,0)=0 AND COALESCE(i.source,'')<>'reference'",params![gen,group],|r|r.get(0)).map_err(|e|e.to_string())?;
-    if total < 2 {
-        return Ok(None);
-    }
     let db = library(state)?;
     let sensitivity: String = conn
         .query_row(
@@ -1348,35 +2090,15 @@ pub fn query_group(
         "loose" => index::Threshold::Loose,
         _ => index::Threshold::Standard,
     };
-    let mut rows = live_members(&conn, gen, group, 0, 7)?;
-    let reference_row=conn.query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE generation=?1 AND group_no=?2 AND image_pk=?3 LIMIT 1"),params![gen,group,original_ref],member_row).optional().map_err(|e|e.to_string())?;
-    let mut reference = match reference_row {
+    let mut rows = view_members(&conn, gen, active, 0, 7)?;
+    let reference_row=conn.query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE generation=?1 AND group_no=?2 AND image_pk=?3 LIMIT 1"),params![gen,active.source_group,active.reference],member_row).optional().map_err(|e|e.to_string())?;
+    let reference = match reference_row {
         Some(row) => resolve(row, &db, state)?,
         None => None,
     };
-    let changed = reference.is_none();
-    if reference.is_none() {
-        for (_, row) in &rows {
-            if let Some(member) = resolve(row.clone(), &db, state)? {
-                reference = Some(member);
-                break;
-            }
-        }
-    }
     let Some(reference) = reference else {
         return Ok(None);
     };
-    let reference_pk: i64 = db
-        .query_row(
-            "SELECT image_pk FROM images WHERE id=?1",
-            [&reference.image.id],
-            |r| r.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    let mut review = kind == 1 && changed;
-    if let Some(flag) = meta(&conn, &format!("review:{gen}:{group}"))? {
-        review |= flag == "1";
-    }
     let more = rows.len() > 6;
     rows.truncate(6);
     let next = if more {
@@ -1389,21 +2111,24 @@ pub fn query_group(
     for (_, stored) in rows {
         let pk = stored.image_pk;
         if let Some(mut member) = resolve(stored, &db, state)? {
-            if kind == 1 && review && pk != reference_pk {
-                member.metric =
-                    local_metric(&conn, reference_pk, pk, threshold)?.unwrap_or_default();
+            if active.kind == 1 && active.recalculate_metrics {
+                member.metric = if pk == active.reference {
+                    DuplicateMetric::default()
+                } else {
+                    local_metric(&conn, active.reference, pk, threshold)?.unwrap_or_default()
+                };
             }
             members.push(member);
         }
     }
     Ok(Some(DuplicateGroup {
         id: query.group_id,
-        kind: if kind == 0 { "exact" } else { "near" }.into(),
+        kind: if active.kind == 0 { "exact" } else { "near" }.into(),
         reference,
-        total_members: total,
+        total_members: active.total,
         members,
         next_cursor: next,
-        needs_review: review,
+        needs_review: false,
     }))
 }
 pub(crate) fn review_affected(
@@ -1489,40 +2214,16 @@ pub fn query_members(
     state: &AppState,
 ) -> Result<DuplicateMemberPage, String> {
     let conn = open_existing(state, false)?;
+    attach_live(&conn, state)?;
     conn.execute_batch("BEGIN DEFERRED;")
         .map_err(|e| e.to_string())?;
     let generation = published(&conn, &query.generation)?;
     let group = group_number(&query.group_id)?;
-    let original_reference: i64 = conn
-        .query_row(
-            "SELECT reference_pk FROM groups WHERE generation=?1 AND group_no=?2",
-            params![generation, group],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?
-        .ok_or("重复分组已失效，请刷新")?;
-    attach_live(&conn, state)?;
-    let total:i64=conn.query_row("SELECT COUNT(*) FROM members m JOIN live.images i ON i.image_pk=m.image_pk WHERE m.generation=?1 AND m.group_no=?2 AND COALESCE(i.trashed,0)=0 AND COALESCE(i.source,'')<>'reference'",params![generation,group],|r|r.get(0)).map_err(|e|e.to_string())?;
+    let view = live_view(&conn, generation, state)?;
+    let active = view.groups.get(&group).ok_or("重复分组已失效，请刷新")?;
     let start = member_cursor(&query.cursor, &query.generation, &query.group_id)?;
     let limit = page_limit(query.limit, 50, 200);
     let db = library(state)?;
-    let local = query_group(
-        DuplicateGroupQuery {
-            generation: query.generation.clone(),
-            group_id: query.group_id.clone(),
-        },
-        state,
-    )?;
-    let reference = local.as_ref().map(|g| g.reference.image.id.clone());
-    let reference_pk = match reference {
-        Some(id) => db
-            .query_row("SELECT image_pk FROM images WHERE id=?1", [id], |r| {
-                r.get::<_, i64>(0)
-            })
-            .map_err(|e| e.to_string())?,
-        None => original_reference,
-    };
     let sensitivity: String = conn
         .query_row(
             "SELECT sensitivity FROM generations WHERE generation=?1",
@@ -1535,7 +2236,7 @@ pub fn query_members(
         "loose" => index::Threshold::Loose,
         _ => index::Threshold::Standard,
     };
-    let mut rows = live_members(&conn, generation, group, start, limit + 1)?;
+    let mut rows = view_members(&conn, generation, active, start, limit + 1)?;
     let more = rows.len() > limit as usize;
     rows.truncate(limit as usize);
     let next = rows.last().map(|(n, _)| n + 1);
@@ -1543,14 +2244,11 @@ pub fn query_members(
     for (_, stored) in rows {
         let pk = stored.image_pk;
         if let Some(mut member) = resolve(stored, &db, state)? {
-            if local
-                .as_ref()
-                .is_some_and(|g| g.kind == "near" && g.needs_review)
-            {
-                member.metric = if pk == reference_pk {
+            if active.kind == 1 && active.recalculate_metrics {
+                member.metric = if pk == active.reference {
                     DuplicateMetric::default()
                 } else {
-                    local_metric(&conn, reference_pk, pk, threshold)?.unwrap_or_default()
+                    local_metric(&conn, active.reference, pk, threshold)?.unwrap_or_default()
                 };
             }
             members.push(member);
@@ -1565,11 +2263,18 @@ pub fn query_members(
         } else {
             None
         },
-        total_members: total,
+        total_members: active.total,
     })
 }
 
 #[cfg(test)]
+#[path = "cache_performance_tests.rs"]
+mod performance_tests;
+#[cfg(test)]
+#[path = "cache_storage_tests.rs"]
+mod storage_tests;
+
+#[cfg(test)]
 pub(super) fn check_budget_for_test(bytes: u64, free: u64, memory: u64) -> Result<(), String> {
-    budget(bytes, free, memory)
+    budget(bytes, free, memory, super::cache_capacity::BASE_BYTES)
 }

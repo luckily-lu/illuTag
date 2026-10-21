@@ -1,0 +1,518 @@
+use super::tests::Fixture;
+use super::*;
+use image::{
+    codecs::{
+        jpeg::JpegEncoder,
+        png::{CompressionType, FilterType as PngFilter, PngEncoder},
+    },
+    DynamicImage, ImageEncoder, Rgb, RgbImage,
+};
+use rusqlite::params;
+use std::{cell::RefCell, fs, fs::File};
+fn options() -> DuplicateOptions {
+    DuplicateOptions {
+        sensitivity: "standard".into(),
+        force_recompute: false,
+        regroup_only: false,
+        verification_mode: "cascade".into(),
+    }
+}
+fn scene() -> RgbImage {
+    RgbImage::from_fn(512, 384, |x, y| {
+        let wave = ((x as f64 / 35.).sin() * 15. + (y as f64 / 47.).cos() * 10.) as i32;
+        let c = if (x as i64 - 310).pow(2) + (y as i64 - 130).pow(2) < 4200 {
+            [190, 100, 85]
+        } else if x > 115 && x < 285 && y > 115 && y < 315 {
+            [70, 125, 170]
+        } else {
+            [125 + (x / 12) as i32, 150, 155 + (y / 16) as i32]
+        };
+        Rgb(c.map(|v| (v + wave).clamp(0, 255) as u8))
+    })
+}
+fn save(path: &std::path::Path, pixels: &RgbImage, compression: CompressionType) {
+    PngEncoder::new_with_quality(
+        File::create(path).unwrap(),
+        compression,
+        PngFilter::Adaptive,
+    )
+    .write_image(
+        pixels.as_raw(),
+        pixels.width(),
+        pixels.height(),
+        image::ExtendedColorType::Rgb8,
+    )
+    .unwrap();
+}
+fn run(f: &Fixture) -> DuplicateWorkflowStatus {
+    run_job(options(), &f.state, &mut || Ok(()), &mut |_, _| {}).unwrap();
+    workflow::status(&f.state).unwrap()
+}
+fn category<'a>(s: &'a DuplicateWorkflowStatus, kind: &str) -> &'a DuplicateCategory {
+    s.categories.iter().find(|x| x.kind == kind).unwrap()
+}
+fn trashed(f: &Fixture) -> Vec<i64> {
+    let c = cache::library(&f.state).unwrap();
+    let mut s = c
+        .prepare("SELECT image_pk FROM images WHERE trashed=1 ORDER BY image_pk")
+        .unwrap();
+    s.query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+fn examples() -> Fixture {
+    let f = Fixture::new(6);
+    let original = scene();
+    save(&f.paths[0], &original, CompressionType::Fast);
+    save(&f.paths[1], &original, CompressionType::Best);
+    JpegEncoder::new_with_quality(File::create(&f.paths[2]).unwrap(), 92)
+        .encode_image(&original)
+        .unwrap();
+    let small = image::imageops::resize(&original, 256, 192, image::imageops::FilterType::Triangle);
+    save(&f.paths[3], &small, CompressionType::Default);
+    let mut edited = original.clone();
+    for y in 123..135 {
+        for x in 303..315 {
+            edited.put_pixel(x, y, Rgb([0, 0, 0]));
+        }
+    }
+    save(&f.paths[4], &edited, CompressionType::Fast);
+    save(&f.paths[5], &edited, CompressionType::Best);
+    f
+}
+#[test]
+fn cascade_separates_pixel_identity_lossy_near_and_detail_variants() {
+    let f = examples();
+    let db = rusqlite::Connection::open(&f.state.database_path).unwrap();
+    db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA busy_timeout=40;")
+        .unwrap();
+    let failures = RefCell::new(Vec::new());
+    let mut stages = Vec::new();
+    run_job(options(),&f.state,&mut ||Ok(()),&mut |stage,_|{stages.push(stage.to_owned());if let Err(e)=db.execute("INSERT OR REPLACE INTO task_runs(id,kind,state,payload,updated_at) VALUES('cascade-progress','duplicates','running',?1,1)",[stage]){failures.borrow_mut().push(e.to_string());}}).unwrap();
+    assert!(
+        failures.borrow().is_empty(),
+        "real task writer must not self-block: {:?}",
+        failures.borrow()
+    );
+    let s = workflow::status(&f.state).unwrap();
+    assert_eq!(s.policy.as_deref(), Some(cascade_pixels::POLICY));
+    assert_eq!(
+        category(&s, "exact").cleanup_count,
+        2,
+        "different PNG encodings plus edited copy are exact pairs"
+    );
+    assert_eq!(
+        category(&s, "near").cleanup_count,
+        2,
+        "JPEG and scaled copy belong in separate near cleanup"
+    );
+    assert!(
+        category(&s, "similar").groups > 0,
+        "local changed detail remains browsable"
+    );
+    assert_eq!(s.cleanup_count, 4);
+    assert!(trashed(&f).is_empty());
+    assert!(stages.iter().any(|x| x.starts_with("第一轮")));
+    assert!(stages.iter().any(|x| x.starts_with("第二轮")));
+    assert!(stages.iter().any(|x| x.starts_with("第三轮")));
+    let rounds = s.rounds.unwrap();
+    assert_eq!(rounds.len(), 3);
+    assert!(rounds.iter().all(|r| r.state == "completed"));
+    assert_eq!(rounds[1].input_pairs, rounds[0].passed_pairs);
+    assert_eq!(rounds[2].input_pairs, rounds[1].passed_pairs);
+    assert_eq!(
+        rounds[1].input_pairs,
+        rounds[1].passed_pairs + rounds[1].filtered_pairs + rounds[1].uncertain_pairs
+    );
+}
+#[test]
+fn cascade_category_batches_never_silently_include_the_other_kind_and_can_undo() {
+    let f = examples();
+    let s = run(&f);
+    assert!(
+        workflow::prepare(
+            DuplicateWorkflowRequest {
+                generation: s.generation.clone().unwrap(),
+                revision: s.revision.clone()
+            },
+            &f.state
+        )
+        .is_err(),
+        "new workflow requires explicit category"
+    );
+    let exact = workflow::prepare_category(
+        DuplicateWorkflowRequest {
+            generation: s.generation.unwrap(),
+            revision: s.revision,
+        },
+        Some("exact"),
+        &f.state,
+    )
+    .unwrap();
+    assert_eq!(exact.target_count, 2);
+    assert!(exact.group_id.ends_with(":exact"));
+    management::run_operation(&exact.operation_id, &f.state, &mut || Ok(()), &mut |_| {}).unwrap();
+    let removed = trashed(&f);
+    assert_eq!(removed.len(), 2);
+    assert!(
+        !removed.contains(&3) && !removed.contains(&4),
+        "JPEG/scaled must remain after exact-only cleanup"
+    );
+    let s = workflow::status(&f.state).unwrap();
+    let near = workflow::prepare_category(
+        DuplicateWorkflowRequest {
+            generation: s.generation.unwrap(),
+            revision: s.revision,
+        },
+        Some("near"),
+        &f.state,
+    )
+    .unwrap();
+    assert_eq!(near.target_count, 2);
+    assert!(near.group_id.ends_with(":near"));
+    management::run_operation(&near.operation_id, &f.state, &mut || Ok(()), &mut |_| {}).unwrap();
+    assert_eq!(trashed(&f).len(), 4);
+    let undo = management::prepare_undo(&near.operation_id, &f.state).unwrap();
+    management::run_operation(&undo, &f.state, &mut || Ok(()), &mut |_| {}).unwrap();
+    assert_eq!(trashed(&f).len(), 2);
+    for path in &f.paths {
+        assert!(path.exists(), "app recycle never removes original files");
+    }
+}
+#[test]
+fn cascade_strict_keeps_alpha_and_low_bits_and_does_not_use_resized_equality() {
+    use image::{ImageBuffer, Rgba};
+    let a = ImageBuffer::from_pixel(512, 384, Rgba([10000_u16, 20000, 30000, 0]));
+    let mut b = a.clone();
+    b.put_pixel(100, 100, Rgba([10001, 20000, 30000, 0]));
+    let answer = cascade_pixels::compare(
+        DynamicImage::ImageRgba16(a.clone()),
+        DynamicImage::ImageRgba16(b),
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert!(!answer.strict);
+    assert_ne!(answer.kind, "exact");
+    let original = scene();
+    let small = image::imageops::resize(&original, 256, 192, image::imageops::FilterType::Triangle);
+    let answer = cascade_pixels::compare(original.into(), small.into(), &mut || Ok(())).unwrap();
+    assert_eq!(answer.kind, "near");
+    assert!(!answer.strict);
+    let answer = cascade_pixels::compare(
+        DynamicImage::ImageRgba16(a.clone()),
+        DynamicImage::ImageRgba16(a),
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert!(answer.strict);
+}
+#[test]
+fn cascade_cancelled_second_round_reuses_compatible_draft_and_never_publishes_partial() {
+    let f = examples();
+    let first = run(&f);
+    let old = first.generation.clone().unwrap();
+    let stop = std::cell::Cell::new(false);
+    let result = run_job(
+        options(),
+        &f.state,
+        &mut || {
+            if stop.get() {
+                Err("cancelled".into())
+            } else {
+                Ok(())
+            }
+        },
+        &mut |stage, _| {
+            if stage.starts_with("第二轮") {
+                stop.set(true)
+            }
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        workflow::status(&f.state).unwrap().generation.as_deref(),
+        Some(old.as_str())
+    );
+    let c = cache::open_existing(&f.state, false).unwrap();
+    let draft: i64 = c
+        .query_row("SELECT generation FROM discovery_checkpoint", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    drop(c);
+    let next = run(&f);
+    assert_eq!(next.generation, Some(draft.to_string()));
+    assert_eq!(next.cleanup_count, 4);
+}
+#[test]
+fn cascade_source_change_invalidates_cached_classification() {
+    let f = examples();
+    run(&f);
+    let mut v = super::verification_cache::Verifier::new(&f.state, false).unwrap();
+    let before = v.check_cascade(1, 3, &f.state, &mut || Ok(())).unwrap();
+    assert!(before.passed());
+    fs::write(&f.paths[2], b"broken changed source").unwrap();
+    let after = v.check_cascade(1, 3, &f.state, &mut || Ok(())).unwrap();
+    assert_eq!(after.kind, "uncertain");
+}
+
+#[test]
+fn cascade_storage_failure_keeps_the_second_round_draft_and_committed_verdicts() {
+    let f = examples();
+    f.run().unwrap();
+    let previous = cache::published_status(&f.state)
+        .unwrap()
+        .generation
+        .unwrap();
+    let stop = std::cell::Cell::new(false);
+    let error = run_job(
+        options(),
+        &f.state,
+        &mut || {
+            if stop.get() {
+                Err("database or disk is full".into())
+            } else {
+                Ok(())
+            }
+        },
+        &mut |stage, coverage| {
+            if stage == "第二轮：验证候选关系" && coverage.processed >= 3 {
+                stop.set(true);
+            }
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("第二轮") && error.contains("已提交"),
+        "{error}"
+    );
+    assert_eq!(
+        cache::published_status(&f.state)
+            .unwrap()
+            .generation
+            .as_deref(),
+        Some(previous.as_str())
+    );
+    let c = cache::open_existing(&f.state, false).unwrap();
+    let draft: i64 = c
+        .query_row("SELECT generation FROM discovery_checkpoint", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let proofs: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM cascade_pairs WHERE generation=?1 AND kind<>'pending'",
+            [draft],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(proofs > 0);
+    drop(c);
+    let completed = run(&f);
+    assert_eq!(completed.generation, Some(draft.to_string()));
+    assert_eq!(completed.cleanup_count, 4);
+}
+#[test]
+fn cascade_one_thousand_distinct_files_with_equal_fingerprints_store_a_linear_star() {
+    use std::io::Write;
+    let f = Fixture::new(1005);
+    for (n, path) in f.paths.iter().enumerate() {
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        write!(file, "nonpixel metadata {n}").unwrap();
+    }
+    let s = run(&f);
+    assert_eq!(category(&s, "exact").cleanup_count, 1004);
+    let c = cache::open_existing(&f.state, false).unwrap();
+    let count: i64 = c
+        .query_row("SELECT COUNT(*) FROM cascade_pairs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 1004,
+        "same fingerprint bucket must not expand into 504510 image pairs"
+    );
+}
+fn collision_fixture(tiny: bool) -> Fixture {
+    let f = Fixture::new(3);
+    let original = scene();
+    let mut other = original.clone();
+    if tiny {
+        let p = other.get_pixel_mut(200, 200);
+        p[0] = p[0].saturating_add(1);
+    } else {
+        for y in 120..132 {
+            for x in 300..312 {
+                other.put_pixel(x, y, Rgb([0, 0, 0]));
+            }
+        }
+    }
+    save(&f.paths[0], &original, CompressionType::Fast);
+    save(&f.paths[1], &other, CompressionType::Fast);
+    save(&f.paths[2], &other, CompressionType::Best);
+    f.run().unwrap();
+    let c = cache::open_existing(&f.state, true).unwrap();
+    // Deliberately simulate a full coarse-fingerprint collision in isolated data.
+    c.execute_batch("UPDATE fingerprints SET phash=(SELECT phash FROM fingerprints WHERE image_pk=1),dhash=(SELECT dhash FROM fingerprints WHERE image_pk=1),color=(SELECT color FROM fingerprints WHERE image_pk=1),low_info=0;").unwrap();
+    drop(c);
+    f
+}
+#[test]
+fn cascade_rejected_aliases_can_find_their_own_exact_copy() {
+    let f = collision_fixture(false);
+    let s = run(&f);
+    assert_eq!(category(&s, "exact").cleanup_count, 1);
+    assert!(category(&s, "similar").groups > 0);
+}
+#[test]
+fn cascade_third_round_finds_exact_pair_inside_a_tolerant_star() {
+    let f = collision_fixture(true);
+    let s = run(&f);
+    assert_eq!(category(&s, "exact").cleanup_count, 1);
+    let c = cache::open_existing(&f.state, false).unwrap();
+    let strict: bool = c
+        .query_row(
+            "SELECT strict FROM cascade_pairs WHERE a=2 AND b=3",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(strict);
+}
+#[test]
+fn cascade_compact_bucket_variant_still_finds_a_near_copy_in_another_feature() {
+    let f = Fixture::new(3);
+    let original = scene();
+    let mut variant = original.clone();
+    for y in 120..140 {
+        for x in 300..320 {
+            variant.put_pixel(x, y, Rgb([0, 0, 0]));
+        }
+    }
+    save(&f.paths[0], &original, CompressionType::Fast);
+    save(&f.paths[1], &variant, CompressionType::Fast);
+    save(
+        &f.paths[2],
+        &image::imageops::resize(&variant, 256, 192, image::imageops::FilterType::Triangle),
+        CompressionType::Best,
+    );
+    f.run().unwrap();
+    let c = cache::open_existing(&f.state, true).unwrap();
+    c.execute_batch("UPDATE fingerprints SET phash=(SELECT phash FROM fingerprints WHERE image_pk=1),dhash=(SELECT dhash FROM fingerprints WHERE image_pk=1),color=(SELECT color FROM fingerprints WHERE image_pk=1),low_info=0;").unwrap();
+    drop(c);
+    let s = run(&f);
+    assert_eq!(category(&s, "near").cleanup_count, 1);
+    assert!(category(&s, "similar").groups > 0);
+    let c = cache::open_existing(&f.state, false).unwrap();
+    let kind: String = c
+        .query_row(
+            "SELECT kind FROM cascade_pairs WHERE a=2 AND b=3",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind, "near");
+}
+#[test]
+fn cascade_naturally_verifies_both_low_resolution_copies_against_the_large_keeper() {
+    let f = Fixture::new(3);
+    let original = scene();
+    let small = image::imageops::resize(&original, 256, 192, image::imageops::FilterType::Triangle);
+    save(&f.paths[0], &original, CompressionType::Best);
+    save(&f.paths[1], &small, CompressionType::Fast);
+    save(&f.paths[2], &small, CompressionType::Best);
+    let s = run(&f);
+    assert_eq!(category(&s, "exact").cleanup_count, 1);
+    assert_eq!(category(&s, "near").cleanup_count, 2);
+    let c = cache::open_existing(&f.state, false).unwrap();
+    let count: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM cascade_pairs WHERE a=1 AND b IN (2,3) AND kind='near'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[test]
+fn cascade_distinct_full_features_with_equal_hashes_do_not_expand_a_clique() {
+    use std::io::Write;
+    let f = Fixture::new(1005);
+    for (n, path) in f.paths.iter().enumerate() {
+        write!(
+            fs::OpenOptions::new().append(true).open(path).unwrap(),
+            "nonpixel metadata {n}"
+        )
+        .unwrap();
+    }
+    f.run().unwrap();
+    let c = cache::open_existing(&f.state, true).unwrap();
+    for n in 0..1005_u32 {
+        let mut color = vec![128_u8; 48];
+        color[..4].copy_from_slice(&n.to_le_bytes());
+        c.execute(
+            "UPDATE fingerprints SET color=?2,low_info=0 WHERE image_pk=?1",
+            params![n + 1, color],
+        )
+        .unwrap();
+    }
+    drop(c);
+    let s = run(&f);
+    assert_eq!(category(&s, "exact").cleanup_count, 1004);
+    let c = cache::open_existing(&f.state, false).unwrap();
+    let pairs: i64 = c
+        .query_row("SELECT COUNT(*) FROM cascade_pairs", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        pairs <= 2008,
+        "different full features must still store compact numeric stars, got {pairs}"
+    );
+}
+
+#[test]
+fn cascade_numeric_cover_keeps_an_uncovered_leaf_connected_to_a_covered_bridge() {
+    use std::io::Write;
+    let f = Fixture::new(3);
+    for (n, path) in f.paths.iter().enumerate() {
+        write!(
+            fs::OpenOptions::new().append(true).open(path).unwrap(),
+            "metadata {n}"
+        )
+        .unwrap();
+    }
+    f.run().unwrap();
+    let c = cache::open_existing(&f.state, true).unwrap();
+    for (pk, hash) in [(1, 0_u64), (2, 255), (3, 65535)] {
+        c.execute(
+            "UPDATE fingerprints SET phash=?2,dhash=?3,low_info=0 WHERE image_pk=?1",
+            params![
+                pk,
+                hash.to_le_bytes().as_slice(),
+                0_u64.to_le_bytes().as_slice()
+            ],
+        )
+        .unwrap();
+    }
+    drop(c);
+    let s = run(&f);
+    assert_eq!(
+        category(&s, "exact").cleanup_count,
+        2,
+        "the third node must enter the candidate pool through its covered neighbor"
+    );
+}
+
+#[test]
+fn cascade_unsupported_or_unreadable_sources_never_become_detail_variants() {
+    let f = Fixture::new(2);
+    let gif = f.root.join("unsupported.gif");
+    DynamicImage::ImageRgb8(scene()).save(&gif).unwrap();
+    let answer = cascade_pixels::verify(&gif, &f.paths[0], &mut || Ok(())).unwrap();
+    assert_eq!(answer.kind, "uncertain");
+    assert!(!answer.passed());
+    fs::write(&f.paths[1], b"invalid image payload").unwrap();
+    let answer = cascade_pixels::verify(&f.paths[0], &f.paths[1], &mut || Ok(())).unwrap();
+    assert_eq!(answer.kind, "uncertain");
+    let stopped = cascade_pixels::verify(&f.paths[0], &f.paths[1], &mut || Err("cancelled".into()));
+    assert_eq!(stopped.unwrap_err(), "cancelled");
+}
