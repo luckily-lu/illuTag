@@ -90,6 +90,26 @@ export function useGallery() {
     revision.value = page.revision;
     loading.value = false;
   }
+  function bootstrapSnapshot() {
+    return {
+      generation: generation.peek(),
+      query: JSON.stringify(query.value),
+    };
+  }
+  /**
+   * Startup bootstrap always queries the default page. If the user already
+   * navigated or searched while it was pending, adopting it would show default
+   * rows behind a different filter. Navigation metadata is adopted separately.
+   */
+  function adoptBootstrap(
+    page: QueryPage,
+    snapshot: { generation: number; query: string },
+  ) {
+    if (snapshot.generation !== generation.peek()) return false;
+    if (snapshot.query !== JSON.stringify(query.value)) return false;
+    adopt(page);
+    return true;
+  }
   function removeImage(id: string, nextRevision: number) {
     generation.invalidate();
     const before = images.value.length;
@@ -139,6 +159,8 @@ export function useGallery() {
     patch,
     resetFilters,
     adopt,
+    bootstrapSnapshot,
+    adoptBootstrap,
     removeImage,
     restoreImage,
     hasMore: computed(() => images.value.length < total.value),

@@ -8,6 +8,9 @@ export class QueryGeneration {
   current(token: number) {
     return token === this.value;
   }
+  peek() {
+    return this.value;
+  }
   invalidate() {
     this.value++;
   }

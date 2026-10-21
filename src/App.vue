@@ -514,10 +514,12 @@ onMounted(async () => {
   window.addEventListener("pointerup", dragEnd);
   window.addEventListener("pointercancel", dragEnd);
   try {
+    const bootstrap = gallery.bootstrapSnapshot();
     const b = await api.bootstrap();
     folders.folders.value = b.userFolders;
     sources.value = b.folders;
-    gallery.adopt(b.page);
+    if (!gallery.adoptBootstrap(b.page, bootstrap))
+      console.info("[startup-prof] bootstrap page skipped: newer query");
   } catch (e) {
     error.value = errorMessage(e);
     await gallery.search();
