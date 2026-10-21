@@ -65,7 +65,7 @@ beforeEach(() => {
   vi.mocked(api.mutate).mockResolvedValue(result("b", true));
   vi.mocked(api.undoViewerTrash).mockResolvedValue(result("b", false, 2));
 });
-it("成功后继续下一张，撤销恢复原位置与当前图片", async () => {
+it("成功后继续下一张，撤销恢复原位置但不抢回当前图片", async () => {
   const s = setup();
   await s.removal.trash();
   expect(s.current.value?.id).toBe("c");
@@ -74,7 +74,42 @@ it("成功后继续下一张，撤销恢复原位置与当前图片", async () =
   await s.removal.restore();
   expect(api.undoViewerTrash).toHaveBeenCalledWith("b", 1);
   expect(s.rows.value.map((i) => i.id)).toEqual(["a", "b", "c"]);
-  expect(s.current.value?.id).toBe("b");
+  expect(s.current.value?.id).toBe("c");
+});
+it("撤销返回前关闭查看器，不会重新打开", async () => {
+  const s = setup();
+  await s.removal.trash();
+  let finish!: (v: ReturnType<typeof result>) => void;
+  vi.mocked(api.undoViewerTrash).mockImplementation(
+    () =>
+      new Promise((r) => {
+        finish = r;
+      }),
+  );
+  const pending = s.removal.restore();
+  s.current.value = null;
+  finish(result("b", false, 2));
+  await pending;
+  expect(s.current.value).toBeNull();
+  expect(s.rows.value.map((i) => i.id)).toEqual(["a", "b", "c"]);
+  expect(s.removal.undo.value).toBeNull();
+});
+it("撤销返回前切换到另一张，不会替换当前图片", async () => {
+  const s = setup();
+  await s.removal.trash();
+  let finish!: (v: ReturnType<typeof result>) => void;
+  vi.mocked(api.undoViewerTrash).mockImplementation(
+    () =>
+      new Promise((r) => {
+        finish = r;
+      }),
+  );
+  const pending = s.removal.restore();
+  s.current.value = image("other");
+  finish(result("b", false, 2));
+  await pending;
+  expect(s.current.value?.id).toBe("other");
+  expect(s.rows.value.map((i) => i.id)).toEqual(["a", "b", "c"]);
 });
 it("重复提交受抑制，失败不移除当前图片", async () => {
   const s = setup();

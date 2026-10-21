@@ -81,7 +81,10 @@ export function useViewerRemoval(
         throw new Error(result.failures[0]?.message || "还原失败");
       if (surface().key === entry.key) {
         surface().restore(image, entry.index, result.revision);
-        current.value = image;
+        // Restore the gallery row, but do not reopen a viewer the user closed
+        // or replace an image they have since navigated to. Only refresh the
+        // viewer when it is still showing the restored image.
+        if (current.value?.id === entry.image.id) current.value = image;
       }
       undo.value = null;
       changed();
