@@ -1869,6 +1869,10 @@ pub(super) fn flush_scanned_image_batch(
             committed_skips += 1;
         } else {
             upsert_image(&tx, folder_id, image)?;
+            // Auto tags describe the source bytes. Once the scan observed a
+            // changed signature they are stale; manual tags stay untouched and
+            // the image is picked up again by the pending tag queue below.
+            compact::delete_auto_tags_for_image_path(&tx, &image.path)?;
             committed_updates += 1;
         }
     }

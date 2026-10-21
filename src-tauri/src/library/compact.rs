@@ -85,6 +85,20 @@ pub(super) fn upsert_auto_tag(
     Ok(())
 }
 
+pub(super) fn delete_auto_tags_for_image_path(
+    conn: &Connection,
+    image_path: &str,
+) -> Result<(), String> {
+    // The scan stage only owns the path. A mapped import/migration may keep a
+    // legacy public id that no longer equals the path, so never match on id here.
+    conn.execute(
+        "DELETE FROM storage_auto_tags WHERE image_pk=(SELECT image_pk FROM images WHERE path=?1)",
+        [image_path],
+    )
+    .map_err(|error| format!("Failed to invalidate stale auto tags: {error}"))?;
+    Ok(())
+}
+
 pub(super) fn clip_model(conn: &Connection, id: &str, version: &str) -> Result<i64, String> {
     conn.prepare_cached(
         "INSERT INTO storage_clip_models(model_id,model_version) VALUES(?1,?2)

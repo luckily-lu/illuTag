@@ -184,6 +184,206 @@ fn tag_queue_keeps_stable_id_separate_from_real_path() {
 }
 
 #[test]
+fn changed_source_invalidates_auto_tags_and_requeues() {
+    let f = Fixture::new(1);
+    let path = f
+        .root
+        .join("image-000000.png")
+        .to_string_lossy()
+        .into_owned();
+    let conn = open_database(&f.state.database_path).unwrap();
+    compact::upsert_auto_tag(
+        &conn,
+        &path,
+        "general",
+        "cat",
+        None,
+        0.9,
+        WD_TAGGER_MODEL_NAME,
+        1,
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO storage_image_user_custom_tags(image_id,tag_text,created_at,updated_at) SELECT image_pk,'manual',0,0 FROM images WHERE path=?1",
+        [&path],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut conn = open_database(&f.state.database_path).unwrap();
+    let mut known_paths = HashSet::from([path.clone()]);
+    let mut new_ids = Vec::new();
+    let mut new_images = Vec::new();
+    let mut updated = 0;
+    let mut skipped = 0;
+    flush_scanned_image_batch(
+        &mut conn,
+        1,
+        &[ScannedImage {
+            path: path.clone(),
+            file_name: "image-000000.png".into(),
+            ext: "png".into(),
+            width: 640,
+            height: 480,
+            file_size: 200,
+            modified_at: 5,
+            imported_at: 0,
+            unchanged: false,
+        }],
+        &mut known_paths,
+        &mut new_ids,
+        &mut new_images,
+        &mut updated,
+        &mut skipped,
+    )
+    .unwrap();
+
+    assert_eq!(updated, 1);
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM storage_auto_tags", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "auto tags from the old source bytes must be invalidated"
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM storage_image_user_custom_tags", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "manual tags must survive"
+    );
+    let queue = collect_pending_tag_images(&conn).unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].id, path);
+    assert_eq!(queue[0].path, path);
+}
+
+#[test]
+fn changed_source_invalidates_auto_tags_for_mapped_id() {
+    let f = Fixture::new(1);
+    let path = f
+        .root
+        .join("image-000000.png")
+        .to_string_lossy()
+        .into_owned();
+    let conn = open_database(&f.state.database_path).unwrap();
+    conn.execute("UPDATE images SET id='legacy-id' WHERE path=?1", [&path])
+        .unwrap();
+    compact::upsert_auto_tag(
+        &conn,
+        "legacy-id",
+        "general",
+        "cat",
+        None,
+        0.9,
+        WD_TAGGER_MODEL_NAME,
+        1,
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut conn = open_database(&f.state.database_path).unwrap();
+    let mut known_paths = HashSet::from([path.clone()]);
+    let mut new_ids = Vec::new();
+    let mut new_images = Vec::new();
+    let mut updated = 0;
+    let mut skipped = 0;
+    flush_scanned_image_batch(
+        &mut conn,
+        1,
+        &[ScannedImage {
+            path: path.clone(),
+            file_name: "image-000000.png".into(),
+            ext: "png".into(),
+            width: 640,
+            height: 480,
+            file_size: 200,
+            modified_at: 5,
+            imported_at: 0,
+            unchanged: false,
+        }],
+        &mut known_paths,
+        &mut new_ids,
+        &mut new_images,
+        &mut updated,
+        &mut skipped,
+    )
+    .unwrap();
+
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM storage_auto_tags", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "invalidation must resolve the image by path, not by a stale public id"
+    );
+    let queue = collect_pending_tag_images(&conn).unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].id, "legacy-id");
+    assert_eq!(queue[0].path, path);
+}
+
+#[test]
+fn unchanged_scan_keeps_auto_tags() {
+    let f = Fixture::new(1);
+    let path = f
+        .root
+        .join("image-000000.png")
+        .to_string_lossy()
+        .into_owned();
+    let conn = open_database(&f.state.database_path).unwrap();
+    compact::upsert_auto_tag(
+        &conn,
+        &path,
+        "general",
+        "cat",
+        None,
+        0.9,
+        WD_TAGGER_MODEL_NAME,
+        1,
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut conn = open_database(&f.state.database_path).unwrap();
+    let mut known_paths = HashSet::from([path.clone()]);
+    let mut new_ids = Vec::new();
+    let mut new_images = Vec::new();
+    let mut updated = 0;
+    let mut skipped = 0;
+    flush_scanned_image_batch(
+        &mut conn,
+        1,
+        &[ScannedImage {
+            path: path.clone(),
+            file_name: "image-000000.png".into(),
+            ext: "png".into(),
+            width: 640,
+            height: 480,
+            file_size: 100,
+            modified_at: 0,
+            imported_at: 0,
+            unchanged: true,
+        }],
+        &mut known_paths,
+        &mut new_ids,
+        &mut new_images,
+        &mut updated,
+        &mut skipped,
+    )
+    .unwrap();
+
+    assert_eq!(skipped, 1);
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM storage_auto_tags", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn compact_tags_preserve_translation_and_distinct_image_statistics() {
     let f = Fixture::new(1);
     let conn = open_database(&f.state.database_path).unwrap();
