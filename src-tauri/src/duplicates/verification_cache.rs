@@ -266,7 +266,12 @@ impl PairCache {
             if slots == 0 {
                 return;
             }
-            self.slots = vec![EMPTY_SLOT; slots];
+            let mut allocated = Vec::new();
+            if allocated.try_reserve_exact(slots).is_err() {
+                return;
+            }
+            allocated.resize(slots, EMPTY_SLOT);
+            self.slots = allocated;
         }
         if (self.used + 1) * 100 > self.slots.len() * PAIR_CACHE_LOAD_PERCENT {
             self.clear_entries();
