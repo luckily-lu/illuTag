@@ -1,7 +1,7 @@
 //! One explicit queue for expensive work. Completed batches survive cancellation.
 use crate::library::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, sync::Mutex, thread, time::Duration};
+use std::{collections::VecDeque, sync::Mutex, thread, time::{Duration, Instant}};
 use tauri::{AppHandle, Emitter};
 use ts_rs::TS;
 
@@ -260,6 +260,83 @@ fn next_id() -> String {
     )
 }
 
+// A single claim/control boundary prevents cancelled work from starting. A
+// failed durable claim must not stop the dispatcher: keep retrying with a
+// bounded delay while the FIFO still has queued work, and publish the reason so
+// the waiting queue can show it. The wait is sliced so cancellation is noticed
+// quickly and the backoff never holds the job gate.
+fn claim_backoff(attempt: u32) -> Duration {
+    let step = 200u64.saturating_mul(1u64 << attempt.min(8));
+    Duration::from_millis(step.min(30_000))
+}
+
+fn wait_for_claim(state: &AppState, duration: Duration) {
+    let deadline = Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(200)));
+        if state
+            .jobs
+            .queue
+            .lock()
+            .map(|queue| queue.is_empty())
+            .unwrap_or(true)
+            || state.jobs.pending_id().is_some()
+        {
+            return;
+        }
+    }
+}
+
+fn claim_with_retry(
+    state: &AppState,
+    mut publish: impl FnMut(&JobRecord),
+    mut wait: impl FnMut(Duration),
+) -> Result<Option<JobRecord>, String> {
+    let mut attempt = 0u32;
+    loop {
+        let gate = state
+            .jobs
+            .gate
+            .lock()
+            .map_err(|_| "任务调度状态不可用".to_string())?;
+        let front = state
+            .jobs
+            .queue
+            .lock()
+            .map_err(|_| "任务调度状态不可用".to_string())?
+            .front()
+            .cloned();
+        let Some(front_id) = front else {
+            drop(gate);
+            return Ok(None);
+        };
+        match state.jobs.claim_locked(state, &mut publish) {
+            Ok(record) => {
+                drop(gate);
+                return Ok(record);
+            }
+            Err(error) => {
+                attempt = attempt.saturating_add(1);
+                let delay = claim_backoff(attempt);
+                if let Some(snapshot) =
+                    state
+                        .jobs
+                        .note_claim_failure(&front_id, &error, attempt, delay)
+                {
+                    publish(&snapshot);
+                }
+                drop(gate);
+                eprintln!("[jobs-dispatch] claim failed, retrying in {delay:?}: {error}");
+                wait(delay);
+            }
+        }
+    }
+}
+
 fn dispatch(state: AppState, app: AppHandle) {
     loop {
         if let Some(id) = state.jobs.pending_id() {
@@ -267,22 +344,25 @@ fn dispatch(state: AppState, app: AppHandle) {
                 return;
             }
         }
-        // A single claim/control boundary prevents cancelled work from starting.
-        let gate = state.jobs.gate.lock().unwrap();
-        let record = match state.jobs.claim_locked(&state, |r| {
-            let _ = app.emit("jobs:changed", r);
-        }) {
+        let record = match claim_with_retry(
+            &state,
+            |record| {
+                let _ = app.emit("jobs:changed", record);
+            },
+            |delay| wait_for_claim(&state, delay),
+        ) {
             Ok(Some(record)) => record,
-            result => {
-                if let Err(error) = result {
-                    eprintln!("[jobs-dispatch] {error}");
-                }
+            Ok(None) => {
+                *state.jobs.running.lock().unwrap() = false;
+                return;
+            }
+            Err(error) => {
+                eprintln!("[jobs-dispatch] {error}");
                 *state.jobs.running.lock().unwrap() = false;
                 return;
             }
         };
         let id = record.id.clone();
-        drop(gate);
         let stages: Vec<&str> = if record.request.kind == "pipeline" {
             if record.request.thumbnails {
                 vec!["scan", "thumbnails", "semantic", "tagging"]

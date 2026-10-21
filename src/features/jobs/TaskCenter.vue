@@ -71,6 +71,15 @@ function scope(j: JobRecord) {
   const source = props.sources?.find((f) => f.id === id);
   return source?.path ?? `来源 #${id}`;
 }
+function queueState(j: JobRecord) {
+  if (j.meta?.persistenceError) return "等待保存当前结果";
+  if (current.value?.state === "paused") return "等待当前任务继续";
+  const stage = j.stage?.trim();
+  return !stage || stage === "等待处理" ? "等待执行" : stage;
+}
+function queueWarning(j: JobRecord) {
+  return queueState(j).startsWith("队列领取失败");
+}
 function duration(j: JobRecord) {
   return durationLabel(j);
 }
@@ -321,13 +330,11 @@ onUnmounted(() => {
           <strong>{{ jobNames[job.request.kind] || job.request.kind }}</strong>
           <p class="task-scope" :title="scope(job)">{{ scope(job) }}</p>
         </div>
-        <span class="muted">{{
-          current?.meta?.persistenceError
-            ? "等待保存当前结果"
-            : current?.state === "paused"
-              ? "等待当前任务继续"
-              : "等待执行"
-        }}</span
+        <span
+          class="muted"
+          :class="{ 'task-warning': queueWarning(job) }"
+          role="status"
+          >{{ queueState(job) }}</span
         ><button
           class="text-button"
           :disabled="controlling?.has(job.id)"

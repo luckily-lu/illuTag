@@ -151,6 +151,29 @@ it("任务中心显示暂停确认与等待原因，按钮采用后端能力", a
   expect(wrapper.emitted("control")).toEqual([["job", "retrySave"]]);
   wrapper.unmount();
 });
+it("等待队列显示领取失败原因和重试次数，取消按钮仍可用", async () => {
+  const queued = {
+    ...job("queued"),
+    id: "retrying",
+    stage: "队列领取失败，正在重试（第 2 次，约 2 秒后）：database is locked",
+  };
+  const wrapper = mount(TaskCenter, {
+    props: { rows: [queued], error: "", thumbnails: true },
+  });
+  await flushPromises();
+  const queue = wrapper.get(".task-queue").text();
+  expect(queue).toContain("队列领取失败");
+  expect(queue).toContain("database is locked");
+  expect(queue).toContain("第 2 次");
+  expect(wrapper.find(".task-warning").exists()).toBe(true);
+  const cancel = wrapper
+    .findAll("button")
+    .find((button) => button.text() === "取消排队");
+  expect(cancel).toBeTruthy();
+  await cancel!.trigger("click");
+  expect(wrapper.emitted("control")).toEqual([["retrying", "cancel"]]);
+  wrapper.unmount();
+});
 it("历史读取期间到来的终态会补取一次，避免遗漏刚完成的任务", async () => {
   let finish!: (v: { rows: JobRecord[] }) => void;
   vi.mocked(api.jobHistory).mockImplementationOnce(

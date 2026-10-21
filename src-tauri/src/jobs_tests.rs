@@ -137,6 +137,103 @@ fn legacy_worker_pause_request_does_not_fabricate_acknowledgement() {
 }
 
 #[test]
+fn claim_retry_recovers_without_a_new_enqueue_and_keeps_fifo_order() {
+    let f = Fixture::new();
+    for id in ["first", "second"] {
+        f.add(row(id, "queued"));
+        f.state.jobs.queue.lock().unwrap().push_back(id.into());
+    }
+    let conn = database(&f.state).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_claim BEFORE INSERT ON task_runs
+         WHEN NEW.state='running'
+         BEGIN SELECT RAISE(ABORT,'synthetic claim failure'); END;",
+    )
+    .unwrap();
+    let published = Mutex::new(Vec::<JobRecord>::new());
+    let waits = std::cell::Cell::new(0u32);
+    let claimed = claim_with_retry(
+        &f.state,
+        |record| published.lock().unwrap().push(record.clone()),
+        |_| {
+            waits.set(waits.get() + 1);
+            if waits.get() == 1 {
+                conn.execute_batch("DROP TRIGGER reject_claim").unwrap();
+            }
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(claimed.id, "first");
+    assert_eq!(claimed.state, "running");
+    assert_eq!(waits.get(), 1, "the retry must happen without a new enqueue");
+    assert!(published
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|record| record.id == "first" && record.stage.contains("队列领取失败")));
+    assert_eq!(
+        *f.state.jobs.queue.lock().unwrap(),
+        VecDeque::from(["second".to_string()]),
+        "the failed first entry must be the only one claimed"
+    );
+    assert_eq!(f.state.jobs.find("second").unwrap().state, "queued");
+    let second = claim_with_retry(&f.state, |_| {}, |_| {}).unwrap().unwrap();
+    assert_eq!(second.id, "second");
+    assert_eq!(second.state, "running");
+    assert!(f.state.jobs.queue.lock().unwrap().is_empty());
+}
+
+#[test]
+fn claim_retry_can_be_cancelled_during_backoff() {
+    let f = Fixture::new();
+    f.add(row("waiting", "queued"));
+    f.state
+        .jobs
+        .queue
+        .lock()
+        .unwrap()
+        .push_back("waiting".into());
+    let conn = database(&f.state).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_claim BEFORE INSERT ON task_runs
+         WHEN NEW.state='running'
+         BEGIN SELECT RAISE(ABORT,'synthetic claim failure'); END;",
+    )
+    .unwrap();
+    let published = Mutex::new(Vec::<JobRecord>::new());
+    let result = claim_with_retry(
+        &f.state,
+        |record| published.lock().unwrap().push(record.clone()),
+        |_| {
+            let _gate = f.state.jobs.gate.lock().unwrap();
+            f.state
+                .jobs
+                .cancel_queued_locked("waiting", &f.state, |_| {})
+                .unwrap();
+        },
+    )
+    .unwrap();
+    assert!(result.is_none(), "cancelling the queue must stop the retry");
+    assert!(f.state.jobs.queue.lock().unwrap().is_empty());
+    assert_eq!(f.state.jobs.find("waiting").unwrap().state, "cancelled");
+    assert!(published
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|record| record.stage.contains("队列领取失败")));
+}
+
+#[test]
+fn claim_backoff_is_bounded_and_sliced_for_cancellation() {
+    assert_eq!(claim_backoff(1), Duration::from_millis(400));
+    assert!(claim_backoff(2) > claim_backoff(1));
+    assert_eq!(claim_backoff(20), Duration::from_secs(30));
+    let f = Fixture::new();
+    wait_for_claim(&f.state, Duration::from_millis(20));
+}
+
+#[test]
 fn queued_cancellation_removes_the_fifo_entry_and_frees_capacity() {
     let f = Fixture::new();
     for n in 0..10 {

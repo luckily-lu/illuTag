@@ -300,6 +300,30 @@ impl JobRuntime {
         Ok(())
     }
 
+    pub(super) fn note_claim_failure(
+        &self,
+        id: &str,
+        error: &str,
+        attempt: u32,
+        delay: std::time::Duration,
+    ) -> Option<JobRecord> {
+        let mut records = self.records.lock().ok()?;
+        let record = records.iter_mut().find(|record| record.id == id)?;
+        if record.state != "queued" {
+            return None;
+        }
+        let previous = record.clone();
+        let reason: String = error.chars().take(160).collect();
+        record.stage = format!(
+            "队列领取失败，正在重试（第 {attempt} 次，约 {} 秒后）：{reason}",
+            delay.as_secs().max(1)
+        );
+        advance(record, Some(&previous));
+        let snapshot = record.clone();
+        drop(records);
+        Some(snapshot)
+    }
+
     pub(super) fn claim_locked(
         &self,
         state: &AppState,
@@ -316,8 +340,15 @@ impl JobRuntime {
                 continue;
             }
             // A failed write keeps the pending entry available for cancellation
-            // or a later enqueue to restart dispatch.
-            self.commit_locked(&id, state, publish, |r| r.state = "running".into())?;
+            // or a later enqueue to restart dispatch. Bound the writer wait so a
+            // queued cancellation can obtain the gate promptly and retry.
+            self.commit_with_timeout_locked(
+                &id,
+                state,
+                publish,
+                |r| r.state = "running".into(),
+                Some(std::time::Duration::from_millis(250)),
+            )?;
             queue.pop_front();
             return self.find(&id).map(Some);
         }
