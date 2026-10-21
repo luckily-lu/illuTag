@@ -1849,7 +1849,6 @@ pub(super) fn flush_scanned_image_batch(
     batch: &[ScannedImage],
     known_paths: &mut HashSet<String>,
     new_image_ids: &mut Vec<String>,
-    newly_found_images: &mut Vec<ScannedImage>,
     updated_images: &mut i64,
     skipped_images: &mut i64,
 ) -> Result<(), String> {
@@ -1859,6 +1858,7 @@ pub(super) fn flush_scanned_image_batch(
     let tx = conn
         .transaction()
         .map_err(|error| format!("Failed to open scan upsert transaction: {error}"))?;
+    let pending_created_at = now_ms();
     let mut committed_new_paths = HashSet::new();
     let mut committed_new_images = Vec::new();
     let mut committed_updates = 0;
@@ -1868,6 +1868,14 @@ pub(super) fn flush_scanned_image_batch(
             !known_paths.contains(&image.path) && committed_new_paths.insert(image.path.clone());
         if is_new {
             upsert_image(&tx, folder_id, image)?;
+            // Same transaction as the image insert: a crash after this commit
+            // still leaves an exact per-image pending record for the next scan.
+            tx.execute(
+                "INSERT OR IGNORE INTO scan_pending_assignments(image_pk,created_at)
+                 SELECT image_pk,?2 FROM images WHERE path=?1",
+                params![image.path, pending_created_at],
+            )
+            .map_err(|error| format!("Failed to record pending folder assignment: {error}"))?;
             committed_new_images.push(image.clone());
         } else if image.unchanged {
             committed_skips += 1;
@@ -1891,7 +1899,6 @@ pub(super) fn flush_scanned_image_batch(
     // A failed transaction must not make a retry believe uncommitted paths exist.
     known_paths.extend(committed_new_paths);
     new_image_ids.extend(committed_new_images.iter().map(|image| image.path.clone()));
-    newly_found_images.extend(committed_new_images);
     *updated_images += committed_updates;
     *skipped_images += committed_skips;
     Ok(())

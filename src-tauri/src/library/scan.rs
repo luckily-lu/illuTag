@@ -164,6 +164,10 @@ pub(super) fn scan_all_folders_and_collect_new_images(
     }
     set_scan_progress_total_folders(progress, folders.len() as i64);
     write_app_meta_value(&conn, "library_scan_in_progress", "1")?;
+    // Finish initial directory ownership for images that were committed before
+    // an interrupted scan. The pending table is per image, so a user edit made
+    // in the meantime is not overwritten.
+    replay_pending_scan_assignments(&conn, scanned_at)?;
     for (_, folder_path) in &folders {
         yield_to_foreground(foreground, stop_requested);
         let folder_path = normalize_existing_or_stored_folder_path(folder_path);
@@ -195,7 +199,6 @@ pub(super) fn scan_all_folders_and_collect_new_images(
         let folder_id = upsert_folder(&conn, &folder_path, scanned_at)?;
         set_scan_progress_current_folder(progress, &folder_path);
         let mut found = Vec::<ScannedImage>::new();
-        let mut newly_found_images = Vec::<ScannedImage>::new();
         let mut pending_batch = Vec::<ScannedImage>::new();
         scan_images(
             Path::new(&folder_path),
@@ -214,7 +217,6 @@ pub(super) fn scan_all_folders_and_collect_new_images(
                         &pending_batch,
                         &mut known_paths,
                         &mut new_image_ids,
-                        &mut newly_found_images,
                         &mut updated_images,
                         &mut skipped_images,
                     )?;
@@ -242,27 +244,30 @@ pub(super) fn scan_all_folders_and_collect_new_images(
                 &pending_batch,
                 &mut known_paths,
                 &mut new_image_ids,
-                &mut newly_found_images,
                 &mut updated_images,
                 &mut skipped_images,
             )?;
         }
         set_scan_progress_scanned_files(progress, scanned_files);
         let found_count = found.len() as i64;
-        // 文件夹归属只需处理新增图片：路径未变的图片其所属目录与归属关系不可能变化，
-        // 跳过可避免全量 DELETE+INSERT 重写（原实现对每次扫描的全部图片逐条自动提交，是主要瓶颈）
-        sync_user_folder_tree_for_library_directory(
-            &conn,
-            &folder_path,
-            &newly_found_images,
-            scanned_at,
-        )?;
-        assign_scanned_images_to_nearest_synced_parent_folder(
-            &conn,
-            &folder_path,
-            &newly_found_images,
-            scanned_at,
-        )?;
+        // Initial ownership is tracked per image in scan_pending_assignments.
+        // Only still-pending images are synced; user edits remove the row.
+        let pending_images = load_pending_assignment_images(&conn, folder_id)?;
+        if !pending_images.is_empty() {
+            sync_user_folder_tree_for_library_directory(
+                &conn,
+                &folder_path,
+                &pending_images,
+                scanned_at,
+            )?;
+            assign_scanned_images_to_nearest_synced_parent_folder(
+                &conn,
+                &folder_path,
+                &pending_images,
+                scanned_at,
+            )?;
+            clear_pending_assignments(&conn, &pending_images)?;
+        }
         scanned_folders += 1;
         set_scan_progress_new_images(progress, new_image_ids.len() as i64);
         set_scan_progress_updated_images(progress, updated_images);
@@ -295,6 +300,100 @@ pub(super) fn scan_all_folders_and_collect_new_images(
     set_scan_progress_queued_images(progress, tag_queue_images.len() as i64);
 
     Ok(ScanCollectResult { tag_queue_images })
+}
+
+fn load_pending_assignment_images(
+    conn: &Connection,
+    folder_id: i64,
+) -> Result<Vec<(i64, String)>, String> {
+    conn.prepare(
+        "SELECT p.image_pk, i.path
+         FROM scan_pending_assignments p
+         JOIN images i ON i.image_pk = p.image_pk
+         WHERE i.folder_id = ?1 AND i.source = 'library'
+         ORDER BY p.image_pk",
+    )
+    .and_then(|mut stmt| {
+        stmt.query_map([folder_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+    })
+    .map_err(|error| format!("Failed to load pending folder assignments: {error}"))
+}
+
+fn clear_pending_assignments(
+    conn: &Connection,
+    images: &[(i64, String)],
+) -> Result<(), String> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("Failed to open pending assignment transaction: {error}"))?;
+    for (image_pk, _) in images {
+        // Keep the marker when no initial ownership row exists: a missing
+        // mapping must be retried, never silently certified as synced.
+        tx.execute(
+            "DELETE FROM scan_pending_assignments
+             WHERE image_pk=?1
+               AND EXISTS (
+                 SELECT 1 FROM storage_image_user_folders f
+                 JOIN user_folders u ON u.id=f.folder_id
+                 WHERE f.image_id=?1 AND u.source_kind=?2
+               )",
+            params![image_pk, USER_FOLDER_SOURCE_KIND_LIBRARY_DIR],
+        )
+        .map_err(|error| format!("Failed to clear pending folder assignment: {error}"))?;
+    }
+    tx.commit()
+        .map_err(|error| format!("Failed to commit pending assignment transaction: {error}"))
+}
+
+/// Replays only images that still have an unused initial-ownership record.
+/// A user folder edit removes that record, so this cannot overwrite a manual
+/// classification even when the edit happened after the scan chunk committed.
+pub(super) fn replay_pending_scan_assignments(conn: &Connection, now: i64) -> Result<(), String> {
+    let rows = conn
+        .prepare(
+            "SELECT p.image_pk, i.path, f.path
+             FROM scan_pending_assignments p
+             JOIN images i ON i.image_pk = p.image_pk
+             JOIN folders f ON f.id = i.folder_id
+             WHERE i.source = 'library'
+             ORDER BY f.path, p.image_pk",
+        )
+        .map_err(|error| format!("Failed to load pending folder assignments: {error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("Failed to load pending folder assignments: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Failed to load pending folder assignments: {error}"))?;
+
+    let mut index = 0usize;
+    while index < rows.len() {
+        let folder_path = rows[index].2.clone();
+        let mut images = Vec::<(i64, String)>::new();
+        while index < rows.len() && rows[index].2 == folder_path {
+            images.push((rows[index].0, rows[index].1.clone()));
+            index += 1;
+        }
+        if !Path::new(&folder_path).is_dir() {
+            return Err(format!(
+                "来源目录不可访问，保留了待补齐的目录归属：{folder_path}"
+            ));
+        }
+        sync_user_folder_tree_for_library_directory(conn, &folder_path, &images, now)?;
+        assign_scanned_images_to_nearest_synced_parent_folder(conn, &folder_path, &images, now)?;
+        clear_pending_assignments(conn, &images)?;
+    }
+    Ok(())
 }
 
 pub(super) fn tag_images_with_wd_model(

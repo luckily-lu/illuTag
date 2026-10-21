@@ -35,6 +35,19 @@ pub(super) fn open_database(database_path: &Path) -> Result<Connection, String> 
     } else if schema_version < SCHEMA_USER_VERSION {
         return Err("此图库需要离线存储升级，请先运行存储优化工具；原数据库未修改".into());
     }
+    if !readonly && schema_version == SCHEMA_USER_VERSION {
+        // Auxiliary table added without changing the schema version. Existing
+        // schema-3 libraries get it on the first writable open; readonly
+        // diagnostics must not attempt DDL.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS scan_pending_assignments (
+               image_pk INTEGER PRIMARY KEY,
+               created_at INTEGER NOT NULL,
+               FOREIGN KEY(image_pk) REFERENCES images(image_pk) ON DELETE CASCADE
+             );",
+        )
+        .map_err(|error| format!("Failed to ensure scan pending table: {error}"))?;
+    }
     Ok(conn)
 }
 

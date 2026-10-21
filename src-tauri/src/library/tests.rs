@@ -213,7 +213,6 @@ fn changed_source_invalidates_auto_tags_and_requeues() {
     let mut conn = open_database(&f.state.database_path).unwrap();
     let mut known_paths = HashSet::from([path.clone()]);
     let mut new_ids = Vec::new();
-    let mut new_images = Vec::new();
     let mut updated = 0;
     let mut skipped = 0;
     flush_scanned_image_batch(
@@ -232,7 +231,6 @@ fn changed_source_invalidates_auto_tags_and_requeues() {
         }],
         &mut known_paths,
         &mut new_ids,
-        &mut new_images,
         &mut updated,
         &mut skipped,
     )
@@ -286,7 +284,6 @@ fn changed_source_invalidates_auto_tags_for_mapped_id() {
     let mut conn = open_database(&f.state.database_path).unwrap();
     let mut known_paths = HashSet::from([path.clone()]);
     let mut new_ids = Vec::new();
-    let mut new_images = Vec::new();
     let mut updated = 0;
     let mut skipped = 0;
     flush_scanned_image_batch(
@@ -305,7 +302,6 @@ fn changed_source_invalidates_auto_tags_for_mapped_id() {
         }],
         &mut known_paths,
         &mut new_ids,
-        &mut new_images,
         &mut updated,
         &mut skipped,
     )
@@ -349,7 +345,6 @@ fn unchanged_scan_keeps_auto_tags() {
     let mut conn = open_database(&f.state.database_path).unwrap();
     let mut known_paths = HashSet::from([path.clone()]);
     let mut new_ids = Vec::new();
-    let mut new_images = Vec::new();
     let mut updated = 0;
     let mut skipped = 0;
     flush_scanned_image_batch(
@@ -368,7 +363,6 @@ fn unchanged_scan_keeps_auto_tags() {
         }],
         &mut known_paths,
         &mut new_ids,
-        &mut new_images,
         &mut updated,
         &mut skipped,
     )
@@ -380,6 +374,195 @@ fn unchanged_scan_keeps_auto_tags() {
             .get::<_, i64>(0))
             .unwrap(),
         1
+    );
+}
+
+fn pending_assignment_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM scan_pending_assignments", [], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+fn image_folder_rows(conn: &Connection, image_path: &str) -> Vec<(i64, String)> {
+    conn.prepare(
+        "SELECT u.id,u.source_kind FROM storage_image_user_folders f
+         JOIN images i ON i.image_pk=f.image_id
+         JOIN user_folders u ON u.id=f.folder_id
+         WHERE i.path=?1
+         ORDER BY u.id",
+    )
+    .unwrap()
+    .query_map([image_path], |r| Ok((r.get(0)?, r.get(1)?)))
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+#[test]
+fn pending_scan_assignment_is_replayed_per_image() {
+    let f = Fixture::new(1);
+    let id = f
+        .root
+        .join("image-000000.png")
+        .to_string_lossy()
+        .into_owned();
+    let conn = open_database(&f.state.database_path).unwrap();
+    conn.execute(
+        "INSERT INTO scan_pending_assignments(image_pk,created_at) SELECT image_pk,0 FROM images WHERE id=?1",
+        [&id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let conn = open_database(&f.state.database_path).unwrap();
+    replay_pending_scan_assignments(&conn, 10).unwrap();
+    assert_eq!(pending_assignment_count(&conn), 0);
+    assert_eq!(
+        image_folder_rows(&conn, &id),
+        vec![(1, "library_dir".to_string())]
+    );
+    // Idempotent replay: nothing pending, no duplicates.
+    replay_pending_scan_assignments(&conn, 11).unwrap();
+    assert_eq!(image_folder_rows(&conn, &id).len(), 1);
+}
+
+#[test]
+fn pending_scan_assignment_is_not_replayed_after_a_user_folder_edit() {
+    let f = Fixture::new(1);
+    let id = f
+        .root
+        .join("image-000000.png")
+        .to_string_lossy()
+        .into_owned();
+    let conn = open_database(&f.state.database_path).unwrap();
+    conn.execute("INSERT INTO user_folders(id,name,sort_order,created_at,updated_at) VALUES(7,'manual',0,0,0)", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO scan_pending_assignments(image_pk,created_at) SELECT image_pk,0 FROM images WHERE id=?1",
+        [&id],
+    )
+    .unwrap();
+    drop(conn);
+
+    mutate_images(
+        ImageMutation {
+            action: "move".into(),
+            image_ids: vec![id.clone()],
+            folder_id: Some(7),
+            favorite: None,
+            custom_tags: vec![],
+            supplement_tags: vec![],
+        },
+        &f.state,
+    )
+    .unwrap();
+    let conn = open_database(&f.state.database_path).unwrap();
+    assert_eq!(
+        pending_assignment_count(&conn),
+        0,
+        "a user classification edit must cancel the pending initial ownership"
+    );
+    replay_pending_scan_assignments(&conn, 10).unwrap();
+    assert_eq!(
+        image_folder_rows(&conn, &id),
+        vec![(7, "manual".to_string())],
+        "replay must not re-add the directory folder"
+    );
+}
+
+#[test]
+fn pending_scan_assignment_uses_image_pk_for_mapped_id() {
+    let f = Fixture::new(1);
+    let path = f
+        .root
+        .join("image-000000.png")
+        .to_string_lossy()
+        .into_owned();
+    let conn = open_database(&f.state.database_path).unwrap();
+    conn.execute("UPDATE images SET id='legacy-id' WHERE path=?1", [&path])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO scan_pending_assignments(image_pk,created_at) SELECT image_pk,0 FROM images WHERE path=?1",
+        [&path],
+    )
+    .unwrap();
+    drop(conn);
+
+    let conn = open_database(&f.state.database_path).unwrap();
+    replay_pending_scan_assignments(&conn, 10).unwrap();
+    assert_eq!(pending_assignment_count(&conn), 0);
+    let pk: i64 = conn
+        .query_row(
+            "SELECT image_pk FROM images WHERE path=?1",
+            [&path],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let assigned: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM storage_image_user_folders WHERE image_id=?1",
+            [pk],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(assigned, 1);
+}
+
+#[test]
+fn pending_scan_assignment_survives_a_failed_replay() {
+    let f = Fixture::new(1);
+    let id = f
+        .root
+        .join("image-000000.png")
+        .to_string_lossy()
+        .into_owned();
+    let conn = open_database(&f.state.database_path).unwrap();
+    conn.execute(
+        "INSERT INTO scan_pending_assignments(image_pk,created_at) SELECT image_pk,0 FROM images WHERE id=?1",
+        [&id],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_assignment BEFORE INSERT ON storage_image_user_folders
+         BEGIN SELECT RAISE(ABORT,'synthetic assignment failure'); END;",
+    )
+    .unwrap();
+    assert!(replay_pending_scan_assignments(&conn, 10).is_err());
+    assert_eq!(
+        pending_assignment_count(&conn),
+        1,
+        "the pending marker must not be cleared when assignment failed"
+    );
+    conn.execute_batch("DROP TRIGGER reject_assignment").unwrap();
+    replay_pending_scan_assignments(&conn, 11).unwrap();
+    assert_eq!(pending_assignment_count(&conn), 0);
+}
+
+#[test]
+fn normal_scan_clears_pending_assignment_after_folder_sync() {
+    let f = Fixture::new(0);
+    let image = f.root.join("new.png");
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+        .save(&image)
+        .unwrap();
+    let result = scan_all_folders_and_collect_new_images(
+        &f.state.database_path,
+        &f.state.foreground_queries,
+        &f.state.background_scan_progress,
+        &f.state.background_scan_pause_requested,
+        &f.state.background_scan_stop_requested,
+        false,
+        None,
+    )
+    .unwrap();
+    assert!(result.tag_queue_images.is_empty());
+    let conn = open_database(&f.state.database_path).unwrap();
+    assert_eq!(pending_assignment_count(&conn), 0);
+    let id = normalize_existing_or_stored_folder_path(&image.to_string_lossy());
+    assert_eq!(
+        image_folder_rows(&conn, &id),
+        vec![(1, "library_dir".to_string())]
     );
 }
 
@@ -1421,7 +1604,6 @@ fn sqlite_full_during_scan_batch_preserves_committed_images() {
     }];
     let mut known_paths = HashSet::new();
     let mut new_ids = Vec::new();
-    let mut new_images = Vec::new();
     let mut updated = 0;
     let mut skipped = 0;
     let error = flush_scanned_image_batch(
@@ -1430,7 +1612,6 @@ fn sqlite_full_during_scan_batch_preserves_committed_images() {
         &batch,
         &mut known_paths,
         &mut new_ids,
-        &mut new_images,
         &mut updated,
         &mut skipped,
     )
@@ -1439,7 +1620,6 @@ fn sqlite_full_during_scan_batch_preserves_committed_images() {
     assert!(conn.is_autocommit());
     assert!(known_paths.is_empty());
     assert!(new_ids.is_empty());
-    assert!(new_images.is_empty());
     assert_eq!((updated, skipped), (0, 0));
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM images", [], |row| row

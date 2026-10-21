@@ -302,10 +302,10 @@ pub fn remove_gallery_folder(folder_path: String, state: &AppState) -> Result<()
 pub(super) fn sync_user_folder_tree_for_library_directory(
     conn: &Connection,
     root_folder_path: &str,
-    scanned_images: &[ScannedImage],
+    images: &[(i64, String)],
     now: i64,
 ) -> Result<(), String> {
-    if scanned_images.is_empty() && !Path::new(root_folder_path).is_dir() {
+    if images.is_empty() && !Path::new(root_folder_path).is_dir() {
         return Ok(());
     }
 
@@ -317,8 +317,8 @@ pub(super) fn sync_user_folder_tree_for_library_directory(
     };
     let mut directory_paths = collect_directory_tree_paths(&root_path)?;
 
-    for image in scanned_images {
-        let image_parent = Path::new(&image.path)
+    for (_, path) in images {
+        let image_parent = Path::new(path)
             .parent()
             .map(|path| normalize_existing_or_stored_folder_path(&path.to_string_lossy()))
             .unwrap_or_else(|| root_path.clone());
@@ -362,22 +362,24 @@ pub(super) fn sync_user_folder_tree_for_library_directory(
         folder_id_by_path.insert(dir_path, folder_id);
     }
 
-    if !scanned_images.is_empty() {
-        for image in scanned_images {
-            remove_synced_folder_assignments_for_image(&tx, &image.path)?;
-            let parent_path = Path::new(&image.path)
+    if !images.is_empty() {
+        for (image_pk, path) in images {
+            let parent_path = Path::new(path)
                 .parent()
                 .map(|path| normalize_existing_or_stored_folder_path(&path.to_string_lossy()))
                 .unwrap_or_else(|| root_path.clone());
             let Some(target_folder_id) = folder_id_by_path.get(&parent_path).copied() else {
                 continue;
             };
+            // Initial ownership only ever adds the directory folder. It never
+            // deletes an existing row, so a user edit made after the scan commit
+            // is preserved even if this replay runs again.
             tx.execute(
                 "
                 INSERT OR IGNORE INTO storage_image_user_folders (image_id, folder_id, assigned_at)
-                VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3)
+                VALUES (?1, ?2, ?3)
                 ",
-                params![image.path, target_folder_id, now],
+                params![image_pk, target_folder_id, now],
             )
             .map_err(|error| format!("Failed to sync image folder assignment: {error}"))?;
         }
@@ -392,10 +394,10 @@ pub(super) fn sync_user_folder_tree_for_library_directory(
 pub(super) fn assign_scanned_images_to_nearest_synced_parent_folder(
     conn: &Connection,
     root_folder_path: &str,
-    scanned_images: &[ScannedImage],
+    images: &[(i64, String)],
     now: i64,
 ) -> Result<(), String> {
-    if scanned_images.is_empty() {
+    if images.is_empty() {
         return Ok(());
     }
 
@@ -435,10 +437,8 @@ pub(super) fn assign_scanned_images_to_nearest_synced_parent_folder(
         .unchecked_transaction()
         .map_err(|error| format!("Failed to open scan assignment transaction: {error}"))?;
 
-    for image in scanned_images {
-        remove_synced_folder_assignments_for_image(&tx, &image.path)?;
-
-        let mut current = Path::new(&image.path)
+    for (image_pk, path) in images {
+        let mut current = Path::new(path)
             .parent()
             .map(|path| normalize_existing_or_stored_folder_path(&path.to_string_lossy()))
             .unwrap_or_else(|| root_path.clone());
@@ -466,9 +466,9 @@ pub(super) fn assign_scanned_images_to_nearest_synced_parent_folder(
         tx.execute(
             "
             INSERT OR IGNORE INTO storage_image_user_folders (image_id, folder_id, assigned_at)
-            VALUES ((SELECT image_pk FROM images WHERE id=?1), ?2, ?3)
+            VALUES (?1, ?2, ?3)
             ",
-            params![image.path, folder_id, now],
+            params![image_pk, folder_id, now],
         )
         .map_err(|error| format!("Failed to sync scanned image folder assignment: {error}"))?;
     }
@@ -589,21 +589,17 @@ pub(super) fn upsert_synced_user_folder_for_path(
     .map_err(|error| format!("Failed to load synced user folder id: {error}"))
 }
 
-pub(super) fn remove_synced_folder_assignments_for_image(
+pub(super) fn clear_pending_scan_assignment(
     conn: &Connection,
     image_id: &str,
 ) -> Result<(), String> {
+    // A user classification edit owns the image from now on. Do not let a
+    // later scan replay re-add the initial directory folder.
     conn.execute(
-        "
-        DELETE FROM storage_image_user_folders
-        WHERE image_id = (SELECT image_pk FROM images WHERE id=?1)
-          AND folder_id IN (
-            SELECT id FROM user_folders WHERE source_kind = ?2
-          )
-        ",
-        params![image_id, USER_FOLDER_SOURCE_KIND_LIBRARY_DIR],
+        "DELETE FROM scan_pending_assignments WHERE image_pk=(SELECT image_pk FROM images WHERE id=?1)",
+        [image_id],
     )
-    .map_err(|error| format!("Failed to clear synced folder assignment: {error}"))?;
+    .map_err(|error| format!("Failed to clear pending folder assignment: {error}"))?;
     Ok(())
 }
 
@@ -1186,6 +1182,7 @@ pub fn assign_images_to_user_folder(
             params![image_id, folder_id, now],
         )
         .map_err(|error| format!("Failed to assign image to folder in batch: {error}"))?;
+        clear_pending_scan_assignment(&tx, image_id)?;
     }
     tx.commit()
         .map_err(|error| format!("Failed to commit batch assign transaction: {error}"))?;
@@ -1231,6 +1228,7 @@ pub fn move_images_to_user_folder(
             params![image_id, target_folder_id, now],
         )
         .map_err(|error| format!("Failed to assign image during batch move: {error}"))?;
+        clear_pending_scan_assignment(&tx, image_id)?;
     }
 
     if from_folder_id != target_folder_id {
@@ -1293,6 +1291,16 @@ pub fn remove_images_from_user_folder(
         }
         tx.execute(&sql, params_from_iter(params_values.iter()))
             .map_err(|error| format!("Failed to remove images from folder in batch: {error}"))?;
+        let sql = format!(
+            "DELETE FROM scan_pending_assignments
+             WHERE image_pk IN (SELECT image_pk FROM images WHERE id IN ({placeholders}))"
+        );
+        let mut params_values = Vec::<Value>::with_capacity(chunk.len());
+        for image_id in chunk {
+            params_values.push(Value::Text(image_id.clone()));
+        }
+        tx.execute(&sql, params_from_iter(params_values.iter()))
+            .map_err(|error| format!("Failed to clear pending folder assignment: {error}"))?;
         Ok(())
     })?;
     tx.commit()

@@ -118,6 +118,14 @@ CREATE TABLE images (
           FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE
         );
 
+-- Images whose insert transaction committed but whose initial directory
+-- ownership was not applied yet. Recovery is per image, never per directory.
+CREATE TABLE scan_pending_assignments (
+          image_pk INTEGER PRIMARY KEY,
+          created_at INTEGER NOT NULL,
+          FOREIGN KEY(image_pk) REFERENCES images(image_pk) ON DELETE CASCADE
+        );
+
 CREATE TABLE known_image_tags (
           model_name TEXT NOT NULL,
           tag_en TEXT NOT NULL,

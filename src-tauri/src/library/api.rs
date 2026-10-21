@@ -391,6 +391,18 @@ fn mutate_images_locked(
                 }
                 _ => return Err("不支持的图片操作".into()),
             }
+            if [
+                "assign",
+                "move",
+                "remove",
+                "assignFolder",
+                "moveFolder",
+                "removeFolder",
+            ]
+            .contains(&request.action.as_str())
+            {
+                super::gallery::clear_pending_scan_assignment(&tx, &image_id)?;
+            }
             tx.commit().map_err(|e| e.to_string())?;
             Ok(())
         })();
