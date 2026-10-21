@@ -701,7 +701,7 @@ pub fn run(
     })
 }
 #[cfg(test)]
-fn run_with(
+pub(super) fn run_with(
     operation: &str,
     state: &AppState,
     control: &mut dyn FnMut() -> Result<(), String>,

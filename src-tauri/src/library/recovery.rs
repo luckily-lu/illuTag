@@ -758,6 +758,70 @@ fn mark_duplicate_item_unavailable(
     Ok(())
 }
 
+fn recycle_signature(path: &Path) -> Result<String, String> {
+    let source = crate::duplicates::fingerprint::source_signature(path)?;
+    serde_json::to_string(&(source.file_size, source.modified_ns, source.identity))
+        .map_err(|error| error.to_string())
+}
+
+fn file_digest(path: &Path) -> Result<Vec<u8>, String> {
+    let mut file = fs::File::open(path).map_err(|error| format!("打开源文件失败：{error}"))?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 256 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("读取源文件失败：{error}"))?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(hash.finalize().to_vec())
+}
+
+fn same_file_content(left: &Path, right: &Path) -> Result<bool, String> {
+    Ok(file_digest(left)? == file_digest(right)?)
+}
+
+fn same_journal_path(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => {
+            if cfg!(windows) {
+                left.eq_ignore_ascii_case(right)
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn mark_recycle_item_unavailable(
+    conn: &Connection,
+    selection: &str,
+    pk: i64,
+    reason: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE items SET state='skipped',message=?3
+         WHERE selection=?1 AND pk=?2 AND state IN ('pending','failed')",
+        params![
+            selection,
+            pk,
+            format!("迁移后无法继续：{reason}")
+                .chars()
+                .take(500)
+                .collect::<String>()
+        ],
+    )
+    .map_err(|error| format!("标记未迁移回收项失败：{error}"))?;
+    Ok(())
+}
+
 fn migrate_recycle_journal(path: &Path, db: &Connection) -> Result<OperationLogMigration, String> {
     let mut conn = Connection::open(path).map_err(|error| format!("打开回收日志失败：{error}"))?;
     let mut report = OperationLogMigration {
@@ -770,7 +834,7 @@ fn migrate_recycle_journal(path: &Path, db: &Connection) -> Result<OperationLogM
         .map_err(|error| format!("打开回收日志事务失败：{error}"))?;
     let rows = tx
         .prepare(
-            "SELECT selection,pk,id,path,bytes,modified,state,signature FROM items ORDER BY selection,pk",
+            "SELECT selection,pk,id,path,bytes,modified,state,phase,signature FROM items ORDER BY selection,pk",
         )
         .map_err(|error| error.to_string())?
         .query_map([], |row| {
@@ -783,12 +847,24 @@ fn migrate_recycle_journal(path: &Path, db: &Connection) -> Result<OperationLogM
                 row.get::<_, i64>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
             ))
         })
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
-    for (selection, pk, old_id, _old_path, _old_bytes, _old_modified, state, old_signature) in rows {
+    for (
+        selection,
+        pk,
+        old_id,
+        old_path,
+        _old_bytes,
+        _old_modified,
+        state,
+        phase,
+        old_signature,
+    ) in rows
+    {
         report.rows_total += 1;
         let image = db
             .query_row(
@@ -821,26 +897,78 @@ fn migrate_recycle_journal(path: &Path, db: &Connection) -> Result<OperationLogM
             .map_err(|error| error.to_string())?;
             continue;
         };
-        let mut signature = old_signature;
+        let action: String = tx
+            .query_row(
+                "SELECT action FROM selections WHERE id=?1",
+                [&selection],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or_default();
+        let retryable = ["pending", "failed"].contains(&state.as_str()) && phase != "moved";
+        let mut signature = old_signature.clone();
         let mut unresolved_reason = None;
-        match crate::duplicates::fingerprint::source_signature(Path::new(&new_path)) {
-            Ok(source) => {
-                signature = serde_json::to_string(&(
-                    source.file_size,
-                    source.modified_ns,
-                    source.identity,
-                ))
-                .map_err(|error| error.to_string())?;
+
+        if action == "systemTrash" && retryable && !old_signature.is_empty() {
+            // A destructive retry may only reuse the old authorization. Never
+            // mint a new signature from whatever file currently occupies the
+            // path: a same-size/same-mtime replacement has a different identity.
+            if same_journal_path(&old_path, &new_path) {
+                match recycle_signature(Path::new(&new_path)) {
+                    Ok(current) if current == old_signature => {}
+                    Ok(_) => {
+                        unresolved_reason =
+                            Some("原路径文件已被替换或身份已变化，旧回收记录不能继续".to_string())
+                    }
+                    Err(error) => unresolved_reason = Some(format!("源文件不可用：{error}")),
+                }
+            } else {
+                let old_unchanged = recycle_signature(Path::new(&old_path))
+                    .map(|current| current == old_signature)
+                    .unwrap_or(false);
+                if !old_unchanged {
+                    unresolved_reason =
+                        Some("迁移前的源文件已变化，无法证明仍是原清理对象".to_string());
+                } else {
+                    match same_file_content(Path::new(&old_path), Path::new(&new_path)) {
+                        Ok(true) => match recycle_signature(Path::new(&new_path)) {
+                            Ok(current) => signature = current,
+                            Err(error) => {
+                                unresolved_reason = Some(format!("迁移后源文件不可用：{error}"))
+                            }
+                        },
+                        Ok(false) => {
+                            unresolved_reason =
+                                Some("迁移后的文件内容与原清理对象不一致".to_string())
+                        }
+                        Err(error) => unresolved_reason = Some(error),
+                    }
+                }
             }
-            Err(error) => unresolved_reason = Some(format!("源文件不可用：{error}")),
+        } else if action == "systemTrash" {
+            // An unsigned item was never authorized; first deletion will sign
+            // it. A moved item has no source path left. In both cases do not
+            // create a replacement signature here.
+            if old_signature.is_empty() && retryable {
+                if let Err(error) = recycle_signature(Path::new(&new_path)) {
+                    unresolved_reason = Some(format!("源文件不可用：{error}"));
+                }
+            }
+        } else if retryable {
+            // Restore records do not use the deletion signature. Preserve it
+            // and only report whether the new source path is reachable.
+            if let Err(error) = recycle_signature(Path::new(&new_path)) {
+                unresolved_reason = Some(format!("源文件不可用：{error}"));
+            }
         }
+
         tx.execute(
             "UPDATE items SET id=?3,path=?4,bytes=?5,modified=?6,signature=?7
              WHERE selection=?1 AND pk=?2",
             params![selection, pk, new_id, new_path, size, modified, signature],
         )
         .map_err(|error| error.to_string())?;
-        report.rows_migrated += 1;
         if let Some(reason) = unresolved_reason {
             report.unresolved.push(OperationLogIssue {
                 kind: "recycleItem".into(),
@@ -849,13 +977,11 @@ fn migrate_recycle_journal(path: &Path, db: &Connection) -> Result<OperationLogM
                 image_id: Some(new_id),
                 reason: reason.clone(),
             });
-            if state == "pending" {
-                tx.execute(
-                    "UPDATE items SET state='skipped',message=?3 WHERE selection=?1 AND pk=?2",
-                    params![selection, pk, format!("迁移后无法使用：{reason}")],
-                )
-                .map_err(|error| error.to_string())?;
+            if ["pending", "failed"].contains(&state.as_str()) {
+                mark_recycle_item_unavailable(&tx, &selection, pk, &reason)?;
             }
+        } else {
+            report.rows_migrated += 1;
         }
     }
     tx.commit().map_err(|error| error.to_string())?;

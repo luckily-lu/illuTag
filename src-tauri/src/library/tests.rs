@@ -617,6 +617,299 @@ fn migration_reports_an_unsupported_operation_journal() {
     assert!(reports.iter().all(|report| report.unresolved.is_empty()));
 }
 
+fn recycle_signature_text(path: &Path) -> String {
+    let source = crate::duplicates::fingerprint::source_signature(path).unwrap();
+    serde_json::to_string(&(source.file_size, source.modified_ns, source.identity)).unwrap()
+}
+
+fn register_recycle_file(f: &Fixture, pk: i64, path: &Path) {
+    let source = crate::duplicates::fingerprint::source_signature(path).unwrap();
+    let id = path.to_string_lossy().into_owned();
+    let conn = open_database(&f.state.database_path).unwrap();
+    conn.execute(
+        "UPDATE images SET id=?1,path=?1,file_size=?2,modified_at=?3,trashed=1 WHERE image_pk=?4",
+        params![
+            id,
+            source.file_size as i64,
+            source.modified_ns / 1_000_000,
+            pk
+        ],
+    )
+    .unwrap();
+}
+
+fn arm_recycle_selection(state: &AppState, selection: &str) {
+    let conn = Connection::open(state.data_dir.join("operations/recycle-management.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE selections SET action='systemTrash',state='queued' WHERE id=?1",
+        [selection],
+    )
+    .unwrap();
+}
+
+fn fail_once_with_fake_mover(f: &Fixture, selection: &str) {
+    let result = super::recycle::run_with(
+        selection,
+        &f.state,
+        &mut || Ok(()),
+        &mut |_| {},
+        &mut |_| Err("synthetic mover failure".into()),
+    );
+    assert!(result.is_ok(), "{result:?}");
+}
+
+#[test]
+fn migration_does_not_reauth_a_replaced_external_recycle_source() {
+    let f = Fixture::new(1);
+    let external = f.root.parent().unwrap().join(format!(
+        "recycle-external-{}-{}",
+        std::process::id(),
+        SERIAL.fetch_add(1, AtomicOrdering::SeqCst)
+    ));
+    fs::create_dir_all(&external).unwrap();
+    let external_file = external.join("pending.png");
+    fs::write(&external_file, b"original-file").unwrap();
+    register_recycle_file(&f, 1, &external_file);
+    let id = external_file.to_string_lossy().into_owned();
+    let selection = super::recycle::prepare(
+        super::recycle::RecycleSelectionRequest {
+            query: None,
+            image_ids: vec![id],
+            selection_id: None,
+            excluded_ids: vec![],
+        },
+        &f.state,
+    )
+    .unwrap();
+    arm_recycle_selection(&f.state, &selection.selection_id);
+    fail_once_with_fake_mover(&f, &selection.selection_id);
+
+    let old_metadata = fs::metadata(&external_file).unwrap();
+    let old_modified = old_metadata.modified().unwrap();
+    let before = recycle_signature_text(&external_file);
+    fs::remove_file(&external_file).unwrap();
+    fs::write(&external_file, b"replaced-data").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&external_file)
+        .unwrap()
+        .set_modified(old_modified)
+        .unwrap();
+    assert_eq!(fs::metadata(&external_file).unwrap().len(), old_metadata.len());
+    let after = recycle_signature_text(&external_file);
+    assert_ne!(before, after, "the replacement must have a different identity");
+
+    let destination = f.root.parent().unwrap().join(format!(
+        "recycle-external-migrated-{}-{}",
+        std::process::id(),
+        SERIAL.fetch_add(1, AtomicOrdering::SeqCst)
+    ));
+    fs::create_dir(&destination).unwrap();
+    let (_, _, reports) =
+        prepare_data_directory_migration(&destination, &f.state).unwrap();
+    let report = reports
+        .iter()
+        .find(|report| report.journal == "recycle-management.sqlite")
+        .expect("recycle report");
+    assert_eq!(report.status, "partial", "{report:?}");
+    assert!(
+        report.unresolved.iter().any(|issue| issue.kind == "recycleItem"),
+        "{report:?}"
+    );
+    let log = Connection::open(destination.join("operations/recycle-management.sqlite")).unwrap();
+    let (state, signature): (String, String) = log
+        .query_row(
+            "SELECT state,signature FROM items WHERE selection=?1 AND pk=1",
+            [&selection.selection_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "skipped");
+    assert_eq!(signature, before, "migration must preserve the old authorization");
+
+    let mut new_state = AppState::new(
+        destination.join("illutag.sqlite"),
+        destination.clone(),
+        None,
+        None,
+    );
+    new_state.read_only = false;
+    let mut moved = Vec::<PathBuf>::new();
+    super::recycle::run_with(
+        &selection.selection_id,
+        &new_state,
+        &mut || Ok(()),
+        &mut |_| {},
+        &mut |path| {
+            moved.push(path.to_path_buf());
+            Err("must not move a replaced file".into())
+        },
+    )
+    .unwrap();
+    assert!(moved.is_empty(), "{moved:?}");
+    assert!(external_file.is_file());
+    let _ = fs::remove_dir_all(&external);
+    let _ = fs::remove_dir_all(&destination);
+}
+
+#[test]
+fn migration_rebinds_an_unchanged_managed_recycle_source() {
+    let f = Fixture::new(1);
+    let clipboard = f.root.join("clipboard");
+    fs::create_dir_all(&clipboard).unwrap();
+    let old_file = clipboard.join("pending.png");
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([9, 8, 7, 255]))
+        .save(&old_file)
+        .unwrap();
+    register_recycle_file(&f, 1, &old_file);
+    let id = old_file.to_string_lossy().into_owned();
+    let selection = super::recycle::prepare(
+        super::recycle::RecycleSelectionRequest {
+            query: None,
+            image_ids: vec![id],
+            selection_id: None,
+            excluded_ids: vec![],
+        },
+        &f.state,
+    )
+    .unwrap();
+    arm_recycle_selection(&f.state, &selection.selection_id);
+    fail_once_with_fake_mover(&f, &selection.selection_id);
+
+    let destination = f.root.parent().unwrap().join(format!(
+        "recycle-managed-migrated-{}-{}",
+        std::process::id(),
+        SERIAL.fetch_add(1, AtomicOrdering::SeqCst)
+    ));
+    fs::create_dir(&destination).unwrap();
+    let (_, _, reports) =
+        prepare_data_directory_migration(&destination, &f.state).unwrap();
+    let report = reports
+        .iter()
+        .find(|report| report.journal == "recycle-management.sqlite")
+        .expect("recycle report");
+    assert_eq!(report.status, "migrated", "{report:?}");
+    assert!(report.unresolved.is_empty(), "{report:?}");
+
+    let mut new_state = AppState::new(
+        destination.join("illutag.sqlite"),
+        destination.clone(),
+        None,
+        None,
+    );
+    new_state.read_only = false;
+    let expected = destination.join("clipboard/pending.png");
+    let log = Connection::open(destination.join("operations/recycle-management.sqlite")).unwrap();
+    // A retry resets failed items to pending before the job runs (same as apply_request).
+    log.execute(
+        "UPDATE items SET state='pending',message='' WHERE selection=?1",
+        [&selection.selection_id],
+    )
+    .unwrap();
+    drop(log);
+    let mut moved = Vec::<PathBuf>::new();
+    super::recycle::run_with(
+        &selection.selection_id,
+        &new_state,
+        &mut || Ok(()),
+        &mut |_| {},
+        &mut |path| {
+            moved.push(path.to_path_buf());
+            Err("synthetic mover failure".into())
+        },
+    )
+    .unwrap();
+    let log = Connection::open(destination.join("operations/recycle-management.sqlite")).unwrap();
+    let (state, message): (String, String) = log
+        .query_row(
+            "SELECT state,message FROM items WHERE selection=?1 AND pk=1",
+            [&selection.selection_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        moved,
+        vec![expected.clone()],
+        "state={state} message={message}"
+    );
+    assert!(expected.is_file());
+    let _ = fs::remove_dir_all(&destination);
+}
+
+#[test]
+fn migration_does_not_reauth_a_replaced_managed_recycle_source() {
+    let f = Fixture::new(1);
+    let clipboard = f.root.join("clipboard");
+    fs::create_dir_all(&clipboard).unwrap();
+    let old_file = clipboard.join("pending.png");
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([9, 8, 7, 255]))
+        .save(&old_file)
+        .unwrap();
+    register_recycle_file(&f, 1, &old_file);
+    let id = old_file.to_string_lossy().into_owned();
+    let selection = super::recycle::prepare(
+        super::recycle::RecycleSelectionRequest {
+            query: None,
+            image_ids: vec![id],
+            selection_id: None,
+            excluded_ids: vec![],
+        },
+        &f.state,
+    )
+    .unwrap();
+    arm_recycle_selection(&f.state, &selection.selection_id);
+    fail_once_with_fake_mover(&f, &selection.selection_id);
+
+    let old_metadata = fs::metadata(&old_file).unwrap();
+    let old_modified = old_metadata.modified().unwrap();
+    let before = recycle_signature_text(&old_file);
+    fs::remove_file(&old_file).unwrap();
+    fs::write(&old_file, vec![0u8; old_metadata.len() as usize]).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&old_file)
+        .unwrap()
+        .set_modified(old_modified)
+        .unwrap();
+    assert_ne!(before, recycle_signature_text(&old_file));
+
+    let destination = f.root.parent().unwrap().join(format!(
+        "recycle-managed-replaced-migrated-{}-{}",
+        std::process::id(),
+        SERIAL.fetch_add(1, AtomicOrdering::SeqCst)
+    ));
+    fs::create_dir(&destination).unwrap();
+    let (_, _, reports) =
+        prepare_data_directory_migration(&destination, &f.state).unwrap();
+    let report = reports
+        .iter()
+        .find(|report| report.journal == "recycle-management.sqlite")
+        .expect("recycle report");
+    assert_eq!(report.status, "partial", "{report:?}");
+
+    let mut new_state = AppState::new(
+        destination.join("illutag.sqlite"),
+        destination.clone(),
+        None,
+        None,
+    );
+    new_state.read_only = false;
+    let mut moved = Vec::<PathBuf>::new();
+    super::recycle::run_with(
+        &selection.selection_id,
+        &new_state,
+        &mut || Ok(()),
+        &mut |_| {},
+        &mut |path| {
+            moved.push(path.to_path_buf());
+            Err("must not move a replaced file".into())
+        },
+    )
+    .unwrap();
+    assert!(moved.is_empty(), "{moved:?}");
+    let _ = fs::remove_dir_all(&destination);
+}
+
 #[test]
 fn migration_rebinds_recycle_journal_and_restores_inside_clipboard() {
     let f = Fixture::new(1);
