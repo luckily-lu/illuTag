@@ -354,7 +354,7 @@ fn byte_checks_use_the_bounded_batch_transaction_instead_of_per_pair_autocommit(
 
 #[test]
 #[ignore = "explicit synthetic cascade performance matrix; never reads production data"]
-fn benchmark_cascade_matrix() {
+fn benchmark_verifier_microbenchmark() {
     use std::time::Instant;
 
     let f = Fixture::new(45);
@@ -456,18 +456,263 @@ fn benchmark_cascade_matrix() {
 
     let result = serde_json::json!({
         "pid": std::process::id(),
+        "benchmark_kind": "direct Verifier microbenchmark",
+        "scope_note": "same process; no production outer cascade_pairs writes/checkpoints; not a full-workflow or cold-OS-cache measurement",
         "images": images.len(),
         "pairs": pairs.len(),
         "pair_cache_budget_bytes": super::verification_cache::pair_cache_budget(
             index::estimate_memory_bytes(45)
         ),
-        "cold": cold_stats,
-        "hot": hot_stats,
-        "dense_persisted": dense_stats,
-        "resume": resume_stats,
+        "cold_conclusion_cache": cold_stats,
+        "hot_conclusion_cache": hot_stats,
+        "new_verifier_reusing_persisted_cache": dense_stats,
+        "new_verifier_after_400_pair_flush": resume_stats,
         "peak_working_set_bytes": null,
     });
     let path = out.join(format!("cascade-{}.json", std::process::id()));
+    fs::write(&path, serde_json::to_string_pretty(&result).unwrap()).unwrap();
+    println!("BENCH_RESULT={}", path.display());
+}
+
+fn production_mixed_fixture(exact: usize, near: usize, distinct: usize) -> Fixture {
+    let total = exact + near + distinct;
+    let f = Fixture::new(total);
+    let width = 480u32;
+    let height = 360u32;
+    let base = RgbImage::from_fn(width, height, |x, y| {
+        Rgb([
+            ((x * 5 + y * 3) % 256) as u8,
+            ((x * 2 + y * 7) % 256) as u8,
+            ((x * 11 + y * 13) % 256) as u8,
+        ])
+    });
+    for index in 0..exact {
+        base.save(&f.paths[index]).unwrap();
+    }
+    for index in 0..near {
+        let mut variant = base.clone();
+        for y in 0..18 {
+            for x in 0..18 {
+                let px = x + (index as u32 % 20);
+                let py = y + 20;
+                if px < width && py < height {
+                    variant.put_pixel(px, py, Rgb([index as u8, 255 - index as u8, 90]));
+                }
+            }
+        }
+        variant.save(&f.paths[exact + index]).unwrap();
+    }
+    for index in 0..distinct {
+        RgbImage::from_fn(width, height, |x, y| {
+            let n = index as u32;
+            Rgb([
+                ((x * (7 + n) + y * 3 + n * 41) % 256) as u8,
+                ((x * 13 + y * (5 + n) + n * 17) % 256) as u8,
+                ((x * 3 + y * 19 + n * 73) % 256) as u8,
+            ])
+        })
+        .save(&f.paths[exact + near + index])
+        .unwrap();
+    }
+    let db = rusqlite::Connection::open(&f.state.database_path).unwrap();
+    for (index, path) in f.paths.iter().enumerate() {
+        let source = fingerprint::source_signature(path).unwrap();
+        db.execute(
+            "UPDATE images SET width=?2,height=?3,file_size=?4,modified_at=?5 WHERE image_pk=?1",
+            params![
+                index as i64 + 1,
+                width as i64,
+                height as i64,
+                source.file_size as i64,
+                source.modified_ns / 1_000_000
+            ],
+        )
+        .unwrap();
+    }
+    drop(db);
+    f
+}
+
+fn cascade_options(force: bool) -> DuplicateOptions {
+    DuplicateOptions {
+        sensitivity: "standard".into(),
+        force_recompute: force,
+        regroup_only: false,
+        verification_mode: "cascade".into(),
+    }
+}
+
+fn cascade_result_counts(f: &Fixture) -> serde_json::Value {
+    let status = cache::status(&f.state).unwrap();
+    let Some(generation) = status.generation else {
+        return serde_json::json!({});
+    };
+    let conn = cache::open_existing(&f.state, false).unwrap();
+    let mut counts = serde_json::Map::new();
+    let mut stmt = conn
+        .prepare("SELECT kind,COUNT(*) FROM cascade_pairs WHERE generation=?1 GROUP BY kind")
+        .unwrap();
+    for row in stmt
+        .query_map([&generation], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap()
+    {
+        let (kind, count) = row.unwrap();
+        counts.insert(kind, serde_json::json!(count));
+    }
+    let phase: i64 = conn
+        .query_row(
+            "SELECT phase FROM cascade_runs WHERE generation=?1",
+            [&generation],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    serde_json::json!({
+        "generation": generation,
+        "phase": phase,
+        "kinds": counts,
+        "unique_images": status.unique_images,
+    })
+}
+
+#[test]
+#[ignore = "explicit production cascade benchmark on synthetic images; never reads production data"]
+fn benchmark_production_cascade() {
+    use std::time::Instant;
+
+    let f = production_mixed_fixture(200, 12, 6);
+    let out = std::env::var_os("ILLUTAG_BENCH_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("illutag-bench"));
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("production.pid"), std::process::id().to_string()).unwrap();
+
+    super::cascade_pixels::reset_decode_count();
+    super::verification_cache::reset_batch_counters();
+    super::workflow::reset_cascade_bench_counters();
+    let started = Instant::now();
+    let mut stages = Vec::<String>::new();
+    let mut progress = |stage: &str, _: &DuplicateCoverage| {
+        if stages.last().map(String::as_str) != Some(stage) {
+            stages.push(stage.to_string());
+        }
+    };
+    let mut control = || Ok(());
+    super::workflow::run_job(
+        cascade_options(false),
+        &f.state,
+        &mut control,
+        &mut progress,
+    )
+    .unwrap();
+    let elapsed = started.elapsed().as_millis();
+    let (pair_checks, verdicts) = super::verification_cache::batch_counters();
+    let (outer_flushes, anchors, _) = super::workflow::cascade_bench_counters();
+    let result = serde_json::json!({
+        "pid": std::process::id(),
+        "fixture": {"exact": 200, "near": 12, "distinct": 6, "width": 480, "height": 360},
+        "elapsed_ms": elapsed,
+        "decodes": super::cascade_pixels::decode_count(),
+        "pair_check_transactions": pair_checks,
+        "verdict_transactions": verdicts,
+        "outer_cascade_pairs_transactions": outer_flushes,
+        "checkpoint_anchors": anchors,
+        "stages": stages,
+        "result": cascade_result_counts(&f),
+        "peak_working_set_bytes": null,
+    });
+    let path = out.join(format!("production-{}.json", std::process::id()));
+    fs::write(&path, serde_json::to_string_pretty(&result).unwrap()).unwrap();
+    println!("BENCH_RESULT={}", path.display());
+}
+
+#[test]
+#[ignore = "explicit production cascade interruption/resume benchmark; synthetic data only"]
+fn benchmark_production_cascade_resume() {
+    use std::time::Instant;
+
+    let f = production_mixed_fixture(20, 50, 4);
+    let out = std::env::var_os("ILLUTAG_BENCH_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("illutag-bench"));
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("production-resume.pid"), std::process::id().to_string()).unwrap();
+
+    let mut control = || Ok(());
+    let mut progress = |_: &str, _: &DuplicateCoverage| {};
+    super::workflow::run_job(
+        cascade_options(false),
+        &f.state,
+        &mut control,
+        &mut progress,
+    )
+    .unwrap();
+    let baseline = cascade_result_counts(&f);
+    let baseline_kinds = baseline["kinds"].clone();
+
+    super::workflow::reset_cascade_bench_counters();
+    let mut cancel_progress = |_: &str, _: &DuplicateCoverage| {};
+    let mut cancel_control = || {
+        if super::workflow::cascade_bench_counters().2 > 0 {
+            return Err("synthetic benchmark cancel after round-2 checkpoint".into());
+        }
+        Ok(())
+    };
+    let interrupted = super::workflow::run_job(
+        cascade_options(true),
+        &f.state,
+        &mut cancel_control,
+        &mut cancel_progress,
+    );
+    assert!(interrupted.is_err(), "the benchmark must interrupt the run");
+    let conn = cache::open_existing(&f.state, true).unwrap();
+    let checkpoints: i64 = conn
+        .query_row("SELECT COUNT(*) FROM cascade_round2", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        checkpoints > 0,
+        "cancellation must leave a production round-2 checkpoint"
+    );
+
+    super::cascade_pixels::reset_decode_count();
+    super::verification_cache::reset_batch_counters();
+    super::workflow::reset_cascade_bench_counters();
+    let started = Instant::now();
+    let mut resume_control = || Ok(());
+    let mut resume_progress = |_: &str, _: &DuplicateCoverage| {};
+    super::workflow::run_job(
+        cascade_options(false),
+        &f.state,
+        &mut resume_control,
+        &mut resume_progress,
+    )
+    .unwrap();
+    let resume_ms = started.elapsed().as_millis();
+    let resumed = cascade_result_counts(&f);
+    assert_eq!(
+        resumed["kinds"], baseline_kinds,
+        "resumed result must match one-shot result"
+    );
+    assert_eq!(resumed["phase"], 4);
+    let (pair_checks, verdicts) = super::verification_cache::batch_counters();
+    let (outer_flushes, anchors, _) = super::workflow::cascade_bench_counters();
+
+    let result = serde_json::json!({
+        "pid": std::process::id(),
+        "fixture": {"exact": 20, "near": 50, "distinct": 4, "width": 480, "height": 360},
+        "baseline": baseline,
+        "resumed": resumed,
+        "checkpoint_rows_after_cancel": checkpoints,
+        "resume_elapsed_ms": resume_ms,
+        "resume_decodes": super::cascade_pixels::decode_count(),
+        "resume_pair_check_transactions": pair_checks,
+        "resume_verdict_transactions": verdicts,
+        "resume_outer_transactions": outer_flushes,
+        "resume_checkpoint_anchors": anchors,
+        "peak_working_set_bytes": null,
+    });
+    let path = out.join(format!("production-resume-{}.json", std::process::id()));
     fs::write(&path, serde_json::to_string_pretty(&result).unwrap()).unwrap();
     println!("BENCH_RESULT={}", path.display());
 }

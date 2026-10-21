@@ -9,6 +9,29 @@ CREATE TABLE IF NOT EXISTS cascade_pairs(generation INTEGER NOT NULL,a INTEGER N
 CREATE INDEX IF NOT EXISTS cascade_pending ON cascade_pairs(generation,kind,a,b);";
 const ALIASES:&str="CREATE TABLE IF NOT EXISTS cascade_aliases(generation INTEGER NOT NULL,feature INTEGER NOT NULL,image_pk INTEGER NOT NULL,PRIMARY KEY(generation,feature,image_pk)) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS cascade_alias_image ON cascade_aliases(generation,image_pk,feature);";
 
+#[cfg(test)]
+thread_local! {
+    static BENCH_OUTER_FLUSHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static BENCH_ANCHORS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static BENCH_ROUND2_CHECKPOINTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_bench_counters() {
+    BENCH_OUTER_FLUSHES.with(|value| value.set(0));
+    BENCH_ANCHORS.with(|value| value.set(0));
+    BENCH_ROUND2_CHECKPOINTS.with(|value| value.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn bench_counters() -> (u64, u64, u64) {
+    (
+        BENCH_OUTER_FLUSHES.with(std::cell::Cell::get),
+        BENCH_ANCHORS.with(std::cell::Cell::get),
+        BENCH_ROUND2_CHECKPOINTS.with(std::cell::Cell::get),
+    )
+}
+
 fn condense(
     records: Vec<index::IndexRecord>,
     control: &mut dyn FnMut() -> Result<(), String>,
@@ -139,6 +162,8 @@ fn classify_pool(
                 ],
             )
         })?;
+        #[cfg(test)]
+        BENCH_ROUND2_CHECKPOINTS.with(|value| value.set(value.get() + 1));
         Ok(())
     };
     let flush_analyses = |control: &mut dyn FnMut() -> Result<(), String>| -> Result<(), String> {
@@ -177,6 +202,8 @@ fn classify_pool(
         }
         c.execute_batch("COMMIT").map_err(|error| error.to_string())?;
         analyses.borrow_mut().clear();
+        #[cfg(test)]
+        BENCH_OUTER_FLUSHES.with(|value| value.set(value.get() + 1));
         Ok(())
     };
     let mut pair = |a: usize, b: usize| -> Result<super::super::cascade_pixels::Analysis, String> {
@@ -234,6 +261,8 @@ fn classify_pool(
             Ok(())
         },
         &mut |anchor| {
+            #[cfg(test)]
+            BENCH_ANCHORS.with(|value| value.set(value.get() + 1));
             next.set(anchor.next_anchor);
             *layout.borrow_mut() = Some(anchor.layout);
             for &unit in anchor.newly_covered {

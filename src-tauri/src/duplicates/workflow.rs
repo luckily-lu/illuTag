@@ -22,6 +22,16 @@ mod planning;
 mod review;
 pub use review::{edit, query};
 
+#[cfg(test)]
+pub(super) fn reset_cascade_bench_counters() {
+    cascade::reset_bench_counters();
+}
+
+#[cfg(test)]
+pub(super) fn cascade_bench_counters() -> (u64, u64, u64) {
+    cascade::bench_counters()
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workflow_runs(
  generation INTEGER PRIMARY KEY,refinement INTEGER NOT NULL DEFAULT 0,plan INTEGER NOT NULL DEFAULT 0,

@@ -8,6 +8,29 @@ use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static BENCH_PAIR_CHECK_TX: Cell<u64> = const { Cell::new(0) };
+    static BENCH_VERDICT_TX: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_batch_counters() {
+    BENCH_PAIR_CHECK_TX.with(|value| value.set(0));
+    BENCH_VERDICT_TX.with(|value| value.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn batch_counters() -> (u64, u64) {
+    (
+        BENCH_PAIR_CHECK_TX.with(Cell::get),
+        BENCH_VERDICT_TX.with(Cell::get),
+    )
+}
+
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pair_checks(
  a INTEGER NOT NULL,b INTEGER NOT NULL,kind INTEGER NOT NULL,
  a_signature BLOB NOT NULL,b_signature BLOB NOT NULL,a_sha BLOB NOT NULL,b_sha BLOB NOT NULL,
@@ -691,9 +714,13 @@ impl Verifier {
         if check_rows > 0 {
             self.pair_check_transactions += 1;
             self.pair_check_rows += check_rows;
+            #[cfg(test)]
+            BENCH_PAIR_CHECK_TX.with(|value| value.set(value.get() + 1));
         }
         if verdict_rows > 0 {
             self.verdict_transactions += 1;
+            #[cfg(test)]
+            BENCH_VERDICT_TX.with(|value| value.set(value.get() + 1));
         }
         Ok(())
     }
