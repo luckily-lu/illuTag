@@ -299,16 +299,18 @@ pub fn remove_gallery_folder(folder_path: String, state: &AppState) -> Result<()
     Ok(())
 }
 
-pub(super) fn sync_user_folder_tree_for_library_directory(
-    conn: &Connection,
+pub(super) struct FolderSyncPlan {
+    root_path: String,
+    sorted_paths: Vec<String>,
+}
+
+/// Walk the directory tree before the caller takes a write transaction. The
+/// resulting plan is safe to replay from a stale candidate list: extra folder
+/// rows are harmless, while image assignments are filtered by pending state.
+pub(super) fn plan_folder_sync(
     root_folder_path: &str,
     images: &[(i64, String)],
-    now: i64,
-) -> Result<(), String> {
-    if images.is_empty() && !Path::new(root_folder_path).is_dir() {
-        return Ok(());
-    }
-
+) -> Result<FolderSyncPlan, String> {
     let root_path = normalize_existing_or_stored_folder_path(root_folder_path);
     let root_prefix = if root_path.ends_with(std::path::MAIN_SEPARATOR) {
         root_path.clone()
@@ -327,73 +329,74 @@ pub(super) fn sync_user_folder_tree_for_library_directory(
         }
     }
 
-    if directory_paths.is_empty() {
-        return Ok(());
-    }
-
     let mut sorted_paths = directory_paths.into_iter().collect::<Vec<_>>();
     sorted_paths.sort_by(|a, b| {
         path_depth_for_sort(a)
             .cmp(&path_depth_for_sort(b))
             .then_with(|| a.cmp(b))
     });
+    Ok(FolderSyncPlan {
+        root_path,
+        sorted_paths,
+    })
+}
 
-    // 单事务包裹全部 upsert/归属写入，避免每语句自动提交带来的 fsync 风暴
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|error| format!("Failed to open folder sync transaction: {error}"))?;
+pub(super) fn sync_user_folder_tree_in_tx(
+    tx: &Connection,
+    plan: &FolderSyncPlan,
+    images: &[(i64, String)],
+    now: i64,
+) -> Result<(), String> {
+    if plan.sorted_paths.is_empty() {
+        return Ok(());
+    }
 
     let mut folder_id_by_path = HashMap::<String, i64>::new();
-    for dir_path in sorted_paths {
-        let parent_id = if dir_path == root_path {
+    for dir_path in &plan.sorted_paths {
+        let parent_id = if *dir_path == plan.root_path {
             None
         } else {
-            let parent_path = Path::new(&dir_path)
+            let parent_path = Path::new(dir_path)
                 .parent()
                 .map(|path| normalize_existing_or_stored_folder_path(&path.to_string_lossy()));
             parent_path.and_then(|path| folder_id_by_path.get(&path).copied())
         };
-        let name = Path::new(&dir_path)
+        let name = Path::new(dir_path)
             .file_name()
             .map(|value| value.to_string_lossy().to_string())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| dir_path.clone());
-        let folder_id = upsert_synced_user_folder_for_path(&tx, &dir_path, parent_id, &name, now)?;
-        folder_id_by_path.insert(dir_path, folder_id);
+        let folder_id = upsert_synced_user_folder_for_path(tx, dir_path, parent_id, &name, now)?;
+        folder_id_by_path.insert(dir_path.clone(), folder_id);
     }
 
-    if !images.is_empty() {
-        for (image_pk, path) in images {
-            let parent_path = Path::new(path)
-                .parent()
-                .map(|path| normalize_existing_or_stored_folder_path(&path.to_string_lossy()))
-                .unwrap_or_else(|| root_path.clone());
-            let Some(target_folder_id) = folder_id_by_path.get(&parent_path).copied() else {
-                continue;
-            };
-            // Initial ownership only ever adds the directory folder. It never
-            // deletes an existing row, so a user edit made after the scan commit
-            // is preserved even if this replay runs again.
-            tx.execute(
-                "
-                INSERT OR IGNORE INTO storage_image_user_folders (image_id, folder_id, assigned_at)
-                VALUES (?1, ?2, ?3)
-                ",
-                params![image_pk, target_folder_id, now],
-            )
-            .map_err(|error| format!("Failed to sync image folder assignment: {error}"))?;
-        }
+    for (image_pk, path) in images {
+        let parent_path = Path::new(path)
+            .parent()
+            .map(|path| normalize_existing_or_stored_folder_path(&path.to_string_lossy()))
+            .unwrap_or_else(|| plan.root_path.clone());
+        let Some(target_folder_id) = folder_id_by_path.get(&parent_path).copied() else {
+            continue;
+        };
+        // Initial ownership only ever adds the directory folder. It never
+        // deletes an existing row, so a user edit made after the scan commit
+        // is preserved even if this replay runs again.
+        tx.execute(
+            "
+            INSERT OR IGNORE INTO storage_image_user_folders (image_id, folder_id, assigned_at)
+            VALUES (?1, ?2, ?3)
+            ",
+            params![image_pk, target_folder_id, now],
+        )
+        .map_err(|error| format!("Failed to sync image folder assignment: {error}"))?;
     }
-
-    tx.commit()
-        .map_err(|error| format!("Failed to commit folder sync transaction: {error}"))?;
 
     Ok(())
 }
 
-pub(super) fn assign_scanned_images_to_nearest_synced_parent_folder(
+pub(super) fn assign_scanned_images_to_nearest_synced_parent_folder_in_tx(
     conn: &Connection,
-    root_folder_path: &str,
+    plan: &FolderSyncPlan,
     images: &[(i64, String)],
     now: i64,
 ) -> Result<(), String> {
@@ -401,7 +404,7 @@ pub(super) fn assign_scanned_images_to_nearest_synced_parent_folder(
         return Ok(());
     }
 
-    let root_path = normalize_existing_or_stored_folder_path(root_folder_path);
+    let root_path = &plan.root_path;
     let root_prefix = if root_path.ends_with(std::path::MAIN_SEPARATOR) {
         root_path.clone()
     } else {
@@ -432,23 +435,18 @@ pub(super) fn assign_scanned_images_to_nearest_synced_parent_folder(
         folder_id_by_path.insert(normalize_existing_or_stored_folder_path(&path), id);
     }
 
-    // 单事务包裹全部归属写入，避免每语句自动提交带来的 fsync 风暴
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|error| format!("Failed to open scan assignment transaction: {error}"))?;
-
     for (image_pk, path) in images {
         let mut current = Path::new(path)
             .parent()
             .map(|path| normalize_existing_or_stored_folder_path(&path.to_string_lossy()))
             .unwrap_or_else(|| root_path.clone());
 
-        if current != root_path && !current.starts_with(&root_prefix) {
+        if current != *root_path && !current.starts_with(&root_prefix) {
             continue;
         }
 
         let mut target_folder_id = folder_id_by_path.get(&current).copied();
-        while target_folder_id.is_none() && current != root_path {
+        while target_folder_id.is_none() && current != *root_path {
             let Some(parent) = Path::new(&current)
                 .parent()
                 .map(|path| normalize_existing_or_stored_folder_path(&path.to_string_lossy()))
@@ -463,7 +461,7 @@ pub(super) fn assign_scanned_images_to_nearest_synced_parent_folder(
             continue;
         };
 
-        tx.execute(
+        conn.execute(
             "
             INSERT OR IGNORE INTO storage_image_user_folders (image_id, folder_id, assigned_at)
             VALUES (?1, ?2, ?3)
@@ -472,9 +470,6 @@ pub(super) fn assign_scanned_images_to_nearest_synced_parent_folder(
         )
         .map_err(|error| format!("Failed to sync scanned image folder assignment: {error}"))?;
     }
-
-    tx.commit()
-        .map_err(|error| format!("Failed to commit scan assignment transaction: {error}"))?;
 
     Ok(())
 }

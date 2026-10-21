@@ -167,7 +167,11 @@ pub(super) fn scan_all_folders_and_collect_new_images(
     // Finish initial directory ownership for images that were committed before
     // an interrupted scan. The pending table is per image, so a user edit made
     // in the meantime is not overwritten.
-    replay_pending_scan_assignments(&conn, scanned_at)?;
+    let replay_warnings = replay_pending_scan_assignments(&conn, scanned_at, source_folder_id)?;
+    for warning in &replay_warnings {
+        push_scan_progress_recent_error(progress, warning);
+        eprintln!("[wd-scan] {warning}");
+    }
     for (_, folder_path) in &folders {
         yield_to_foreground(foreground, stop_requested);
         let folder_path = normalize_existing_or_stored_folder_path(folder_path);
@@ -254,19 +258,7 @@ pub(super) fn scan_all_folders_and_collect_new_images(
         // Only still-pending images are synced; user edits remove the row.
         let pending_images = load_pending_assignment_images(&conn, folder_id)?;
         if !pending_images.is_empty() {
-            sync_user_folder_tree_for_library_directory(
-                &conn,
-                &folder_path,
-                &pending_images,
-                scanned_at,
-            )?;
-            assign_scanned_images_to_nearest_synced_parent_folder(
-                &conn,
-                &folder_path,
-                &pending_images,
-                scanned_at,
-            )?;
-            clear_pending_assignments(&conn, &pending_images)?;
+            complete_pending_assignments(&conn, &folder_path, &pending_images, scanned_at)?;
         }
         scanned_folders += 1;
         set_scan_progress_new_images(progress, new_image_ids.len() as i64);
@@ -302,7 +294,7 @@ pub(super) fn scan_all_folders_and_collect_new_images(
     Ok(ScanCollectResult { tag_queue_images })
 }
 
-fn load_pending_assignment_images(
+pub(super) fn load_pending_assignment_images(
     conn: &Connection,
     folder_id: i64,
 ) -> Result<Vec<(i64, String)>, String> {
@@ -322,20 +314,89 @@ fn load_pending_assignment_images(
     .map_err(|error| format!("Failed to load pending folder assignments: {error}"))
 }
 
+fn pending_assignment_exists(conn: &Connection, image_pk: i64) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM scan_pending_assignments WHERE image_pk=?1)",
+        [image_pk],
+        |row| row.get(0),
+    )
+    .map_err(|error| format!("Failed to check pending folder assignment: {error}"))
+}
+
+/// Consume only the pending rows that still exist inside the same immediate
+/// transaction as the folder writes. A manual edit that commits before this
+/// transaction removes the marker, so the stale candidate list cannot re-add
+/// the directory folder. A manual edit that arrives later blocks on the write
+/// lock and wins afterwards.
+pub(super) fn complete_pending_assignments(
+    conn: &Connection,
+    root_folder_path: &str,
+    candidates: &[(i64, String)],
+    now: i64,
+) -> Result<(), String> {
+    complete_pending_assignments_with_hook(conn, root_folder_path, candidates, now, &mut || {})
+}
+
+/// `before_write` is a test seam for the exact race window: after the stale
+/// candidate list was inspected, before the immediate write transaction.
+pub(super) fn complete_pending_assignments_with_hook(
+    conn: &Connection,
+    root_folder_path: &str,
+    candidates: &[(i64, String)],
+    now: i64,
+    before_write: &mut dyn FnMut(),
+) -> Result<(), String> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let mut live = Vec::<(i64, String)>::new();
+    for (image_pk, path) in candidates {
+        if pending_assignment_exists(conn, *image_pk)? {
+            live.push((*image_pk, path.clone()));
+        }
+    }
+    if live.is_empty() {
+        return Ok(());
+    }
+    // Directory walking is read-only and happens before the write transaction.
+    let plan = plan_folder_sync(root_folder_path, &live)?;
+    before_write();
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("Failed to open pending assignment transaction: {error}"))?;
+    let result = (|| -> Result<(), String> {
+        let mut images = Vec::<(i64, String)>::new();
+        for (image_pk, path) in live {
+            if pending_assignment_exists(conn, image_pk)? {
+                images.push((image_pk, path));
+            }
+        }
+        if images.is_empty() {
+            return Ok(());
+        }
+        sync_user_folder_tree_in_tx(conn, &plan, &images, now)?;
+        assign_scanned_images_to_nearest_synced_parent_folder_in_tx(conn, &plan, &images, now)?;
+        clear_pending_assignments(conn, &images)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .map_err(|error| format!("Failed to commit pending assignment transaction: {error}")),
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 fn clear_pending_assignments(
     conn: &Connection,
     images: &[(i64, String)],
 ) -> Result<(), String> {
-    if images.is_empty() {
-        return Ok(());
-    }
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|error| format!("Failed to open pending assignment transaction: {error}"))?;
     for (image_pk, _) in images {
         // Keep the marker when no initial ownership row exists: a missing
         // mapping must be retried, never silently certified as synced.
-        tx.execute(
+        conn.execute(
             "DELETE FROM scan_pending_assignments
              WHERE image_pk=?1
                AND EXISTS (
@@ -347,25 +408,33 @@ fn clear_pending_assignments(
         )
         .map_err(|error| format!("Failed to clear pending folder assignment: {error}"))?;
     }
-    tx.commit()
-        .map_err(|error| format!("Failed to commit pending assignment transaction: {error}"))
+    Ok(())
 }
 
 /// Replays only images that still have an unused initial-ownership record.
 /// A user folder edit removes that record, so this cannot overwrite a manual
 /// classification even when the edit happened after the scan chunk committed.
-pub(super) fn replay_pending_scan_assignments(conn: &Connection, now: i64) -> Result<(), String> {
+///
+/// `scope` limits compensation to the folders this scan was asked to visit.
+/// Pending rows from an offline/unrelated source are retained and reported,
+/// but must not block an online source from scanning.
+pub(super) fn replay_pending_scan_assignments(
+    conn: &Connection,
+    now: i64,
+    scope: Option<i64>,
+) -> Result<Vec<String>, String> {
     let rows = conn
         .prepare(
-            "SELECT p.image_pk, i.path, f.path
+            "SELECT p.image_pk, i.path, f.path, i.folder_id
              FROM scan_pending_assignments p
              JOIN images i ON i.image_pk = p.image_pk
              JOIN folders f ON f.id = i.folder_id
              WHERE i.source = 'library'
+               AND (?1 IS NULL OR i.folder_id = ?1)
              ORDER BY f.path, p.image_pk",
         )
         .map_err(|error| format!("Failed to load pending folder assignments: {error}"))?
-        .query_map([], |row| {
+        .query_map(params![scope], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
@@ -376,6 +445,7 @@ pub(super) fn replay_pending_scan_assignments(conn: &Connection, now: i64) -> Re
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Failed to load pending folder assignments: {error}"))?;
 
+    let mut warnings = Vec::<String>::new();
     let mut index = 0usize;
     while index < rows.len() {
         let folder_path = rows[index].2.clone();
@@ -385,15 +455,14 @@ pub(super) fn replay_pending_scan_assignments(conn: &Connection, now: i64) -> Re
             index += 1;
         }
         if !Path::new(&folder_path).is_dir() {
-            return Err(format!(
-                "来源目录不可访问，保留了待补齐的目录归属：{folder_path}"
+            warnings.push(format!(
+                "来源暂时不可访问，保留了待补齐的目录归属：{folder_path}"
             ));
+            continue;
         }
-        sync_user_folder_tree_for_library_directory(conn, &folder_path, &images, now)?;
-        assign_scanned_images_to_nearest_synced_parent_folder(conn, &folder_path, &images, now)?;
-        clear_pending_assignments(conn, &images)?;
+        complete_pending_assignments(conn, &folder_path, &images, now)?;
     }
-    Ok(())
+    Ok(warnings)
 }
 
 pub(super) fn tag_images_with_wd_model(
@@ -527,6 +596,7 @@ pub(super) fn run_tag_pipeline<S: TagSession>(
 ) -> Result<(), String> {
     let total = images.len();
     let mut pending = std::collections::VecDeque::<(usize, TagQueueImage)>::new();
+    let mut skipped_missing = vec![false; total];
     let mut read_idx = 0usize;
     let mut send_idx = 0usize;
     let mut retried_current = false;
@@ -540,7 +610,13 @@ pub(super) fn run_tag_pipeline<S: TagSession>(
         while send_idx < total && pending.len() < 2 {
             let image = images[send_idx].clone();
             if !Path::new(&image.path).is_file() {
-                failed(&format!("图片文件不存在，已跳过：{}", image.path));
+                // A send/read restart rewinds send_idx to read_idx and walks
+                // over already-rejected missing files again. Count each missing
+                // image once, not once per service generation.
+                if !skipped_missing[send_idx] {
+                    failed(&format!("图片文件不存在，已跳过：{}", image.path));
+                    skipped_missing[send_idx] = true;
+                }
                 send_idx += 1;
                 continue;
             }

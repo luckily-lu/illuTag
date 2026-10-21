@@ -496,6 +496,61 @@ fn prefetch_send_failure_resends_unread_requests_without_duplicates() {
 }
 
 #[test]
+fn prefetch_restart_does_not_recount_an_already_skipped_missing_image() {
+    let f = Fixture::new(0);
+    let images = pipeline_images(&f, 3);
+    fs::remove_file(&images[0].path).unwrap();
+    let mut session = FakeTagSession {
+        sends: std::collections::VecDeque::from([
+            Ok(()),
+            Err("child exited".into()),
+            Ok(()),
+            Ok(()),
+        ]),
+        reads: std::collections::VecDeque::from([Ok(wd_result("image-1")), Ok(wd_result("image-2"))]),
+        sent_ids: vec![],
+        restarts: 0,
+    };
+    let (result, saved, failures, count) = run_fake_pipeline(&mut session, &images);
+    result.unwrap();
+    assert_eq!(saved, vec!["image-1", "image-2"]);
+    assert_eq!(count, 2);
+    assert_eq!(
+        failures.len(),
+        1,
+        "the missing image must be reported once: {failures:?}"
+    );
+    assert!(failures[0].contains("pipeline-0"), "{failures:?}");
+    assert_eq!(session.restarts, 1);
+    assert_eq!(session.sent_ids, vec!["image-1", "image-2", "image-1", "image-2"]);
+}
+
+#[test]
+fn read_restart_does_not_recount_an_already_skipped_missing_image() {
+    let f = Fixture::new(0);
+    let images = pipeline_images(&f, 3);
+    fs::remove_file(&images[1].path).unwrap();
+    let mut session = FakeTagSession {
+        sends: std::collections::VecDeque::from([Ok(()), Ok(()), Ok(()), Ok(())]),
+        reads: std::collections::VecDeque::from([
+            Err("child exited".into()),
+            Ok(wd_result("image-0")),
+            Ok(wd_result("image-2")),
+        ]),
+        sent_ids: vec![],
+        restarts: 0,
+    };
+    let (result, saved, failures, count) = run_fake_pipeline(&mut session, &images);
+    result.unwrap();
+    assert_eq!(saved, vec!["image-0", "image-2"]);
+    assert_eq!(count, 2);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("pipeline-1"), "{failures:?}");
+    assert_eq!(session.restarts, 1);
+    assert_eq!(session.sent_ids, vec!["image-0", "image-2", "image-0", "image-2"]);
+}
+
+#[test]
 fn prefetch_read_failure_resends_from_the_unread_item() {
     let f = Fixture::new(0);
     let images = pipeline_images(&f, 2);
@@ -662,14 +717,14 @@ fn pending_scan_assignment_is_replayed_per_image() {
     drop(conn);
 
     let conn = open_database(&f.state.database_path).unwrap();
-    replay_pending_scan_assignments(&conn, 10).unwrap();
+    replay_pending_scan_assignments(&conn, 10, None).unwrap();
     assert_eq!(pending_assignment_count(&conn), 0);
     assert_eq!(
         image_folder_rows(&conn, &id),
         vec![(1, "library_dir".to_string())]
     );
     // Idempotent replay: nothing pending, no duplicates.
-    replay_pending_scan_assignments(&conn, 11).unwrap();
+    replay_pending_scan_assignments(&conn, 11, None).unwrap();
     assert_eq!(image_folder_rows(&conn, &id).len(), 1);
 }
 
@@ -709,7 +764,7 @@ fn pending_scan_assignment_is_not_replayed_after_a_user_folder_edit() {
         0,
         "a user classification edit must cancel the pending initial ownership"
     );
-    replay_pending_scan_assignments(&conn, 10).unwrap();
+    replay_pending_scan_assignments(&conn, 10, None).unwrap();
     assert_eq!(
         image_folder_rows(&conn, &id),
         vec![(7, "manual".to_string())],
@@ -736,7 +791,7 @@ fn pending_scan_assignment_uses_image_pk_for_mapped_id() {
     drop(conn);
 
     let conn = open_database(&f.state.database_path).unwrap();
-    replay_pending_scan_assignments(&conn, 10).unwrap();
+    replay_pending_scan_assignments(&conn, 10, None).unwrap();
     assert_eq!(pending_assignment_count(&conn), 0);
     let pk: i64 = conn
         .query_row(
@@ -774,15 +829,140 @@ fn pending_scan_assignment_survives_a_failed_replay() {
          BEGIN SELECT RAISE(ABORT,'synthetic assignment failure'); END;",
     )
     .unwrap();
-    assert!(replay_pending_scan_assignments(&conn, 10).is_err());
+    assert!(replay_pending_scan_assignments(&conn, 10, None).is_err());
     assert_eq!(
         pending_assignment_count(&conn),
         1,
         "the pending marker must not be cleared when assignment failed"
     );
     conn.execute_batch("DROP TRIGGER reject_assignment").unwrap();
-    replay_pending_scan_assignments(&conn, 11).unwrap();
+    replay_pending_scan_assignments(&conn, 11, None).unwrap();
     assert_eq!(pending_assignment_count(&conn), 0);
+}
+
+#[test]
+fn pending_assignment_stale_candidate_cannot_re_add_a_manual_edit() {
+    let f = Fixture::new(1);
+    let id = f
+        .root
+        .join("image-000000.png")
+        .to_string_lossy()
+        .into_owned();
+    let conn = open_database(&f.state.database_path).unwrap();
+    conn.execute("INSERT INTO user_folders(id,name,sort_order,created_at,updated_at) VALUES(7,'manual',0,0,0)", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO scan_pending_assignments(image_pk,created_at) SELECT image_pk,0 FROM images WHERE id=?1",
+        [&id],
+    )
+    .unwrap();
+    // The scan read its replay work before the user's edit commits. Run the
+    // edit after that read but before the immediate write transaction: the
+    // stale Vec still contains the image, so only the in-transaction pending
+    // check prevents the directory folder from being re-added.
+    let stale = scan::load_pending_assignment_images(&conn, 1).unwrap();
+    assert_eq!(stale.len(), 1);
+    scan::complete_pending_assignments_with_hook(
+        &conn,
+        f.root.to_string_lossy().as_ref(),
+        &stale,
+        10,
+        &mut || {
+            mutate_images(
+                ImageMutation {
+                    action: "move".into(),
+                    image_ids: vec![id.clone()],
+                    folder_id: Some(7),
+                    favorite: None,
+                    custom_tags: vec![],
+                    supplement_tags: vec![],
+                },
+                &f.state,
+            )
+            .unwrap();
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        image_folder_rows(&conn, &id),
+        vec![(7, "manual".to_string())],
+        "a stale pending list must not resurrect the directory folder after the edit"
+    );
+    assert_eq!(pending_assignment_count(&conn), 0);
+}
+
+#[test]
+fn offline_source_pending_does_not_block_a_different_online_source_scan() {
+    let f = Fixture::new(0);
+    let a = f.root.join("source-a");
+    let b = f.root.join("source-b");
+    fs::create_dir(&a).unwrap();
+    fs::create_dir(&b).unwrap();
+    let a_image = a.join("a.png");
+    let b_image = b.join("b.png");
+    fs::write(&a_image, b"a").unwrap();
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([4, 5, 6, 255]))
+        .save(&b_image)
+        .unwrap();
+    let conn = open_database(&f.state.database_path).unwrap();
+    conn.execute(
+        "INSERT INTO folders(id,path,added_at) VALUES(10,?1,0),(11,?2,0)",
+        params![a.to_string_lossy().as_ref(), b.to_string_lossy().as_ref()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO images(image_pk,id,path,file_name,ext,width,height,file_size,modified_at,imported_at,folder_id)
+         VALUES(1,?1,?1,'a.png','png',1,1,1,0,0,10),(2,?2,?2,'b.png','png',1,1,1,0,0,11)",
+        params![a_image.to_string_lossy().as_ref(), b_image.to_string_lossy().as_ref()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO scan_pending_assignments(image_pk,created_at) VALUES(1,0)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    fs::rename(&a, f.root.join("source-a-offline")).unwrap();
+    let result = scan_all_folders_and_collect_new_images(
+        &f.state.database_path,
+        &f.state.foreground_queries,
+        &f.state.background_scan_progress,
+        &f.state.background_scan_pause_requested,
+        &f.state.background_scan_stop_requested,
+        false,
+        Some(11),
+    );
+    assert!(
+        result.is_ok(),
+        "an offline pending source must not abort an online source scan: {:?}",
+        result.err()
+    );
+    let conn = open_database(&f.state.database_path).unwrap();
+    assert_eq!(
+        pending_assignment_count(&conn),
+        1,
+        "the offline source marker must be retained"
+    );
+    assert_eq!(
+        image_folder_rows(&conn, a_image.to_string_lossy().as_ref()),
+        vec![]
+    );
+
+    let warnings =
+        replay_pending_scan_assignments(&conn, 12, None).expect("offline groups are warnings");
+    assert!(
+        warnings.iter().any(|warning| warning.contains("source-a")),
+        "{warnings:?}"
+    );
+    assert!(pending_assignment_count(&conn) == 1);
+
+    fs::rename(f.root.join("source-a-offline"), &a).unwrap();
+    replay_pending_scan_assignments(&conn, 13, Some(10)).unwrap();
+    assert_eq!(pending_assignment_count(&conn), 0);
+    let rows = image_folder_rows(&conn, a_image.to_string_lossy().as_ref());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, "library_dir");
 }
 
 #[test]
