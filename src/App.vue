@@ -5,6 +5,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { api, errorMessage, invoke } from "./shared/ipc";
 import { useGallery } from "./features/gallery/useGallery";
 import { useSelection } from "./features/gallery/useSelection";
+import { useSelectionScope } from "./features/gallery/useSelectionScope";
 import { provideWorkspace } from "./shared/workspace";
 import { useFolders } from "./features/folders/useFolders";
 import { useJobs } from "./features/jobs/useJobs";
@@ -38,6 +39,10 @@ const gallery = useGallery(),
   folders = useFolders(),
   preferences = usePreferences();
 provideWorkspace({ gallery, selection });
+useSelectionScope(gallery.query, () => {
+  selection.clear();
+  recycleBin.selectionId.value = null;
+});
 const page = ref("gallery"),
   sources = ref<LibraryFolder[]>([]),
   drawer = ref(false),
@@ -185,20 +190,13 @@ const recycleSelectedBytes = computed(() => {
       ),
   );
 });
-let frozenRecycleQuery = "",
-  frozenRecycleRevision = -1;
-watch(
-  [() => JSON.stringify(gallery.query.value), gallery.revision],
-  ([queryKey, revision]) => {
-    if (
-      selection.allSelection.value &&
-      (queryKey !== frozenRecycleQuery || revision !== frozenRecycleRevision)
-    ) {
-      selection.clear();
-      recycleBin.selectionId.value = null;
-    }
-  },
-);
+let frozenRecycleRevision = -1;
+watch(gallery.revision, (revision) => {
+  if (selection.allSelection.value && revision !== frozenRecycleRevision) {
+    selection.clear();
+    recycleBin.selectionId.value = null;
+  }
+});
 async function selectRecycleResults() {
   try {
     const query = {
@@ -215,7 +213,6 @@ async function selectRecycleResults() {
       recycleBin.selectionId.value = null;
       return;
     }
-    frozenRecycleQuery = queryKey;
     frozenRecycleRevision = revision;
     selection.selectAllResults(snapshot.count);
   } catch (e) {
