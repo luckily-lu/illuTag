@@ -611,15 +611,19 @@ pub(super) fn repair_thumbnail_paths_for_current_data_dir(
     candidates: &mut [ThumbnailCandidate],
 ) -> Result<(), String> {
     for candidate in candidates {
-        let expected_thumb_path =
-            expected_thumbnail_path_for_image_id(thumb_root, &candidate.image_id);
-        let expected_thumb_exists = Path::new(&expected_thumb_path).is_file();
-        if thumbnail_up_to_date(candidate)
-            && candidate.current_thumb_path.as_deref() == Some(expected_thumb_path.as_str())
-        {
+        // Path repair may only relocate an already valid thumbnail. If the
+        // record is missing or its source signature is stale, an existing file
+        // at the expected path proves nothing about its pixels; leave it for the
+        // real generation path instead of certifying stale content as current.
+        if !thumbnail_up_to_date(candidate) {
             continue;
         }
-        if !expected_thumb_exists {
+        let expected_thumb_path =
+            expected_thumbnail_path_for_image_id(thumb_root, &candidate.image_id);
+        if candidate.current_thumb_path.as_deref() == Some(expected_thumb_path.as_str()) {
+            continue;
+        }
+        if !Path::new(&expected_thumb_path).is_file() {
             continue;
         }
         upsert_thumbnail_record(

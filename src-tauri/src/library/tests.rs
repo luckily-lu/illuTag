@@ -384,6 +384,96 @@ fn unchanged_scan_keeps_auto_tags() {
 }
 
 #[test]
+fn thumbnail_path_repair_never_certifies_stale_content() {
+    use super::inference::{
+        expected_thumbnail_path_for_image_id, generate_single_thumbnail, repair_thumbnail_paths_for_current_data_dir,
+    };
+
+    let f = Fixture::new(1);
+    let id = f
+        .root
+        .join("image-000000.png")
+        .to_string_lossy()
+        .into_owned();
+    let conn = open_database(&f.state.database_path).unwrap();
+    let thumb_root = f.root.join("thumbs");
+    fs::create_dir_all(&thumb_root).unwrap();
+    let expected = expected_thumbnail_path_for_image_id(&thumb_root, &id);
+    let old = thumb_root.join("old.webp").to_string_lossy().into_owned();
+    fs::write(&old, b"old thumbnail").unwrap();
+    fs::write(&expected, b"unrelated file at expected path").unwrap();
+    super::inference::upsert_thumbnail_record(&conn, &id, &old, 10, 10).unwrap();
+
+    let candidate = |thumb: Option<String>, modified_at: i64, file_size: i64| ThumbnailCandidate {
+        image_id: id.clone(),
+        image_path: id.clone(),
+        modified_at: 20,
+        file_size: 200,
+        current_thumb_path: thumb,
+        current_source_modified_at: Some(modified_at),
+        current_source_file_size: Some(file_size),
+    };
+
+    // The record describes old bytes at 10/10 while the source is now 20/20.
+    let mut stale = vec![candidate(Some(old.clone()), 10, 10)];
+    repair_thumbnail_paths_for_current_data_dir(&conn, &thumb_root, &mut stale).unwrap();
+    assert_eq!(stale[0].current_thumb_path.as_deref(), Some(old.as_str()));
+    assert_eq!(
+        conn.query_row(
+            "SELECT source_modified_at,source_file_size,thumb_path FROM storage_image_thumbnails",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+        )
+        .unwrap(),
+        (10, 10, old.clone()),
+        "a stale record must not be rewritten with the new source signature"
+    );
+
+    // A record that actually matches the source may be relocated.
+    conn.execute(
+        "UPDATE storage_image_thumbnails SET source_modified_at=20,source_file_size=200",
+        [],
+    )
+    .unwrap();
+    let mut current = vec![candidate(Some(old.clone()), 20, 200)];
+    repair_thumbnail_paths_for_current_data_dir(&conn, &thumb_root, &mut current).unwrap();
+    assert_eq!(
+        current[0].current_thumb_path.as_deref(),
+        Some(expected.as_str())
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT source_modified_at,source_file_size,thumb_path FROM storage_image_thumbnails",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+        )
+        .unwrap(),
+        (20, 200, expected.clone())
+    );
+
+    // No record at all: an existing file at the expected path is not proof.
+    conn.execute("DELETE FROM storage_image_thumbnails", []).unwrap();
+    let mut missing = vec![candidate(None, 0, 0)];
+    repair_thumbnail_paths_for_current_data_dir(&conn, &thumb_root, &mut missing).unwrap();
+    assert!(missing[0].current_thumb_path.is_none());
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM storage_image_thumbnails", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+
+    // The real generation path then writes the current pixels to the expected path.
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([20, 40, 60, 255]))
+        .save(&id)
+        .unwrap();
+    let generated = generate_single_thumbnail(&missing[0], &thumb_root, 64, 0.8).unwrap();
+    assert_eq!(generated, expected);
+    assert!(Path::new(&expected).is_file());
+    assert_ne!(fs::read(&expected).unwrap(), b"unrelated file at expected path");
+}
+
+#[test]
 fn compact_tags_preserve_translation_and_distinct_image_statistics() {
     let f = Fixture::new(1);
     let conn = open_database(&f.state.database_path).unwrap();
