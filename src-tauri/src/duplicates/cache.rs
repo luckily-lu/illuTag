@@ -118,10 +118,13 @@ pub(crate) fn signature(public_id: &str, file: &fingerprint::SourceSignature) ->
     digest.update(file.modified_ns.to_le_bytes());
     digest.finalize().into()
 }
-pub(crate) fn db_binding(state: &AppState) -> Result<String, String> {
-    let info = fingerprint::source_signature(&state.database_path)?;
-    let canonical = fs::canonicalize(&state.database_path).map_err(|e| e.to_string())?;
+pub(crate) fn db_binding_for(database_path: &Path) -> Result<String, String> {
+    let info = fingerprint::source_signature(database_path)?;
+    let canonical = fs::canonicalize(database_path).map_err(|e| e.to_string())?;
     Ok(format!("{}|{}", canonical.to_string_lossy(), info.identity))
+}
+pub(crate) fn db_binding(state: &AppState) -> Result<String, String> {
+    db_binding_for(&state.database_path)
 }
 pub(crate) fn library(state: &AppState) -> Result<Connection, String> {
     let conn = Connection::open_with_flags(&state.database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)

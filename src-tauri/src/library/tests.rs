@@ -535,6 +535,117 @@ fn prefetch_response_mismatch_stops_without_saving_wrong_tags() {
 }
 
 #[test]
+fn migration_reports_an_unsupported_operation_journal() {
+    let f = Fixture::new(1);
+    let operations = f.root.join("operations");
+    fs::create_dir_all(&operations).unwrap();
+    let conn = Connection::open(operations.join("recycle-management.sqlite")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+         INSERT INTO meta VALUES('binding','not-current');",
+    )
+    .unwrap();
+    drop(conn);
+    let destination_fixture = Fixture::new(0);
+    let destination = destination_fixture.root.join("unsupported-migration");
+    fs::create_dir(&destination).unwrap();
+    let (_, _, reports) = prepare_data_directory_migration(&destination, &f.state).unwrap();
+    let report = reports
+        .iter()
+        .find(|report| report.journal == "recycle-management.sqlite")
+        .expect("journal must be reported");
+    assert_eq!(report.status, "skipped");
+    assert!(!report.message.is_empty());
+    assert!(!destination
+        .join("operations/recycle-management.sqlite")
+        .exists());
+    assert!(reports.iter().all(|report| report.unresolved.is_empty()));
+}
+
+#[test]
+fn migration_rebinds_recycle_journal_and_restores_inside_clipboard() {
+    let f = Fixture::new(1);
+    let clipboard = f.root.join("clipboard");
+    fs::create_dir_all(&clipboard).unwrap();
+    let old_path = clipboard.join("pending.png");
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([9, 8, 7, 255]))
+        .save(&old_path)
+        .unwrap();
+    let signature = crate::duplicates::fingerprint::source_signature(&old_path).unwrap();
+    let old_id = old_path.to_string_lossy().into_owned();
+    let conn = open_database(&f.state.database_path).unwrap();
+    conn.execute(
+        "UPDATE images SET id=?1,path=?1,file_size=?2,modified_at=?3,trashed=1 WHERE image_pk=1",
+        params![
+            old_id,
+            signature.file_size as i64,
+            signature.modified_ns / 1_000_000
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let selection = super::recycle::prepare(
+        super::recycle::RecycleSelectionRequest {
+            query: None,
+            image_ids: vec![old_id.clone()],
+            selection_id: None,
+            excluded_ids: vec![],
+        },
+        &f.state,
+    )
+    .unwrap();
+    assert_eq!(selection.count, 1);
+    let journal = Connection::open(f.root.join("operations/recycle-management.sqlite")).unwrap();
+    journal
+        .execute(
+            "UPDATE selections SET action='restore',state='queued' WHERE id=?1",
+            [&selection.selection_id],
+        )
+        .unwrap();
+    drop(journal);
+
+    let destination_fixture = Fixture::new(0);
+    let destination = destination_fixture.root.join("new-data");
+    let (files, _, reports) = prepare_data_directory_migration(&destination, &f.state).unwrap();
+    assert!(files >= 3);
+    assert!(
+        reports.iter().all(|report| report.status == "migrated"),
+        "{reports:?}"
+    );
+    assert!(destination.join("clipboard/pending.png").is_file());
+
+    let mut new_state = AppState::new(
+        destination.join("illutag.sqlite"),
+        destination.clone(),
+        None,
+        None,
+    );
+    new_state.read_only = false;
+    super::recycle::run(
+        &selection.selection_id,
+        &new_state,
+        &mut || Ok(()),
+        &mut |_| {},
+    )
+    .unwrap();
+    let new_conn = open_database(&new_state.database_path).unwrap();
+    let (trashed, new_path): (i64, String) = new_conn
+        .query_row("SELECT trashed,path FROM images WHERE image_pk=1", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(trashed, 0);
+    assert!(Path::new(&new_path).is_file());
+    assert!(
+        new_path.starts_with(destination.to_string_lossy().as_ref()),
+        "{new_path}"
+    );
+    let status = super::recycle::status(&selection.selection_id, &new_state).unwrap();
+    assert_eq!(status.succeeded, 1);
+}
+
+#[test]
 fn pending_scan_assignment_is_replayed_per_image() {
     let f = Fixture::new(1);
     let id = f
@@ -1677,7 +1788,7 @@ fn directory_migration_validates_before_switch_and_preserves_source() {
     assert_eq!(fs::read(occupied.join("keep")).unwrap(), b"original");
     let target = Fixture::new(0);
     let destination = target.root.join("new-data");
-    let (files, _) = prepare_data_directory_migration(&destination, &f.state).unwrap();
+    let (files, _, _) = prepare_data_directory_migration(&destination, &f.state).unwrap();
     assert!(files >= 3);
     assert!(f.state.database_path.is_file());
     assert!(destination.join("clipboard/owned.png").is_file());

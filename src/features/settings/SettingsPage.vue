@@ -224,8 +224,33 @@ function migrate() {
       text: "数据库、偏好、配置和托管图片会复制并校验后切换。外部来源原图保留原位置。完成后需重启。",
       run: () =>
         run(async () => {
-          await invoke("migrate_data_directory_command", { targetDir });
-          message.value = "数据目录已迁移，请重启应用";
+          const result = await invoke<{
+            message?: string;
+            operationLogs?: {
+              journal: string;
+              status: string;
+              message: string;
+              unresolved: {
+                kind: string;
+                operation: string;
+                imageId: string | null;
+                reason: string;
+              }[];
+            }[];
+          }>("migrate_data_directory_command", { targetDir });
+          const logs = result.operationLogs ?? [];
+          const unresolved = logs.flatMap((log) =>
+            log.unresolved.map(
+              (row) =>
+                `${log.journal} · ${row.kind}${row.operation ? ` · 批次 ${row.operation}` : ""}${row.imageId ? ` · ${row.imageId}` : ""}：${row.reason}`,
+            ),
+          );
+          const skipped = logs
+            .filter((log) => log.status === "skipped")
+            .map((log) => `${log.journal}：${log.message}`);
+          message.value = result.message ?? "数据目录已迁移，请重启应用";
+          if (unresolved.length || skipped.length)
+            error.value = [...skipped, ...unresolved].join("\n");
         }),
     };
   });

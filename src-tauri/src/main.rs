@@ -41,6 +41,7 @@ struct DataDirectoryMigrationResult {
     config_path: String,
     copied_files: u64,
     copied_bytes: u64,
+    operation_logs: Vec<illutag_core::library::OperationLogMigration>,
     restart_required: bool,
     message: String,
 }
@@ -447,7 +448,7 @@ async fn migrate_data_directory_command(
     commands::off_main(app, move |state| {
         let target = PathBuf::from(target_dir);
         let config = portable_config_path()?;
-        let (copied_files, copied_bytes) =
+        let (copied_files, copied_bytes, operation_logs) =
             illutag_core::library::prepare_data_directory_migration(&target, &state)?;
         if let Err(error) = write_portable_config(
             &config,
@@ -460,14 +461,23 @@ async fn migrate_data_directory_command(
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             return Err(error);
         }
+        let unresolved: usize = operation_logs.iter().map(|log| log.unresolved.len()).sum();
+        let message = if unresolved == 0 {
+            "数据目录已校验并切换，请重启应用。原目录保持完整。".to_string()
+        } else {
+            format!(
+                "数据目录已校验并切换，请重启应用。有 {unresolved} 条旧操作记录未能迁移，详情见提示列表。"
+            )
+        };
         Ok(DataDirectoryMigrationResult {
             source_dir: state.data_dir.to_string_lossy().into(),
             target_dir: target.to_string_lossy().into(),
             config_path: config.to_string_lossy().into(),
             copied_files,
             copied_bytes,
+            operation_logs,
             restart_required: true,
-            message: "数据目录已校验并切换，请重启应用。原目录保持完整。".into(),
+            message,
         })
     })
     .await

@@ -54,6 +54,71 @@ fn trashed(f: &Fixture, index: usize) -> bool {
 }
 
 #[test]
+fn migration_repairs_duplicate_payloads_and_undo_still_works() {
+    let mut f = Fixture::new(3);
+    let new_assets = f.state.data_dir.join("clipboard");
+    fs::rename(f.root.join("assets"), &new_assets).unwrap();
+    let db = Connection::open(&f.state.database_path).unwrap();
+    db.execute(
+        "UPDATE folders SET path=?1",
+        [new_assets.to_string_lossy().as_ref()],
+    )
+    .unwrap();
+    for (index, path) in f.paths.iter_mut().enumerate() {
+        let next = new_assets.join(path.file_name().unwrap());
+        db.execute(
+            "UPDATE images SET id=?1,path=?1 WHERE image_pk=?2",
+            params![next.to_string_lossy().as_ref(), index as i64 + 1],
+        )
+        .unwrap();
+        *path = next;
+    }
+    drop(db);
+    f.run().unwrap();
+
+    let g = group(&f);
+    let preview = prepare(
+        request(&f, &g, "exactOthers", vec![id(&f, 0)], vec![]),
+        &f.state,
+    )
+    .unwrap();
+    execute(&f, &preview.operation_id).unwrap();
+    assert!(trashed(&f, 1));
+    assert!(trashed(&f, 2));
+
+    let destination = f.root.join("migrated");
+    fs::create_dir(&destination).unwrap();
+    let (_, _, reports) =
+        crate::library::prepare_data_directory_migration(&destination, &f.state).unwrap();
+    assert!(
+        reports.iter().all(|report| report.status == "migrated"),
+        "{reports:?}"
+    );
+    assert!(destination.join("clipboard/image-000.png").is_file());
+
+    let mut new_state = crate::library::AppState::new(
+        destination.join("illutag.sqlite"),
+        destination.clone(),
+        None,
+        None,
+    );
+    new_state.read_only = false;
+    let undo = prepare_undo(&preview.operation_id, &new_state).unwrap();
+    run_operation(&undo, &new_state, &mut || Ok(()), &mut |_| {}).unwrap();
+    let new_db = cache::library(&new_state).unwrap();
+    let remaining: i64 = new_db
+        .query_row("SELECT COUNT(*) FROM images WHERE trashed<>0", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(remaining, 0, "undo must work after migration");
+    assert_eq!(
+        operation_status(&undo, &new_state).unwrap().succeeded,
+        2
+    );
+}
+
+#[test]
 fn physical_alias_preflight_releases_library_readers_before_pause_acknowledgement() {
     let f = Fixture::new(1005);
     f.run().unwrap();

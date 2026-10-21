@@ -517,10 +517,513 @@ pub fn restore_package(
     Ok(manifest)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationLogIssue {
+    pub kind: String,
+    pub operation: String,
+    pub image_pk: Option<i64>,
+    pub image_id: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationLogMigration {
+    pub journal: String,
+    /// migrated | partial | skipped
+    pub status: String,
+    pub rows_total: u64,
+    pub rows_migrated: u64,
+    pub unresolved: Vec<OperationLogIssue>,
+    pub message: String,
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    hex_encode(&Sha256::digest(bytes))
+}
+
+fn canonical_journal_path(path: &Path) -> Result<String, String> {
+    let value = fs::canonicalize(path)
+        .map_err(|error| format!("文件无法访问：{error}"))?
+        .to_string_lossy()
+        .into_owned();
+    Ok(if cfg!(windows) {
+        value.to_lowercase()
+    } else {
+        value
+    })
+}
+
+fn journal_is_supported(conn: &Connection, tables: &[&str]) -> Result<(), String> {
+    let check: String = conn
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|error| format!("日志校验失败：{error}"))?;
+    if check != "ok" {
+        return Err(format!("日志校验失败：{check}"));
+    }
+    for table in tables {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("读取日志结构失败：{error}"))?;
+        if !exists {
+            return Err(format!("日志缺少表 {table}，版本不受支持"));
+        }
+    }
+    Ok(())
+}
+
+fn journal_binding(conn: &Connection) -> Option<String> {
+    conn.query_row("SELECT value FROM meta WHERE key='binding'", [], |row| {
+        row.get::<_, String>(0)
+    })
+    .ok()
+}
+
+fn snapshot_operation_journal(source: &Path, destination: &Path) -> Result<(), String> {
+    let source = Connection::open_with_flags(
+        source,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| format!("打开操作日志失败：{error}"))?;
+    let mut target =
+        Connection::open(destination).map_err(|error| format!("创建日志快照失败：{error}"))?;
+    let backup = rusqlite::backup::Backup::new(&source, &mut target)
+        .map_err(|error| format!("复制操作日志失败：{error}"))?;
+    backup
+        .run_to_completion(8192, Duration::from_millis(5), None)
+        .map_err(|error| format!("复制操作日志失败：{error}"))?;
+    drop(backup);
+    target
+        .execute_batch("PRAGMA journal_mode=DELETE;")
+        .map_err(|error| format!("整理日志快照失败：{error}"))?;
+    let check: String = target
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|error| format!("校验日志快照失败：{error}"))?;
+    if check != "ok" {
+        return Err(format!("日志快照校验失败：{check}"));
+    }
+    Ok(())
+}
+
+fn repaired_item_payload(
+    db: &Connection,
+    payload: &str,
+) -> Result<String, (Option<i64>, String)> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(payload).map_err(|error| (None, format!("记录无法解析：{error}")))?;
+    let pk = value
+        .get("pk")
+        .and_then(|value| value.as_i64())
+        .ok_or((None, "记录缺少 image_pk".to_string()))?;
+    let image = crate::duplicates::management::main_image(db, pk)
+        .map_err(|error| (Some(pk), error))?
+        .ok_or((Some(pk), "图库记录已移除".to_string()))?;
+    let signature = crate::duplicates::fingerprint::source_signature(Path::new(&image.path))
+        .map_err(|error| (Some(pk), format!("源文件不可用：{error}")))?;
+    let canonical = canonical_journal_path(Path::new(&image.path))
+        .map_err(|error| (Some(pk), error))?;
+    value["image"] = serde_json::to_value(&image)
+        .map_err(|error| (Some(pk), format!("图片记录无法序列化：{error}")))?;
+    value["public_hash"] = serde_json::json!(hex_digest(image.id.as_bytes()));
+    value["signature"] = serde_json::json!(hex_encode(&crate::duplicates::cache::signature(
+        &image.id,
+        &signature
+    )));
+    value["canonical"] = serde_json::json!(canonical);
+    value["identity"] = serde_json::json!(signature.identity);
+    serde_json::to_string(&value)
+        .map_err(|error| (Some(pk), format!("记录无法序列化：{error}")))
+}
+
+fn mark_duplicate_item_unavailable(
+    conn: &Connection,
+    operation: i64,
+    ordinal: i64,
+    reason: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE items SET state='skipped',code='migrationUnavailable',message=?3
+         WHERE operation=?1 AND ordinal=?2 AND state='pending'",
+        params![operation, ordinal, reason.chars().take(400).collect::<String>()],
+    )
+    .map_err(|error| format!("标记未迁移记录失败：{error}"))?;
+    Ok(())
+}
+
+fn migrate_recycle_journal(path: &Path, db: &Connection) -> Result<OperationLogMigration, String> {
+    let mut conn = Connection::open(path).map_err(|error| format!("打开回收日志失败：{error}"))?;
+    let mut report = OperationLogMigration {
+        journal: "recycle-management.sqlite".into(),
+        status: "migrated".into(),
+        ..Default::default()
+    };
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("打开回收日志事务失败：{error}"))?;
+    let rows = tx
+        .prepare(
+            "SELECT selection,pk,id,path,bytes,modified,state,signature FROM items ORDER BY selection,pk",
+        )
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    for (selection, pk, old_id, _old_path, _old_bytes, _old_modified, state, old_signature) in rows {
+        report.rows_total += 1;
+        let image = db
+            .query_row(
+                "SELECT id,path,file_size,modified_at FROM images WHERE image_pk=?1",
+                [pk],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((new_id, new_path, size, modified)) = image else {
+            report.unresolved.push(OperationLogIssue {
+                kind: "recycleItem".into(),
+                operation: selection.clone(),
+                image_pk: Some(pk),
+                image_id: Some(old_id),
+                reason: "图库记录已移除".into(),
+            });
+            tx.execute(
+                "UPDATE items SET state='skipped',message='迁移后无法使用：图库记录已移除'
+                 WHERE selection=?1 AND pk=?2",
+                params![selection, pk],
+            )
+            .map_err(|error| error.to_string())?;
+            continue;
+        };
+        let mut signature = old_signature;
+        let mut unresolved_reason = None;
+        match crate::duplicates::fingerprint::source_signature(Path::new(&new_path)) {
+            Ok(source) => {
+                signature = serde_json::to_string(&(
+                    source.file_size,
+                    source.modified_ns,
+                    source.identity,
+                ))
+                .map_err(|error| error.to_string())?;
+            }
+            Err(error) => unresolved_reason = Some(format!("源文件不可用：{error}")),
+        }
+        tx.execute(
+            "UPDATE items SET id=?3,path=?4,bytes=?5,modified=?6,signature=?7
+             WHERE selection=?1 AND pk=?2",
+            params![selection, pk, new_id, new_path, size, modified, signature],
+        )
+        .map_err(|error| error.to_string())?;
+        report.rows_migrated += 1;
+        if let Some(reason) = unresolved_reason {
+            report.unresolved.push(OperationLogIssue {
+                kind: "recycleItem".into(),
+                operation: selection.clone(),
+                image_pk: Some(pk),
+                image_id: Some(new_id),
+                reason: reason.clone(),
+            });
+            if state == "pending" {
+                tx.execute(
+                    "UPDATE items SET state='skipped',message=?3 WHERE selection=?1 AND pk=?2",
+                    params![selection, pk, format!("迁移后无法使用：{reason}")],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    tx.commit().map_err(|error| error.to_string())?;
+    if !report.unresolved.is_empty() {
+        report.status = "partial".into();
+        report.message = format!("{} 条回收记录无法完整迁移", report.unresolved.len());
+    }
+    Ok(report)
+}
+
+fn migrate_duplicate_journal(
+    path: &Path,
+    db: &Connection,
+    mappings: &[BackupPathMapping],
+) -> Result<OperationLogMigration, String> {
+    let mut conn = Connection::open(path).map_err(|error| format!("打开整理日志失败：{error}"))?;
+    let mut report = OperationLogMigration {
+        journal: "duplicate-management.sqlite".into(),
+        status: "migrated".into(),
+        ..Default::default()
+    };
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("打开整理日志事务失败：{error}"))?;
+
+    let items = tx
+        .prepare("SELECT operation,ordinal,image_pk,payload,state FROM items ORDER BY operation,ordinal")
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    for (operation, ordinal, pk, payload, state) in items {
+        report.rows_total += 1;
+        match repaired_item_payload(db, &payload) {
+            Ok(next) => {
+                tx.execute(
+                    "UPDATE items SET payload=?3 WHERE operation=?1 AND ordinal=?2",
+                    params![operation, ordinal, next],
+                )
+                .map_err(|error| error.to_string())?;
+                report.rows_migrated += 1;
+            }
+            Err((_, reason)) => {
+                report.unresolved.push(OperationLogIssue {
+                    kind: "managementItem".into(),
+                    operation: operation.to_string(),
+                    image_pk: Some(pk),
+                    image_id: None,
+                    reason: reason.clone(),
+                });
+                if state == "pending" {
+                    mark_duplicate_item_unavailable(&tx, operation, ordinal, &reason)?;
+                }
+            }
+        }
+    }
+
+    for table in ["bulk_candidates", "bulk_keepers"] {
+        let exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !exists {
+            continue;
+        }
+        let key = if table == "bulk_candidates" {
+            "operation,image_pk,payload FROM bulk_candidates"
+        } else {
+            "operation,image_pk,payload FROM bulk_keepers"
+        };
+        let rows = tx
+            .prepare(&format!("SELECT {key}"))
+            .map_err(|error| error.to_string())?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        for (operation, pk, payload) in rows {
+            report.rows_total += 1;
+            match repaired_item_payload(db, &payload) {
+                Ok(next) => {
+                    tx.execute(
+                        &format!(
+                            "UPDATE {table} SET payload=?3 WHERE operation=?1 AND image_pk=?2"
+                        ),
+                        params![operation, pk, next],
+                    )
+                    .map_err(|error| error.to_string())?;
+                    report.rows_migrated += 1;
+                }
+                Err((_, reason)) => {
+                    report.unresolved.push(OperationLogIssue {
+                        kind: table.into(),
+                        operation: operation.to_string(),
+                        image_pk: Some(pk),
+                        image_id: None,
+                        reason: reason.clone(),
+                    });
+                    if table == "bulk_candidates" {
+                        tx.execute(
+                            "UPDATE bulk_candidates SET state=2 WHERE operation=?1 AND image_pk=?2",
+                            params![operation, pk],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                }
+            }
+        }
+    }
+
+    let operations = tx
+        .prepare("SELECT id,request FROM operations ORDER BY id")
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    for (id, request) in operations {
+        let mut value: serde_json::Value = match serde_json::from_str(&request) {
+            Ok(value) => value,
+            Err(error) => {
+                report.unresolved.push(OperationLogIssue {
+                    kind: "operationRequest".into(),
+                    operation: id.to_string(),
+                    image_pk: None,
+                    image_id: None,
+                    reason: format!("请求无法解析：{error}"),
+                });
+                continue;
+            }
+        };
+        for key in ["keep_ids", "protected_ids", "image_ids"] {
+            let Some(ids) = value.get_mut(key).and_then(|value| value.as_array_mut()) else {
+                continue;
+            };
+            for id_value in ids {
+                let Some(old) = id_value.as_str() else {
+                    continue;
+                };
+                let next = remap_backup_path(old, mappings);
+                if next != old {
+                    let exists: bool = db
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM images WHERE id=?1)",
+                            [&next],
+                            |row| row.get(0),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    if !exists {
+                        report.unresolved.push(OperationLogIssue {
+                            kind: "operationRequest".into(),
+                            operation: id.to_string(),
+                            image_pk: None,
+                            image_id: Some(old.to_string()),
+                            reason: format!("映射后的图片不存在：{next}"),
+                        });
+                    }
+                    *id_value = serde_json::json!(next);
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE operations SET request=?2 WHERE id=?1",
+            params![id, serde_json::to_string(&value).map_err(|error| error.to_string())?],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+
+    let owner_rows = tx
+        .prepare("SELECT image_pk FROM owners")
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    for pk in owner_rows {
+        report.rows_total += 1;
+        let image_id = db
+            .query_row("SELECT id FROM images WHERE image_pk=?1", [pk], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(|error| error.to_string())?;
+        match image_id {
+            Some(image_id) => {
+                tx.execute(
+                    "UPDATE owners SET public_hash=?2 WHERE image_pk=?1",
+                    params![pk, hex_digest(image_id.as_bytes())],
+                )
+                .map_err(|error| error.to_string())?;
+                report.rows_migrated += 1;
+            }
+            None => report.unresolved.push(OperationLogIssue {
+                kind: "owner".into(),
+                operation: String::new(),
+                image_pk: Some(pk),
+                image_id: None,
+                reason: "图库记录已移除".into(),
+            }),
+        }
+    }
+
+    tx.commit().map_err(|error| error.to_string())?;
+    if !report.unresolved.is_empty() {
+        report.status = "partial".into();
+        report.message = format!("{} 条整理记录无法完整迁移", report.unresolved.len());
+    }
+    Ok(report)
+}
+
+fn rebind_operation_journals(data_dir: &Path, binding: &str) -> Result<Vec<String>, String> {
+    let mut warned = Vec::new();
+    for (name, tables) in [
+        (
+            "recycle-management.sqlite",
+            vec!["meta", "items", "selections"],
+        ),
+        (
+            "duplicate-management.sqlite",
+            vec!["meta", "items", "operations", "owners"],
+        ),
+    ] {
+        let path = data_dir.join("operations").join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let conn = Connection::open(&path).map_err(|error| format!("打开迁移日志失败：{error}"))?;
+        if let Err(error) = journal_is_supported(&conn, &tables) {
+            warned.push(format!("{name}: {error}"));
+            continue;
+        }
+        conn.execute("UPDATE meta SET value=?1 WHERE key='binding'", [binding])
+            .map_err(|error| format!("重绑迁移日志失败：{error}"))?;
+        let check: String = conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|error| format!("校验迁移日志失败：{error}"))?;
+        if check != "ok" {
+            warned.push(format!("{name}: 校验失败：{check}"));
+        }
+    }
+    Ok(warned)
+}
+
 pub fn prepare_data_directory_migration(
     target: &Path,
     state: &AppState,
-) -> Result<(u64, u64), String> {
+) -> Result<(u64, u64, Vec<OperationLogMigration>), String> {
     let mut guard = begin_maintenance(state)?;
     let reference_target = target.to_string_lossy().to_string();
     if !target.is_absolute() {
@@ -539,6 +1042,17 @@ pub fn prepare_data_directory_migration(
     {
         return Err("请选择空目录，避免覆盖已有数据".into());
     }
+    let mappings = vec![
+        BackupPathMapping {
+            from: state.data_dir.to_string_lossy().into(),
+            to: reference_target.clone(),
+        },
+        BackupPathMapping {
+            from: source.to_string_lossy().into(),
+            to: reference_target.clone(),
+        },
+    ];
+    let source_binding = crate::duplicates::cache::db_binding(state)?;
     let stage = target.join("migration-staging");
     fs::create_dir(&stage).map_err(|e| e.to_string())?;
     sqlite_snapshot(&state.database_path, &stage.join("illutag.sqlite"))?;
@@ -557,19 +1071,79 @@ pub fn prepare_data_directory_migration(
             fs::copy(file, stage.join(name)).map_err(|e| e.to_string())?;
         }
     }
-    remap_database_paths(
-        &stage.join("illutag.sqlite"),
-        &[
-            BackupPathMapping {
-                from: state.data_dir.to_string_lossy().into(),
-                to: reference_target.clone(),
-            },
-            BackupPathMapping {
-                from: source.to_string_lossy().into(),
-                to: reference_target,
-            },
-        ],
-    )?;
+
+    // Operation journals are copied before the main database is switched. The
+    // record-level repair happens after path remapping, because an image inside
+    // the data directory changes both its public id and its file identity.
+    let operations_source = source.join("operations");
+    let mut copied_journals = Vec::<&'static str>::new();
+    let mut reports = Vec::<OperationLogMigration>::new();
+    if operations_source.is_dir() {
+        fs::create_dir_all(stage.join("operations")).map_err(|e| e.to_string())?;
+        for (name, tables) in [
+            (
+                "recycle-management.sqlite",
+                vec!["meta", "items", "selections"],
+            ),
+            (
+                "duplicate-management.sqlite",
+                vec!["meta", "items", "operations", "owners"],
+            ),
+        ] {
+            let from = operations_source.join(name);
+            if !from.is_file() {
+                continue;
+            }
+            let source_journal = match Connection::open_with_flags(
+                &from,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ) {
+                Ok(conn) => conn,
+                Err(error) => {
+                    reports.push(OperationLogMigration {
+                        journal: name.into(),
+                        status: "skipped".into(),
+                        message: format!("无法打开，未迁移：{error}"),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+            };
+            if let Err(error) = journal_is_supported(&source_journal, &tables) {
+                reports.push(OperationLogMigration {
+                    journal: name.into(),
+                    status: "skipped".into(),
+                    message: format!("{error}，未迁移"),
+                    ..Default::default()
+                });
+                continue;
+            }
+            if journal_binding(&source_journal).as_deref() != Some(source_binding.as_str()) {
+                reports.push(OperationLogMigration {
+                    journal: name.into(),
+                    status: "skipped".into(),
+                    message: "日志不属于当前图库（binding 不一致），未迁移".into(),
+                    ..Default::default()
+                });
+                continue;
+            }
+            drop(source_journal);
+            let to = stage.join("operations").join(name);
+            if let Err(error) = snapshot_operation_journal(&from, &to) {
+                reports.push(OperationLogMigration {
+                    journal: name.into(),
+                    status: "skipped".into(),
+                    message: format!("{error}，未迁移"),
+                    ..Default::default()
+                });
+                continue;
+            }
+            copied_journals.push(name);
+        }
+    }
+
+    remap_database_paths(&stage.join("illutag.sqlite"), &mappings)?;
+
     let mut files = 0;
     let mut bytes = 0;
     for item in WalkDir::new(&stage) {
@@ -584,7 +1158,57 @@ pub fn prepare_data_directory_migration(
         fs::rename(item.path(), target.join(item.file_name())).map_err(|e| e.to_string())?;
     }
     fs::remove_dir(stage).map_err(|e| e.to_string())?;
+
+    // Record repair runs after the switch so file identity/signature values in
+    // the journals match the files at their final paths.
+    let migrated_db = Connection::open_with_flags(
+        &target.join("illutag.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| format!("打开迁移后主库失败：{error}"))?;
+    for name in &copied_journals {
+        let path = target.join("operations").join(name);
+        let result = if *name == "recycle-management.sqlite" {
+            migrate_recycle_journal(&path, &migrated_db)
+        } else {
+            migrate_duplicate_journal(&path, &migrated_db, &mappings)
+        };
+        match result {
+            Ok(report) => reports.push(report),
+            Err(error) => reports.push(OperationLogMigration {
+                journal: (*name).into(),
+                status: "skipped".into(),
+                message: format!("记录修复失败，未迁移：{error}"),
+                ..Default::default()
+            }),
+        }
+    }
+    drop(migrated_db);
+
+    // Rebind the copied journals to the final database identity only after the
+    // files have reached their final path.
+    let target_binding = crate::duplicates::cache::db_binding_for(&target.join("illutag.sqlite"))?;
+    let warnings = rebind_operation_journals(&target, &target_binding)?;
+    if !warnings.is_empty() {
+        reports.push(OperationLogMigration {
+            journal: "operations".into(),
+            status: "partial".into(),
+            unresolved: warnings
+                .into_iter()
+                .map(|reason| OperationLogIssue {
+                    kind: "binding".into(),
+                    operation: String::new(),
+                    image_pk: None,
+                    image_id: None,
+                    reason,
+                })
+                .collect(),
+            message: "部分日志未能重绑，需要重新清理旧撤销记录".into(),
+            ..Default::default()
+        });
+    }
+
     guard.keep = true;
     crate::duplicates::invalidate(state);
-    Ok((files, bytes))
+    Ok((files, bytes, reports))
 }
