@@ -117,6 +117,19 @@ it("旧进度与迟到列表不能盖住新状态，重试只传任务ID", async
   expect(state.rows.value.some((j) => j.id === "job")).toBe(false);
   wrapper.unmount();
 });
+it("终态等待保存时执行耗时按完成时刻冻结，不随等待增长", () => {
+  const pendingSave = job("running");
+  pendingSave.meta!.startedAt = 1000;
+  pendingSave.meta!.finishedAt = 62000;
+  expect(durationLabel(pendingSave, 62_000)).toBe("1分1秒");
+  expect(durationLabel(pendingSave, 90_000)).toBe("1分1秒");
+  expect(durationLabel(pendingSave, 900_000)).toBe("1分1秒");
+  const active = job("running");
+  delete active.meta!.finishedAt;
+  expect(durationLabel(active, 90_000)).not.toBe(
+    durationLabel(active, 900_000),
+  );
+});
 it("任务中心显示暂停确认与等待原因，按钮采用后端能力", async () => {
   const row = job("pausing");
   row.meta!.canPause = false;

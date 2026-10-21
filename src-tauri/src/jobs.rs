@@ -435,6 +435,9 @@ fn dispatch(state: AppState, app: AppHandle) {
                 "completed"
             };
             state.jobs.defer_terminal_locked(&id, outcome).unwrap();
+            if let Ok(record) = state.jobs.find(&id) {
+                let _ = app.emit("jobs:changed", &record);
+            }
         }
         let saved = retry_terminal_save(&id, &state, &app).is_ok();
         if ["duplicates", "duplicateManagement", "duplicateUndo"]

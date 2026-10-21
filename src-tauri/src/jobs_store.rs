@@ -9,6 +9,9 @@ pub(super) struct PendingTerminal {
     id: String,
     outcome: String,
     stage: String,
+    /// Time the work actually ended. Deferred persistence must not include the
+    /// waiting time between completion and a successful terminal save.
+    finished_at: i64,
 }
 
 pub(super) fn terminal(state: &str) -> bool {
@@ -365,15 +368,28 @@ impl JobRuntime {
 
     pub(super) fn defer_terminal_locked(&self, id: &str, outcome: &str) -> Result<(), String> {
         let record = self.find(id)?;
-        let mut pending = self.pending_terminal.lock().map_err(|e| e.to_string())?;
-        if pending.is_some() {
-            return Err("已有待保存的任务结果".into());
+        let finished_at = timestamp();
+        {
+            let mut pending = self.pending_terminal.lock().map_err(|e| e.to_string())?;
+            if pending.is_some() {
+                return Err("已有待保存的任务结果".into());
+            }
+            *pending = Some(PendingTerminal {
+                id: id.into(),
+                outcome: outcome.into(),
+                stage: record.stage,
+                finished_at,
+            });
         }
-        *pending = Some(PendingTerminal {
-            id: id.into(),
-            outcome: outcome.into(),
-            stage: record.stage,
-        });
+        // Freeze the visible duration immediately; persistence may be deferred.
+        let mut records = self.records.lock().map_err(|e| e.to_string())?;
+        if let Some(record) = records.iter_mut().find(|record| record.id == id) {
+            let previous = record.clone();
+            if let Some(meta) = record.meta.as_mut() {
+                meta.finished_at = Some(finished_at);
+            }
+            advance(record, Some(&previous));
+        }
         Ok(())
     }
 
@@ -408,6 +424,11 @@ impl JobRuntime {
                 record.stage = pending.stage;
                 if let Some(meta) = record.meta.as_mut() {
                     meta.persistence_error = None;
+                    meta.finished_at = Some(
+                        pending
+                            .finished_at
+                            .max(meta.started_at.unwrap_or(pending.finished_at)),
+                    );
                 }
             },
             Some(Duration::from_millis(250)),

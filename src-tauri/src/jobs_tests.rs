@@ -501,6 +501,27 @@ fn terminal_write_lock_failure_keeps_the_queue_and_retry_saves_without_reexecuti
             .defer_terminal_locked("finished", "completed")
             .unwrap();
     }
+    let deferred_at = f
+        .state
+        .jobs
+        .find("finished")
+        .unwrap()
+        .meta
+        .unwrap()
+        .finished_at
+        .expect("completion time must be frozen before the terminal save");
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    assert_eq!(
+        f.state
+            .jobs
+            .find("finished")
+            .unwrap()
+            .meta
+            .unwrap()
+            .finished_at,
+        Some(deferred_at),
+        "waiting for persistence must not keep advancing the duration"
+    );
     // A real independent SQLite writer prevents the terminal UPDATE/INSERT.
     let writer = database(&f.state).unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -568,6 +589,12 @@ fn terminal_write_lock_failure_keeps_the_queue_and_retry_saves_without_reexecuti
         "saving must not repeat the completed work"
     );
     assert!(saved.meta.as_ref().unwrap().persistence_error.is_none());
+    assert_eq!(
+        saved.meta.as_ref().unwrap().finished_at,
+        Some(deferred_at),
+        "the saved history must keep the real completion time"
+    );
+    assert!(saved.updated_at > deferred_at, "save time is separate");
     assert!(saved.meta.as_ref().unwrap().revision > meta.revision);
     assert!(f.state.jobs.pending_id().is_none());
     assert_eq!(
