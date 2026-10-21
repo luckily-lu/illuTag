@@ -14,7 +14,7 @@ pub(super) fn initialize(c: &Connection, force: bool) -> Result<(), String> {
     }
     Ok(())
 }
-fn version(sig: &[u8], sha: &[u8]) -> Vec<u8> {
+pub(super) fn version(sig: &[u8], sha: &[u8]) -> Vec<u8> {
     let mut h = Sha256::new();
     h.update(POLICY);
     h.update(sig);

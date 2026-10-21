@@ -803,6 +803,9 @@ pub(super) fn run(
     if let Err(error)=super::super::cascade_gc::retire_legacy(&c,g,state,control){
         eprintln!("[duplicate-legacy-cache-retirement] {error}");
     }
+    if let Err(error) = super::super::cascade_gc::retire_stale_cascade(&c, g, state, control) {
+        eprintln!("[duplicate-stale-cascade-retirement] {error}");
+    }
     for (table, key) in [
         ("cascade_aliases", "generation"),
         ("cascade_pairs", "generation"),
