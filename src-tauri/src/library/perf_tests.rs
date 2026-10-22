@@ -1151,6 +1151,13 @@ fn perf_truth_rejects_keeper_or_protected_in_full_plan() {
     assert!(!plan_target_violations(&members, 1, &protected, &[1, 3, 4]).is_empty());
     assert!(!plan_target_violations(&members, 1, &protected, &[3, 4, 4]).is_empty());
     assert!(!plan_target_violations(&members, 1, &protected, &[3]).is_empty());
+
+    // A wrong target beyond the UI's six-item preview must still be caught.
+    let large: HashSet<i64> = (1..=8).collect();
+    let seven_ok = [2, 3, 4, 5, 6, 7, 8];
+    assert!(plan_target_violations(&large, 1, &HashSet::new(), &seven_ok).is_empty());
+    let seventh_wrong = [2, 3, 4, 5, 6, 7, 9];
+    assert!(!plan_target_violations(&large, 1, &HashSet::new(), &seventh_wrong).is_empty());
 }
 
 #[test]
