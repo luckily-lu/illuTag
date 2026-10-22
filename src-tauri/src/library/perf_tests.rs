@@ -6,9 +6,12 @@ use crate::duplicates::{
     index::{self, IndexRecord, Threshold},
     workflow, DuplicateOptions,
 };
-use image::{Rgb, RgbImage};
+use image::{
+    codecs::jpeg::JpegEncoder, ExtendedColorType, ImageEncoder, Rgb, RgbImage,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::time::Instant;
 
@@ -18,16 +21,18 @@ fn run_root() -> PathBuf {
     let raw = env::var_os("ILLUTAG_PERF_RUN_DIR")
         .map(PathBuf::from)
         .expect("ILLUTAG_PERF_RUN_DIR must point at an isolated perf run directory");
-    fs::create_dir_all(&raw).unwrap();
+    assert!(raw.exists(), "perf run directory must already exist");
     let root = fs::canonicalize(&raw).unwrap();
     let display = root.to_string_lossy();
     let normalized = Path::new(display.strip_prefix(r"\\?\").unwrap_or(&display));
     let allowed = Path::new(PERF_ROOT);
+    let relative = normalized
+        .strip_prefix(allowed)
+        .expect("perf data must stay under the isolated perf root");
     assert!(
-        normalized.starts_with(allowed),
-        "perf data must stay under {}: {}",
-        allowed.display(),
-        normalized.display()
+        !relative.as_os_str().is_empty(),
+        "perf data must be a child of {}, not the root itself",
+        allowed.display()
     );
     assert!(
         !normalized
@@ -37,9 +42,48 @@ fn run_root() -> PathBuf {
         "refusing to use a real library path: {}",
         normalized.display()
     );
-    fs::write(root.join(".perf-isolated"), b"illuTag synthetic perf run\n").unwrap();
+    assert_no_reparse(&root);
+    let marker = root.join(".perf-isolated");
+    assert!(
+        marker.is_file(),
+        "runner must create the ownership marker before the test starts"
+    );
     fs::write(root.join("test.pid"), std::process::id().to_string()).unwrap();
     root
+}
+
+#[cfg(windows)]
+fn assert_no_reparse(path: &Path) {
+    use std::os::windows::fs::MetadataExt;
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if candidate.exists() {
+            let metadata = fs::symlink_metadata(candidate).unwrap();
+            assert_eq!(
+                metadata.file_attributes() & 0x400,
+                0,
+                "perf path must not contain a reparse point: {}",
+                candidate.display()
+            );
+        }
+        current = candidate.parent();
+    }
+}
+
+#[cfg(not(windows))]
+fn assert_no_reparse(_path: &Path) {}
+
+fn stop_requested() -> bool {
+    env::var_os("ILLUTAG_PERF_STOP_FILE")
+        .map(PathBuf::from)
+        .map(|path| path.exists())
+        .unwrap_or(false)
+}
+
+fn check_stop() {
+    if stop_requested() {
+        panic!("perf stop requested by runner");
+    }
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -81,6 +125,18 @@ fn digest_file(path: &Path) -> String {
         .collect()
 }
 
+fn save_jpeg(path: &Path, image: &RgbImage, quality: u8) {
+    let mut file = fs::File::create(path).unwrap();
+    JpegEncoder::new_with_quality(&mut file, quality)
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+}
+
 fn near(seed: u64, width: u32, height: u32) -> NearFingerprint {
     let mut color = [0u8; 48];
     for (index, byte) in color.iter_mut().enumerate() {
@@ -97,10 +153,11 @@ fn near(seed: u64, width: u32, height: u32) -> NearFingerprint {
 }
 
 fn record(index: usize, sha: [u8; 32], near: NearFingerprint) -> IndexRecord {
+    let file_size = 1_000_000 + u64::from_le_bytes(sha[..8].try_into().unwrap()) % 7_000_000;
     IndexRecord {
         image_pk: index as i64 + 1,
         image_order: index as u32,
-        file_size: 1_000_000 + (index as u64 % 7_000_000),
+        file_size,
         width: near.width,
         height: near.height,
         sha256: sha,
@@ -114,26 +171,35 @@ fn numeric_records(count: usize) -> Vec<IndexRecord> {
         let family = index / 100;
         let slot = index % 100;
         let base = mix(family as u64);
-        let (sha, features) = if slot < 90 {
+        let base_sha = Sha256::digest(format!("unique-{family}").as_bytes()).into();
+        let base_near = near(base, 1600, 1200);
+        let (sha, features) = if slot == 0 {
+            (base_sha, base_near)
+        } else if slot < 90 {
+            // 90% independent base contents. Each derived family member is a
+            // different SHA/native fingerprint, not 93 identical rows.
             (
-                Sha256::digest(format!("unique-{family}").as_bytes()).into(),
-                near(base, 1600, 1200),
+                Sha256::digest(format!("unique-{family}-{slot}").as_bytes()).into(),
+                near(mix(base ^ (slot as u64).wrapping_mul(0x9e37_79b9)), 1600, 1200),
             )
         } else if slot < 93 {
-            (
-                Sha256::digest(format!("unique-{family}").as_bytes()).into(),
-                near(base, 1600, 1200),
-            )
+            (base_sha, base_near)
         } else if slot < 97 {
-            let mut features = near(base, 1600, 1200);
+            let mut features = base_near;
             features.phash ^= 1 << (slot % 63);
             features.dhash ^= 1 << ((slot + 7) % 63);
-            (Sha256::digest(format!("near-{index}").as_bytes()).into(), features)
+            (
+                Sha256::digest(format!("near-{family}-{slot}").as_bytes()).into(),
+                features,
+            )
         } else {
-            let mut features = near(base, 1600, 1200);
+            let mut features = base_near;
             features.phash = mix(features.phash ^ slot as u64);
             features.dhash = mix(features.dhash ^ slot as u64);
-            (Sha256::digest(format!("local-{index}").as_bytes()).into(), features)
+            (
+                Sha256::digest(format!("local-{family}-{slot}").as_bytes()).into(),
+                features,
+            )
         };
         records.push(record(index, sha, features));
     }
@@ -143,10 +209,24 @@ fn numeric_records(count: usize) -> Vec<IndexRecord> {
 #[test]
 #[ignore = "opt-in synthetic numeric index scale; no images or production database"]
 fn perf_m_numeric_scale() {
+    if env::var_os("ILLUTAG_PERF_FORCE_FAIL").is_some() {
+        panic!("synthetic failure requested by runner");
+    }
+    if env::var_os("ILLUTAG_PERF_FORCE_CRASH").is_some() {
+        std::process::abort();
+    }
     let root = run_root();
     let count = env_usize("ILLUTAG_PERF_N", 100_000);
     let started = Instant::now();
     let records = numeric_records(count);
+    let mut hashes = HashSet::new();
+    let mut near = HashSet::new();
+    for record in &records {
+        hashes.insert(record.sha256);
+        if let Some(features) = &record.near {
+            near.insert(features.clone());
+        }
+    }
     let build_started = Instant::now();
     let mut groups = 0u64;
     let mut members = 0u64;
@@ -173,11 +253,18 @@ fn perf_m_numeric_scale() {
         "elapsed_ms": started.elapsed().as_millis(),
         "build_ms": build_ms,
         "index_estimate_bytes": index::estimate_memory_bytes(count),
+        "distinct_sha": hashes.len(),
+        "distinct_near_fingerprint": near.len(),
+        "expected_independent": count * 90 / 100,
+        "expected_exact_derived": count * 3 / 100,
+        "expected_near_derived": count * 4 / 100,
+        "expected_local_derived": count * 3 / 100,
         "groups": groups,
         "members": members,
         "pair_callbacks": compared,
         "too_dense": summary.too_dense_references.len(),
         "low_information": summary.low_information_skipped,
+        "truth_scope": "index-callback synthesis only; M1 offline query truth is not implemented",
     });
     write_json(&root, &format!("m-numeric-{count}.json"), &result);
     println!("PERF_RESULT={}", serde_json::to_string(&result).unwrap());
@@ -188,6 +275,7 @@ fn perf_m_numeric_scale() {
 fn perf_m_sql_paging() {
     let root = run_root();
     let count = env_usize("ILLUTAG_PERF_N", 1_000_000);
+    assert!(count > 0, "M-SQL row count must be positive");
     let db_path = root.join(format!("m-sql-{count}.sqlite"));
     if db_path.exists() {
         fs::remove_file(&db_path).unwrap();
@@ -212,6 +300,9 @@ fn perf_m_sql_paging() {
                 )
                 .unwrap();
             for index in 0..count {
+                if index % 4096 == 0 {
+                    check_stop();
+                }
                 let id = format!("img-{index:08}");
                 let path = format!("{}\\{id}.png", folder.to_string_lossy());
                 insert
@@ -230,6 +321,7 @@ fn perf_m_sql_paging() {
     let state = AppState::new(db_path.clone(), root.clone(), None, None);
     let mut durations = Vec::with_capacity(1000);
     for query_index in 0..1000 {
+        check_stop();
         let offset = (mix(query_index) as usize % count) as i64;
         let started = Instant::now();
         let page = query_gallery(
@@ -267,12 +359,14 @@ struct PerfLibrary {
 
 fn perf_library(root: &Path, label: &str) -> PerfLibrary {
     let data = root.join(label);
+    assert!(
+        !data.exists(),
+        "cold perf run must use a fresh library directory: {}",
+        data.display()
+    );
     let assets = data.join("assets");
     fs::create_dir_all(&assets).unwrap();
     let db = data.join("illutag.sqlite");
-    if db.exists() {
-        fs::remove_file(&db).unwrap();
-    }
     let conn = Connection::open(&db).unwrap();
     conn.execute_batch(compact::SCHEMA).unwrap();
     conn.execute_batch(compact::INDEXES).unwrap();
@@ -348,6 +442,9 @@ fn generate_mixed(
         let _ = size;
     };
     for index in 0..unique {
+        if index % 64 == 0 {
+            check_stop();
+        }
         let image = base_image(index as u64, width, height);
         let path = root.join(format!("unique-{index:06}.png"));
         image.save(&path).unwrap();
@@ -355,19 +452,22 @@ fn generate_mixed(
         push(path, index as u64, "independent");
     }
     for index in 0..exact {
+        check_stop();
         let family = index % unique_paths.len();
         let path = root.join(format!("exact-{index:06}.png"));
         fs::copy(&unique_paths[family], &path).unwrap();
         push(path, family as u64, "exact");
     }
     for index in 0..recompressed {
+        check_stop();
         let family = index % unique_paths.len();
-        let image = image::open(&unique_paths[family]).unwrap();
+        let image = image::open(&unique_paths[family]).unwrap().to_rgb8();
         let path = root.join(format!("recompress-{index:06}.jpg"));
-        image.save(&path).unwrap();
+        save_jpeg(&path, &image, 95);
         push(path, family as u64, "near");
     }
     for index in 0..local {
+        check_stop();
         let family = index % unique_paths.len();
         let mut image = base_image(family as u64, width, height);
         for y in 0..(height / 12).max(1) {
@@ -396,7 +496,13 @@ fn generate_mixed(
 
 fn run_production(state: &AppState) -> Result<Vec<String>, String> {
     let mut stages = Vec::new();
-    let mut control = || Ok(());
+    let mut control = || {
+        if stop_requested() {
+            Err("perf stop requested by runner".to_string())
+        } else {
+            Ok(())
+        }
+    };
     workflow::run_job(
         DuplicateOptions {
             sensitivity: "standard".into(),
@@ -447,7 +553,139 @@ fn cascade_counts(state: &AppState) -> Value {
         "kinds": kinds,
         "unique_images": status.unique_images,
         "exact_groups": status.exact_groups,
-        "near_groups": status.near_groups,
+        "reported_non_exact_groups": status.near_groups,
+    })
+}
+
+fn read_manifest(assets: &Path) -> Vec<(String, u64, String)> {
+    fs::read_to_string(assets.join("manifest.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let value: Value = serde_json::from_str(line).unwrap();
+            (
+                value["path"].as_str().unwrap().to_string(),
+                value["family_id"].as_u64().unwrap(),
+                value["expected_relation"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn relation_matches(expected: &str, actual: &str) -> bool {
+    match expected {
+        "independent" => true,
+        "exact" => actual == "exact",
+        "near" => actual == "near",
+        "similar" => actual == "similar",
+        _ => false,
+    }
+}
+
+fn validation_ok(mismatch_count: usize, phase: i64, generation: &str) -> bool {
+    mismatch_count == 0 && phase == 4 && !generation.is_empty()
+}
+
+fn validate_relations(state: &AppState, assets: &Path) -> Value {
+    let rows = read_manifest(assets);
+    let db = open_database(&state.database_path).unwrap();
+    let mut path_to_pk = HashMap::<String, i64>::new();
+    {
+        let mut stmt = db
+            .prepare("SELECT image_pk,path FROM images")
+            .unwrap();
+        for row in stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+        {
+            let (pk, path) = row.unwrap();
+            path_to_pk.insert(path, pk);
+        }
+    }
+    let status = cache::status(state).unwrap();
+    let generation = status.generation.clone().unwrap_or_default();
+    let cache_conn = cache::open_existing(state, false).unwrap();
+    let mut pairs = HashMap::<(i64, i64), String>::new();
+    {
+        let mut stmt = cache_conn
+            .prepare("SELECT a,b,kind FROM cascade_pairs WHERE generation=?1")
+            .unwrap();
+        for row in stmt
+            .query_map([&generation], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+        {
+            let (a, b, kind) = row.unwrap();
+            pairs.insert((a.min(b), a.max(b)), kind);
+        }
+    }
+    let mut family_members = HashMap::<u64, Vec<i64>>::new();
+    for (path, family, _) in &rows {
+        if let Some(pk) = path_to_pk.get(path) {
+            family_members.entry(*family).or_default().push(*pk);
+        }
+    }
+    let mut expected_counts = HashMap::<String, u64>::new();
+    let mut actual_counts = HashMap::<String, u64>::new();
+    let mut mismatches = Vec::<Value>::new();
+    for (path, family, expected) in &rows {
+        *expected_counts.entry(expected.clone()).or_insert(0) += 1;
+        let Some(pk) = path_to_pk.get(path).copied() else {
+            mismatches.push(json!({"path": path, "expected": expected, "actual": "image_missing"}));
+            continue;
+        };
+        let Some(members) = family_members.get(family) else {
+            mismatches.push(json!({"path": path, "expected": expected, "actual": "family_base_missing"}));
+            continue;
+        };
+        let actual = members
+            .iter()
+            .filter(|other| **other != pk)
+            .filter_map(|other| {
+                pairs
+                    .get(&(pk.min(*other), pk.max(*other)))
+                    .map(|kind| (kind.as_str(), *other))
+            })
+            .max_by_key(|(kind, _)| match *kind {
+                "exact" => 3,
+                "near" => 2,
+                "similar" => 1,
+                _ => 0,
+            })
+            .map(|(kind, _)| kind.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        *actual_counts.entry(actual.clone()).or_insert(0) += 1;
+        if !relation_matches(expected, &actual) {
+            mismatches.push(json!({
+                "path": path,
+                "family_id": family,
+                "expected": expected,
+                "actual": actual,
+            }));
+        }
+    }
+    let phase: i64 = cache_conn
+        .query_row(
+            "SELECT phase FROM cascade_runs WHERE generation=?1",
+            [&generation],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    json!({
+        "passed": validation_ok(mismatches.len(), phase, &generation),
+        "generation": generation,
+        "phase": phase,
+        "expected_counts": expected_counts,
+        "actual_pair_counts": actual_counts,
+        "mismatch_count": mismatches.len(),
+        "mismatches": mismatches,
     })
 }
 
@@ -462,6 +700,7 @@ fn perf_h_scan_cascade() {
     let library = perf_library(&root, &format!("h-{count}-{width}x{height}"));
     let (paths, manifest) = generate_mixed(&library.assets, count, width, height);
     let generation_ms = generation_started.elapsed().as_millis();
+    check_stop();
     let scan_started = Instant::now();
     let scanned = scan_all_folders_and_collect_new_images(
         &library.state.database_path,
@@ -475,15 +714,12 @@ fn perf_h_scan_cascade() {
     .unwrap();
     let scan_ms = scan_started.elapsed().as_millis();
     assert!(scanned.tag_queue_images.is_empty());
+    check_stop();
     let workflow_started = Instant::now();
     let stages = run_production(&library.state).unwrap();
     let workflow_ms = workflow_started.elapsed().as_millis();
     let counts = cascade_counts(&library.state);
-    let expected_exact = manifest["exact"].as_u64().unwrap_or(0);
-    let expected_near = manifest["recompressed"].as_u64().unwrap_or(0)
-        + manifest["local"].as_u64().unwrap_or(0);
-    let actual_exact = counts["exact_groups"].as_u64().unwrap_or(0);
-    let actual_near = counts["near_groups"].as_u64().unwrap_or(0);
+    let validation = validate_relations(&library.state, &library.assets);
     let db = open_database(&library.state.database_path).unwrap();
     let input_images: i64 = db
         .query_row("SELECT COUNT(*) FROM images", [], |row| row.get(0))
@@ -499,18 +735,16 @@ fn perf_h_scan_cascade() {
         "total_ms": generation_started.elapsed().as_millis(),
         "stages": stages,
         "result": counts,
-        "correctness": {
-            "expected_exact_groups": expected_exact,
-            "actual_exact_groups": actual_exact,
-            "exact_groups_match": expected_exact == actual_exact,
-            "expected_near_or_similar_groups": expected_near,
-            "actual_near_groups": actual_near,
-            "near_group_delta": actual_near as i64 - expected_near as i64,
-        },
+        "correctness": validation,
         "run_dir": library.root,
     });
     write_json(&root, &format!("h-{count}.json"), &result);
     println!("PERF_RESULT={}", serde_json::to_string(&result).unwrap());
+    assert!(
+        validation["passed"].as_bool().unwrap_or(false),
+        "per-image truth mismatch: {}",
+        validation["mismatches"]
+    );
 }
 
 #[test]
@@ -522,15 +756,30 @@ fn perf_x_dense() {
     let height = env_usize("ILLUTAG_PERF_HEIGHT", 480) as u32;
     let library = perf_library(&root, &format!("x-dense-{count}"));
     let base = base_image(7, width, height);
+    let mut digests = HashSet::with_capacity(count);
     for index in 0..count {
+        check_stop();
         let mut image = base.clone();
+        let color = [
+            (index & 0xff) as u8,
+            ((index >> 8) & 0xff) as u8,
+            90,
+        ];
         for y in 0..(height / 16).max(1) {
             for x in 0..(width / 16).max(1) {
-                image.put_pixel(x, y, Rgb([index as u8, 255 - index as u8, 90]));
+                image.put_pixel(x, y, Rgb(color));
             }
         }
-        image.save(library.assets.join(format!("dense-{index:05}.png"))).unwrap();
+        let path = library.assets.join(format!("dense-{index:05}.png"));
+        image.save(&path).unwrap();
+        digests.insert(digest_file(&path));
     }
+    assert_eq!(
+        digests.len(),
+        count,
+        "dense X2 samples must contain one distinct encoded file per variant"
+    );
+    check_stop();
     let started = Instant::now();
     scan_all_folders_and_collect_new_images(
         &library.state.database_path,
@@ -543,11 +792,13 @@ fn perf_x_dense() {
     )
     .unwrap();
     let scan_ms = started.elapsed().as_millis();
+    check_stop();
     let workflow_started = Instant::now();
     let stages = run_production(&library.state).unwrap();
     let result = json!({
         "layer": "X-dense",
         "count": count,
+        "distinct_files": digests.len(),
         "width": width,
         "height": height,
         "scan_ms": scan_ms,
@@ -593,6 +844,24 @@ fn boundary_probe(name: &str, width: u32, height: u32, pixels: u64) {
 }
 
 #[test]
+fn perf_truth_rejects_near_misclassified_as_similar() {
+    assert!(!relation_matches("near", "similar"));
+    assert!(!relation_matches("similar", "near"));
+    assert!(!relation_matches("exact", "near"));
+    assert!(relation_matches("near", "near"));
+    assert!(relation_matches("similar", "similar"));
+    assert!(relation_matches("exact", "exact"));
+}
+
+#[test]
+fn perf_truth_rejects_unpublished_or_missing_generation() {
+    assert!(!validation_ok(0, 3, "generation"));
+    assert!(!validation_ok(0, 4, ""));
+    assert!(!validation_ok(1, 4, "generation"));
+    assert!(validation_ok(0, 4, "generation"));
+}
+
+#[test]
 #[ignore = "opt-in high-resolution decode-limit probe; one synthetic image"]
 fn perf_boundary_16mp() {
     let root = run_root();
@@ -611,28 +880,5 @@ fn perf_boundary_16mp() {
         "file_bytes": fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
     });
     write_json(&root, "boundary-16mp.json", &result);
-    println!("PERF_RESULT={}", serde_json::to_string(&result).unwrap());
-}
-
-#[test]
-#[ignore = "opt-in 64MiB native decode boundary for the current three-round path"]
-fn perf_boundary_native_64mib() {
-    let root = run_root();
-    // 4096x4096 RGB8 is exactly 50,331,648 decoded bytes (under 64MiB) but
-    // exceeds the current 16,777,216-pixel limit, so it must be rejected.
-    let path = root.join("native-4096.png");
-    base_image(13, 4096, 4096).save(&path).unwrap();
-    // The production native entry is private to the duplicates module; use the
-    // public fingerprint boundary here and record that native coverage is
-    // reported separately by the cascade-level harness.
-    let result = json!({
-        "layer": "boundary-native",
-        "path": path,
-        "pixels": 4096u64 * 4096u64,
-        "decoded_rgb8_bytes": 4096u64 * 4096u64 * 3,
-        "native_pixel_limit": 16_777_216u64,
-        "note": "native decode path is covered by cascade boundary tests",
-    });
-    write_json(&root, "boundary-native.json", &result);
     println!("PERF_RESULT={}", serde_json::to_string(&result).unwrap());
 }

@@ -5,7 +5,7 @@ use image::{
         jpeg::JpegEncoder,
         png::{CompressionType, FilterType as PngFilter, PngEncoder},
     },
-    DynamicImage, ImageEncoder, Rgb, RgbImage,
+    DynamicImage, ExtendedColorType, ImageEncoder, Rgb, RgbImage,
 };
 use rusqlite::params;
 use std::{cell::RefCell, fs, fs::File};
@@ -715,6 +715,129 @@ fn benchmark_production_cascade_resume() {
     let path = out.join(format!("production-resume-{}.json", std::process::id()));
     fs::write(&path, serde_json::to_string_pretty(&result).unwrap()).unwrap();
     println!("BENCH_RESULT={}", path.display());
+}
+
+#[test]
+#[ignore = "opt-in native pixel/byte boundary; synthetic high-resolution images only"]
+fn perf_boundary_native_limits() {
+    let root = std::env::var_os("ILLUTAG_PERF_RUN_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("ILLUTAG_PERF_RUN_DIR");
+    let dir = root.join("native-boundary");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(root.join("test.pid"), std::process::id().to_string()).unwrap();
+    let image = RgbImage::from_fn(4096, 4096, |x, y| {
+        Rgb([
+            ((x * 3 + y * 5) % 256) as u8,
+            ((x * 7 + y * 11) % 256) as u8,
+            ((x * 13 + y * 17) % 256) as u8,
+        ])
+    });
+    let fast = dir.join("equal-fast.png");
+    let best = dir.join("equal-best.png");
+    let mut file = std::fs::File::create(&fast).unwrap();
+    PngEncoder::new_with_quality(&mut file, CompressionType::Fast, PngFilter::NoFilter)
+        .write_image(image.as_raw(), 4096, 4096, ExtendedColorType::Rgb8)
+        .unwrap();
+    drop(file);
+    let mut file = std::fs::File::create(&best).unwrap();
+    PngEncoder::new_with_quality(&mut file, CompressionType::Best, PngFilter::Adaptive)
+        .write_image(image.as_raw(), 4096, 4096, ExtendedColorType::Rgb8)
+        .unwrap();
+    drop(file);
+    let equal = super::cascade_pixels::verify(&fast, &best, &mut || Ok(())).unwrap();
+    assert_eq!(equal.kind, "exact", "same native pixels must pass");
+
+    let over = dir.join("over-pixel.png");
+    RgbImage::from_fn(4097, 4096, |x, y| {
+        Rgb([(x % 256) as u8, (y % 256) as u8, 40])
+    })
+    .save(&over)
+    .unwrap();
+    let over_result = super::cascade_pixels::verify(&fast, &over, &mut || Ok(())).unwrap();
+    assert_eq!(over_result.kind, "uncertain");
+    assert!(
+        over_result.reason.contains("pixel") || over_result.reason.contains("memory"),
+        "unexpected over-pixel reason: {}",
+        over_result.reason
+    );
+
+    let rgba16 = dir.join("rgba16-4096.png");
+    let image16: image::ImageBuffer<image::Rgba<u16>, Vec<u16>> =
+        image::ImageBuffer::from_fn(4096, 4096, |x, y| {
+            image::Rgba([(x % 65536) as u16, (y % 65536) as u16, 7, 65535])
+        });
+    image16.save(&rgba16).unwrap();
+    let bytes_result = super::cascade_pixels::verify(&fast, &rgba16, &mut || Ok(())).unwrap();
+    assert_eq!(bytes_result.kind, "uncertain");
+    assert!(
+        bytes_result.reason.contains("pixel") || bytes_result.reason.contains("memory"),
+        "unexpected byte-limit reason: {}",
+        bytes_result.reason
+    );
+
+    let rgba8 = dir.join("rgba8-4096.png");
+    image::RgbaImage::from_fn(4096, 4096, |x, y| {
+        image::Rgba([(x % 256) as u8, (y % 256) as u8, 9, 255])
+    })
+    .save(&rgba8)
+    .unwrap();
+    let rgba8_result = super::cascade_pixels::verify(&fast, &rgba8, &mut || Ok(())).unwrap();
+    // 4096x4096 RGBA8 is exactly 64MiB decoded: the byte limit is `>`, so this
+    // remains decodable and is classified by pixels (these differ from `fast`).
+    assert_eq!(rgba8_result.kind, "similar");
+
+
+    let rgb16 = dir.join("rgb16-4096.png");
+    let rgb16_image: image::ImageBuffer<image::Rgb<u16>, Vec<u16>> =
+        image::ImageBuffer::from_fn(4096, 4096, |x, y| {
+            image::Rgb([(x % 65536) as u16, (y % 65536) as u16, 11])
+        });
+    rgb16_image.save(&rgb16).unwrap();
+    let rgb16_result = super::cascade_pixels::verify(&fast, &rgb16, &mut || Ok(())).unwrap();
+    assert_eq!(rgb16_result.kind, "uncertain");
+    assert!(rgb16_result.reason.contains("pixel") || rgb16_result.reason.contains("memory"));
+
+    // 2048x2048 RGBA16 is 33.5MiB decoded, below 64MiB, and must remain
+    // decodable (the same pixels are encoded twice with different compression).
+    let rgba16_low_a = dir.join("rgba16-2048-a.png");
+    let rgba16_low_b = dir.join("rgba16-2048-b.png");
+    let low_image: image::ImageBuffer<image::Rgba<u16>, Vec<u16>> =
+        image::ImageBuffer::from_fn(2048, 2048, |x, y| {
+            image::Rgba([(x % 65536) as u16, (y % 65536) as u16, 3, 65535])
+        });
+    let low_raw: Vec<u8> = low_image
+        .as_raw()
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let mut file = std::fs::File::create(&rgba16_low_a).unwrap();
+    PngEncoder::new_with_quality(&mut file, CompressionType::Fast, PngFilter::NoFilter)
+        .write_image(&low_raw, 2048, 2048, ExtendedColorType::Rgba16)
+        .unwrap();
+    drop(file);
+    let mut file = std::fs::File::create(&rgba16_low_b).unwrap();
+    PngEncoder::new_with_quality(&mut file, CompressionType::Best, PngFilter::Adaptive)
+        .write_image(&low_raw, 2048, 2048, ExtendedColorType::Rgba16)
+        .unwrap();
+    drop(file);
+    let low_result =
+        super::cascade_pixels::verify(&rgba16_low_a, &rgba16_low_b, &mut || Ok(())).unwrap();
+    assert_eq!(low_result.kind, "exact");
+
+    let result = serde_json::json!({
+        "layer": "native-boundary",
+        "equal_pixels": {"kind": equal.kind, "reason": equal.reason},
+        "over_pixel": {"kind": over_result.kind, "reason": over_result.reason},
+        "rgba8_4096": {"kind": rgba8_result.kind, "reason": rgba8_result.reason},
+        "rgb16_4096": {"kind": rgb16_result.kind, "reason": rgb16_result.reason},
+        "rgba16_4096": {"kind": bytes_result.kind, "reason": bytes_result.reason},
+        "rgba16_2048_equal": {"kind": low_result.kind, "reason": low_result.reason},
+        "equal_file_bytes": [fs::metadata(&fast).unwrap().len(), fs::metadata(&best).unwrap().len()],
+    });
+    let path = dir.join("result.json");
+    fs::write(&path, serde_json::to_string_pretty(&result).unwrap()).unwrap();
+    println!("PERF_RESULT={}", path.display());
 }
 
 #[test]
