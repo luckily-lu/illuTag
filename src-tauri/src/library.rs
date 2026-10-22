@@ -303,3 +303,6 @@ impl AppState {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "library/perf_tests.rs"]
+mod perf_tests;
