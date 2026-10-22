@@ -720,12 +720,8 @@ fn benchmark_production_cascade_resume() {
 #[test]
 #[ignore = "opt-in native pixel/byte boundary; synthetic high-resolution images only"]
 fn perf_boundary_native_limits() {
-    let root = std::env::var_os("ILLUTAG_PERF_RUN_DIR")
-        .map(std::path::PathBuf::from)
-        .expect("ILLUTAG_PERF_RUN_DIR");
-    let dir = root.join("native-boundary");
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(root.join("test.pid"), std::process::id().to_string()).unwrap();
+    let root = crate::perf_support::run_root();
+    let dir = crate::perf_support::cold_dir(&root, "native-boundary");
     let image = RgbImage::from_fn(4096, 4096, |x, y| {
         Rgb([
             ((x * 3 + y * 5) % 256) as u8,

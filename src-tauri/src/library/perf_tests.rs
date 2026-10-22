@@ -6,6 +6,7 @@ use crate::duplicates::{
     index::{self, IndexRecord, Threshold},
     workflow, DuplicateOptions,
 };
+use crate::perf_support::{cold_dir, run_root};
 use image::{
     codecs::jpeg::JpegEncoder, ExtendedColorType, ImageEncoder, Rgb, RgbImage,
 };
@@ -14,64 +15,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::time::Instant;
-
-const PERF_ROOT: &str = r"D:\Ai\illuTag-refactor-work\perf-million-hires";
-
-fn run_root() -> PathBuf {
-    let raw = env::var_os("ILLUTAG_PERF_RUN_DIR")
-        .map(PathBuf::from)
-        .expect("ILLUTAG_PERF_RUN_DIR must point at an isolated perf run directory");
-    assert!(raw.exists(), "perf run directory must already exist");
-    let root = fs::canonicalize(&raw).unwrap();
-    let display = root.to_string_lossy();
-    let normalized = Path::new(display.strip_prefix(r"\\?\").unwrap_or(&display));
-    let allowed = Path::new(PERF_ROOT);
-    let relative = normalized
-        .strip_prefix(allowed)
-        .expect("perf data must stay under the isolated perf root");
-    assert!(
-        !relative.as_os_str().is_empty(),
-        "perf data must be a child of {}, not the root itself",
-        allowed.display()
-    );
-    assert!(
-        !normalized
-            .to_string_lossy()
-            .to_lowercase()
-            .contains("danbooru"),
-        "refusing to use a real library path: {}",
-        normalized.display()
-    );
-    assert_no_reparse(&root);
-    let marker = root.join(".perf-isolated");
-    assert!(
-        marker.is_file(),
-        "runner must create the ownership marker before the test starts"
-    );
-    fs::write(root.join("test.pid"), std::process::id().to_string()).unwrap();
-    root
-}
-
-#[cfg(windows)]
-fn assert_no_reparse(path: &Path) {
-    use std::os::windows::fs::MetadataExt;
-    let mut current = Some(path);
-    while let Some(candidate) = current {
-        if candidate.exists() {
-            let metadata = fs::symlink_metadata(candidate).unwrap();
-            assert_eq!(
-                metadata.file_attributes() & 0x400,
-                0,
-                "perf path must not contain a reparse point: {}",
-                candidate.display()
-            );
-        }
-        current = candidate.parent();
-    }
-}
-
-#[cfg(not(windows))]
-fn assert_no_reparse(_path: &Path) {}
 
 fn stop_requested() -> bool {
     env::var_os("ILLUTAG_PERF_STOP_FILE")
@@ -358,12 +301,7 @@ struct PerfLibrary {
 }
 
 fn perf_library(root: &Path, label: &str) -> PerfLibrary {
-    let data = root.join(label);
-    assert!(
-        !data.exists(),
-        "cold perf run must use a fresh library directory: {}",
-        data.display()
-    );
+    let data = cold_dir(root, label);
     let assets = data.join("assets");
     fs::create_dir_all(&assets).unwrap();
     let db = data.join("illutag.sqlite");
@@ -433,6 +371,7 @@ fn generate_mixed(
                 "height": height,
                 "byte_digest": digest_file(&path),
                 "expected_relation": relation,
+                "jpeg_quality": (relation == "near").then_some(95u8),
                 "supported_scope": "synthetic-perf",
             }))
             .unwrap(),
@@ -586,6 +525,31 @@ fn validation_ok(mismatch_count: usize, phase: i64, generation: &str) -> bool {
     mismatch_count == 0 && phase == 4 && !generation.is_empty()
 }
 
+fn cross_family_violations(
+    pk_family: &HashMap<i64, u64>,
+    pairs: &HashMap<(i64, i64), String>,
+) -> Vec<Value> {
+    let mut violations = Vec::new();
+    for (&(a, b), kind) in pairs {
+        if kind != "exact" && kind != "near" {
+            continue;
+        }
+        let (Some(family_a), Some(family_b)) = (pk_family.get(&a), pk_family.get(&b)) else {
+            continue;
+        };
+        if family_a != family_b {
+            violations.push(json!({
+                "a": a,
+                "b": b,
+                "family_a": family_a,
+                "family_b": family_b,
+                "kind": kind,
+            }));
+        }
+    }
+    violations
+}
+
 fn validate_relations(state: &AppState, assets: &Path) -> Value {
     let rows = read_manifest(assets);
     let db = open_database(&state.database_path).unwrap();
@@ -627,11 +591,14 @@ fn validate_relations(state: &AppState, assets: &Path) -> Value {
         }
     }
     let mut family_members = HashMap::<u64, Vec<i64>>::new();
+    let mut pk_family = HashMap::<i64, u64>::new();
     for (path, family, _) in &rows {
         if let Some(pk) = path_to_pk.get(path) {
             family_members.entry(*family).or_default().push(*pk);
+            pk_family.insert(*pk, *family);
         }
     }
+    let cross_family = cross_family_violations(&pk_family, &pairs);
     let mut expected_counts = HashMap::<String, u64>::new();
     let mut actual_counts = HashMap::<String, u64>::new();
     let mut mismatches = Vec::<Value>::new();
@@ -671,6 +638,7 @@ fn validate_relations(state: &AppState, assets: &Path) -> Value {
             }));
         }
     }
+    mismatches.extend(cross_family.iter().cloned());
     let phase: i64 = cache_conn
         .query_row(
             "SELECT phase FROM cascade_runs WHERE generation=?1",
@@ -684,6 +652,8 @@ fn validate_relations(state: &AppState, assets: &Path) -> Value {
         "phase": phase,
         "expected_counts": expected_counts,
         "actual_pair_counts": actual_counts,
+        "cross_family_exact_near_violations": cross_family.len(),
+        "cross_family_violations": cross_family,
         "mismatch_count": mismatches.len(),
         "mismatches": mismatches,
     })
@@ -859,6 +829,31 @@ fn perf_truth_rejects_unpublished_or_missing_generation() {
     assert!(!validation_ok(0, 4, ""));
     assert!(!validation_ok(1, 4, "generation"));
     assert!(validation_ok(0, 4, "generation"));
+}
+
+#[test]
+fn perf_truth_rejects_cross_family_exact_or_near_edges() {
+    let mut families = HashMap::new();
+    for (pk, family) in [(1, 1), (2, 1), (3, 2), (4, 2), (5, 3)] {
+        families.insert(pk, family);
+    }
+    let mut pairs = HashMap::new();
+    pairs.insert((1, 2), "exact".to_string());
+    pairs.insert((1, 3), "similar".to_string());
+    assert!(cross_family_violations(&families, &pairs).is_empty());
+
+    pairs.insert((2, 3), "near".to_string());
+    assert_eq!(cross_family_violations(&families, &pairs).len(), 1);
+    pairs.remove(&(2, 3));
+    pairs.insert((1, 4), "exact".to_string());
+    assert_eq!(cross_family_violations(&families, &pairs).len(), 1);
+    pairs.insert((2, 5), "near".to_string());
+    assert_eq!(
+        cross_family_violations(&families, &pairs).len(),
+        2,
+        "correct same-family edges must not hide wrong cross-family edges"
+    );
+    assert!(!validation_ok(2, 4, "generation"));
 }
 
 #[test]

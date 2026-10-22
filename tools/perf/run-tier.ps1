@@ -6,6 +6,7 @@ param(
   [string]$RunId = "",
   [int]$MaxMinutes = 240,
   [int]$TestStopAfterSeconds = 0,
+  [int]$TestBuildSleepSeconds = 0,
   [double]$TestMaxPrivateGb = 4,
   [switch]$Reuse,
   [switch]$ForceFailure,
@@ -15,6 +16,8 @@ $ErrorActionPreference = 'Stop'
 if ($Count -le 0) { throw 'Count must be positive' }
 if ($MaxMinutes -le 0) { throw 'MaxMinutes must be positive' }
 if ($TestStopAfterSeconds -lt 0) { throw 'TestStopAfterSeconds must be non-negative' }
+if ($TestBuildSleepSeconds -lt 0) { throw 'TestBuildSleepSeconds must be non-negative' }
+if ($Reuse) { throw 'reuse mode is not implemented; hot/incremental runs must use a new isolated root' }
 $perfRoot = 'D:\Ai\illuTag-refactor-work\perf-million-hires'
 $repo = 'D:\Ai\illuTag-src'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -132,6 +135,7 @@ $envInfo | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $runDir 'environment
   max_seconds=$maxSeconds; reserve_bytes=$reserveBytes; qa_cap_bytes=$qaCapBytes
   max_private_bytes=$maxPrivateBytes
   test_stop_after_seconds=$TestStopAfterSeconds
+  test_build_sleep_seconds=$TestBuildSleepSeconds
   existing_qa_bytes=$existingBytes; estimated_data_bytes=$estimatedBytes
   cold_run=(-not $Reuse); force_failure=[bool]$ForceFailure; force_crash=[bool]$ForceCrash
 } | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDir 'run-config.json')
@@ -150,6 +154,12 @@ $test = switch ($Layer) {
 }
 $forceLine = if ($ForceFailure) { 'set ILLUTAG_PERF_FORCE_FAIL=1' } else { 'set ILLUTAG_PERF_FORCE_FAIL=' }
 $crashLine = if ($ForceCrash) { 'set ILLUTAG_PERF_FORCE_CRASH=1' } else { 'set ILLUTAG_PERF_FORCE_CRASH=' }
+$buildSleepLine = if ($TestBuildSleepSeconds -gt 0) {
+  "powershell -NoProfile -Command Start-Sleep -Seconds $TestBuildSleepSeconds"
+} else { 'rem no build sleep' }
+$out = Join-Path $runDir 'runner.out'
+$err = Join-Path $runDir 'runner.err'
+$exitCodeFile = Join-Path $runDir 'exitcode.txt'
 $cmdPath = Join-Path $runDir 'run.cmd'
 @"
 @echo off
@@ -166,35 +176,103 @@ set TEMP=$temp
 set TMP=$temp
 $forceLine
 $crashLine
-"$cargo" test --release --manifest-path "$repo\src-tauri\Cargo.toml" --lib $test -- --ignored --exact --nocapture --test-threads=1
+$buildSleepLine
+"$cargo" test --release --manifest-path "$repo\src-tauri\Cargo.toml" --lib $test -- --ignored --exact --nocapture --test-threads=1 > "$out" 2> "$err"
+set RC=%ERRORLEVEL%
+echo %RC% > "$exitCodeFile"
+exit /b %RC%
 "@ | Set-Content -Encoding ascii $cmdPath
 
-$out = Join-Path $runDir 'runner.out'
-$err = Join-Path $runDir 'runner.err'
 $res = Join-Path $runDir 'resources.jsonl'
 $stopFile = Join-Path $runDir 'STOP'
-Remove-Item $res, $stopFile, $out, $err -ErrorAction SilentlyContinue
+Remove-Item $res, $stopFile, $out, $err, $exitCodeFile -ErrorAction SilentlyContinue
 $started = Get-Date
-$proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', $cmdPath) -WorkingDirectory $repo -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+$proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', $cmdPath) -WorkingDirectory $repo -NoNewWindow -PassThru
 $peakWs = 0L; $peakPrivate = 0L; $last = Get-Date
 $ownedPid = 0; $ownedStart = $null; $ownedName = ''
-$stopReason = $null; $unknownExit = $false
+$stopReason = $null; $unknownExit = $false; $residualPids = @()
+$knownPids = New-Object 'System.Collections.Generic.HashSet[int]'
+$knownStarts = @{}
+$knownPids.Add([int]$proc.Id) | Out-Null
+try { $knownStarts[[int]$proc.Id] = (Get-Process -Id $proc.Id -ErrorAction Stop).StartTime } catch {}
+
+function Get-QaBytes {
+  return [int64]((Get-ChildItem $perfRootFull -Recurse -File -ErrorAction SilentlyContinue |
+    Measure-Object Length -Sum).Sum)
+}
+
+function Get-DescendantPids([int]$rootPid) {
+  $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Select-Object ProcessId,ParentProcessId)
+  $byParent = @{}
+  foreach ($row in $all) {
+    $parent = [int]$row.ParentProcessId
+    if (-not $byParent.ContainsKey($parent)) { $byParent[$parent] = @() }
+    $byParent[$parent] += [int]$row.ProcessId
+  }
+  $result = New-Object System.Collections.Generic.List[int]
+  $queue = New-Object System.Collections.Generic.Queue[int]
+  $queue.Enqueue($rootPid)
+  while ($queue.Count -gt 0) {
+    $current = $queue.Dequeue()
+    if ($byParent.ContainsKey($current)) {
+      foreach ($child in $byParent[$current]) {
+        if (-not $result.Contains($child)) { $result.Add($child); $queue.Enqueue($child) }
+      }
+    }
+  }
+  return $result
+}
+
+function Track-Descendants {
+  foreach ($id in @(Get-DescendantPids $proc.Id)) {
+    if (-not $knownPids.Contains([int]$id)) {
+      try {
+        $p = Get-Process -Id $id -ErrorAction Stop
+        $knownPids.Add([int]$id) | Out-Null
+        $knownStarts[[int]$id] = $p.StartTime
+      } catch {}
+    }
+  }
+}
+
+function Stop-OwnedTree {
+  Track-Descendants
+  $pids = @($knownPids)
+  if ($ownedPid -gt 0) { $pids += $ownedPid }
+  foreach ($id in ($pids | Sort-Object -Descending -Unique)) {
+    try {
+      $p = Get-Process -Id $id -ErrorAction Stop
+      if ($knownStarts.ContainsKey([int]$id) -and $p.StartTime -eq $knownStarts[[int]$id]) {
+        Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+      }
+    } catch {}
+  }
+  & cmd.exe /c "taskkill /PID $($proc.Id) /T /F >nul 2>&1" | Out-Null
+}
 
 function Request-Stop([string]$reason) {
   if (-not $script:stopReason) { $script:stopReason = $reason }
   Set-Content $stopFile $script:stopReason -Encoding ascii
 }
 
+$qaUsed = $existingBytes
+$lastQaCheck = $started
 while (-not $proc.HasExited) {
   $now = Get-Date
+  Track-Descendants
   if (($now - $started).TotalSeconds -gt $maxSeconds) { Request-Stop 'wall-time limit' }
   if ($TestStopAfterSeconds -gt 0 -and ($now - $started).TotalSeconds -gt $TestStopAfterSeconds) {
     Request-Stop 'test stop threshold'
   }
   $freeNow = [int64](Get-PSDrive D).Free
-  $qaUsed = $existingBytes + ($freeBytes - $freeNow)
   if ($freeNow -lt $reserveBytes) { Request-Stop 'disk reserve threshold' }
-  if ($qaUsed -gt $qaCapBytes) { Request-Stop 'QA disk cap' }
+  if (($now - $lastQaCheck).TotalSeconds -ge 5) {
+    $qaUsed = Get-QaBytes
+    $lastQaCheck = $now
+    $freeMemNow = [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory * 1KB / 1GB, 1)
+    if ($qaUsed -gt $qaCapBytes) { Request-Stop 'QA actual-usage cap' }
+    if ($freeMemNow -lt 8) { Request-Stop 'free physical memory < 8 GiB' }
+  }
 
   $pidFile = Join-Path $runDir 'test.pid'
   if (Test-Path $pidFile) {
@@ -221,21 +299,48 @@ while (-not $proc.HasExited) {
   }
   if ($stopReason) {
     Start-Sleep -Seconds 10
-    if (-not $proc.HasExited -and $ownedPid -gt 0) {
-      $still = Get-Process -Id $ownedPid -ErrorAction SilentlyContinue
-      if ($still -and $still.StartTime -eq $ownedStart -and $still.ProcessName -like 'illutag_core*') {
-        Stop-Process -Id $ownedPid -Force -ErrorAction SilentlyContinue
+    Stop-OwnedTree
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline) {
+      Track-Descendants
+      $alive = @()
+      foreach ($id in $knownPids) {
+        try {
+          $p = Get-Process -Id $id -ErrorAction Stop
+          if ($knownStarts.ContainsKey([int]$id) -and $p.StartTime -eq $knownStarts[[int]$id]) {
+            $alive += $id
+          }
+        } catch {}
       }
+      if ($alive.Count -eq 0) { break }
+      Start-Sleep -Milliseconds 200
     }
+    Track-Descendants
+    $residualPids = @()
+    foreach ($id in $knownPids) {
+      try {
+        $p = Get-Process -Id $id -ErrorAction Stop
+        if ($knownStarts.ContainsKey([int]$id) -and $p.StartTime -eq $knownStarts[[int]$id]) {
+          $residualPids += $id
+        }
+      } catch {}
+    }
+    $residualPids = @($residualPids | Sort-Object -Unique)
     break
   }
   Start-Sleep -Milliseconds 100
 }
 if (-not $proc.HasExited) {
-  $proc.WaitForExit(30000) | Out-Null
+  $proc.WaitForExit()
 }
+$proc.WaitForExit()
 $proc.Refresh()
-$exit = if ($proc.HasExited) { $proc.ExitCode } else { $null }
+$exit = $null
+if (Test-Path $exitCodeFile) {
+  $rawExit = (Get-Content $exitCodeFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+  $parsed = 0
+  if ([int]::TryParse("$rawExit".Trim(), [ref]$parsed)) { $exit = $parsed }
+}
 if ($null -eq $exit) { $exit = 255; $unknownExit = $true }
 if ($stopReason) { $exit = 124 }
 $elapsed = (Get-Date) - $started
@@ -247,21 +352,27 @@ $manifestHash = if ($manifest) { (Get-FileHash $manifest.FullName -Algorithm SHA
 $usedBytes = [int64]((Get-ChildItem $runDir -Recurse -File | Measure-Object Length -Sum).Sum)
 $freeEnd = [int64](Get-PSDrive D).Free
 $failure = $null
-if ($stopReason) { $failure = "stopped: $stopReason" }
+if ($stopReason -and $residualPids.Count -gt 0) {
+  $failure = "stopped with residual PIDs: $($residualPids -join ',') ($stopReason)"
+}
+elseif ($stopReason) { $failure = "stopped: $stopReason" }
 elseif ($unknownExit) { $failure = 'unknown child exit code' }
 elseif ($exit -ne 0) { $failure = "child exit code $exit" }
 elseif ($jsonFiles.Count -eq 0) { $failure = 'required result JSON is missing' }
 $passed = ($null -eq $failure)
+$qaEnd = Get-QaBytes
 $summary = [ordered]@{
   run_id = $RunId; layer = $Layer; count = $Count; resolution = "$Width x $Height"
   exit_code = $exit; passed = $passed; failure_reason = $failure
-  stopped = ($null -ne $stopReason); stop_reason = $stopReason
+  stopped = ($null -ne $stopReason -and $residualPids.Count -eq 0)
+  stop_reason = $stopReason; residual_pids = $residualPids
   elapsed_seconds = [math]::Round($elapsed.TotalSeconds, 3)
   peak_working_set_bytes = $peakWs; peak_private_bytes = $peakPrivate
   peak_sampling_note = 'sampled every <=100ms/1s; value is a lower bound, not OS peak'
   manifest_sha256 = $manifestHash; run_bytes = $usedBytes
+  qa_bytes_at_end = $qaEnd
   disk_free_gb_at_end = [math]::Round($freeEnd/1GB, 2)
-  budget = [ordered]@{ max_seconds=$maxSeconds; reserve_gb=[math]::Round($reserveBytes/1GB,2); qa_cap_gb=[math]::Round($qaCapBytes/1GB,2); max_private_bytes=$maxPrivateBytes }
+  budget = [ordered]@{ max_seconds=$maxSeconds; reserve_gb=[math]::Round($reserveBytes/1GB,2); qa_cap_gb=[math]::Round($qaCapBytes/1GB,2); max_private_bytes=$maxPrivateBytes; qa_sampling_seconds=5 }
   result_files = @($jsonFiles | ForEach-Object { $_.FullName })
   completed_at = (Get-Date).ToString('o')
 }
