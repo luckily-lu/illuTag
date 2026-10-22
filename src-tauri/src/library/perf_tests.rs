@@ -4,7 +4,7 @@ use crate::duplicates::{
     cache,
     fingerprint::NearFingerprint,
     index::{self, IndexRecord, Threshold},
-    workflow, DuplicateOptions,
+    management, workflow, DuplicateManagementRequest, DuplicateOptions, DuplicateQuery,
 };
 use crate::perf_support::{cold_dir, run_root};
 use image::{
@@ -392,7 +392,13 @@ fn generate_mixed(
     }
     for index in 0..exact {
         check_stop();
-        let family = index % unique_paths.len();
+        // Give family 0 three exact copies so the management-plan check can
+        // exercise protected-member exclusion in a group larger than two.
+        let family = if index < 3 {
+            0
+        } else {
+            index % unique_paths.len()
+        };
         let path = root.join(format!("exact-{index:06}.png"));
         fs::copy(&unique_paths[family], &path).unwrap();
         push(path, family as u64, "exact");
@@ -659,6 +665,147 @@ fn validate_relations(state: &AppState, assets: &Path) -> Value {
     })
 }
 
+fn validate_management_plans(state: &AppState, _assets: &Path, generation: &str) -> Value {
+    let db = open_database(&state.database_path).unwrap();
+    let mut path_to_pk = HashMap::<String, i64>::new();
+    {
+        let mut stmt = db.prepare("SELECT image_pk,path FROM images").unwrap();
+        for row in stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .unwrap()
+        {
+            let (pk, path) = row.unwrap();
+            path_to_pk.insert(path, pk);
+        }
+    }
+    let cache_conn = cache::open_existing(state, false).unwrap();
+    let mut pairs = HashMap::<(i64, i64), String>::new();
+    {
+        let mut stmt = cache_conn
+            .prepare("SELECT a,b,kind FROM cascade_pairs WHERE generation=?1")
+            .unwrap();
+        for row in stmt
+            .query_map([generation], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+        {
+            let (a, b, kind) = row.unwrap();
+            pairs.insert((a.min(b), a.max(b)), kind);
+        }
+    }
+    let groups = cache::query_groups(
+        DuplicateQuery {
+            generation: generation.to_string(),
+            kind: "exact".to_string(),
+            cursor: None,
+            limit: 200,
+        },
+        state,
+    )
+    .unwrap()
+    .groups;
+    let mut mismatches = Vec::<Value>::new();
+    let mut targets_checked = 0u64;
+    let mut protected_checked = 0u64;
+    for group in &groups {
+        let keeper = group.reference.image.id.clone();
+        let Some(other) = group.members.iter().find(|member| member.image.id != keeper) else {
+            continue;
+        };
+        let request = DuplicateManagementRequest {
+            generation: generation.to_string(),
+            group_id: group.id.clone(),
+            mode: "exactOthers".to_string(),
+            keep_ids: vec![keeper.clone()],
+            protected_ids: vec![],
+            image_ids: vec![],
+            action: "trash".to_string(),
+            source_operation_id: None,
+        };
+        let preview = match management::prepare(request, state) {
+            Ok(preview) => preview,
+            Err(error) => {
+                mismatches.push(json!({"group": group.id, "kind": "prepare_error", "error": error}));
+                continue;
+            }
+        };
+        let expected_targets = group.total_members.saturating_sub(1);
+        if preview.target_count != expected_targets {
+            mismatches.push(json!({
+                "group": group.id, "kind": "target_count",
+                "expected": expected_targets, "actual": preview.target_count,
+            }));
+        }
+        let keeper_pk = path_to_pk.get(&group.reference.image.path).copied();
+        for target in &preview.sample {
+            if target.image.id == keeper {
+                continue;
+            }
+            targets_checked += 1;
+            let target_pk = path_to_pk.get(&target.image.path).copied();
+            let relation = match (keeper_pk, target_pk) {
+                (Some(a), Some(b)) => pairs
+                    .get(&(a.min(b), a.max(b)))
+                    .cloned()
+                    .unwrap_or_else(|| "none".to_string()),
+                _ => "missing_pk".to_string(),
+            };
+            if relation != "exact" {
+                mismatches.push(json!({
+                    "group": group.id, "kind": "target_without_exact_keeper_evidence",
+                    "target": target.image.path, "relation": relation,
+                }));
+            }
+        }
+        if group.total_members < 3 {
+            // A two-member group cannot both keep one member and protect the
+            // only target; protected exclusion is exercised on larger groups.
+            continue;
+        }
+        let request = DuplicateManagementRequest {
+            generation: generation.to_string(),
+            group_id: group.id.clone(),
+            mode: "exactOthers".to_string(),
+            keep_ids: vec![keeper],
+            protected_ids: vec![other.image.id.clone()],
+            image_ids: vec![],
+            action: "trash".to_string(),
+            source_operation_id: None,
+        };
+        let protected_preview = match management::prepare(request, state) {
+            Ok(preview) => preview,
+            Err(error) => {
+                mismatches.push(json!({"group": group.id, "kind": "protected_prepare_error", "error": error}));
+                continue;
+            }
+        };
+        protected_checked += 1;
+        if protected_preview.protected_count == 0
+            || protected_preview.target_count > group.total_members.saturating_sub(2)
+        {
+            mismatches.push(json!({
+                "group": group.id, "kind": "protected_targeted",
+                "protected_count": protected_preview.protected_count,
+                "target_count": protected_preview.target_count,
+                "members": group.total_members,
+            }));
+        }
+    }
+    json!({
+        "passed": mismatches.is_empty(),
+        "groups": groups.len(),
+        "targets_checked": targets_checked,
+        "protected_checked": protected_checked,
+        "mismatches": mismatches,
+        "scope": "exact groups: keeper/target direct evidence and protected exclusion; near/similar/uncertain not auto-planned",
+    })
+}
+
 #[test]
 #[ignore = "opt-in isolated H-tier scan + production cascade; synthetic images only"]
 fn perf_h_scan_cascade() {
@@ -690,6 +837,11 @@ fn perf_h_scan_cascade() {
     let workflow_ms = workflow_started.elapsed().as_millis();
     let counts = cascade_counts(&library.state);
     let validation = validate_relations(&library.state, &library.assets);
+    let management = validate_management_plans(
+        &library.state,
+        &library.assets,
+        counts["generation"].as_str().unwrap_or_default(),
+    );
     let db = open_database(&library.state.database_path).unwrap();
     let input_images: i64 = db
         .query_row("SELECT COUNT(*) FROM images", [], |row| row.get(0))
@@ -706,6 +858,7 @@ fn perf_h_scan_cascade() {
         "stages": stages,
         "result": counts,
         "correctness": validation,
+        "management": management,
         "run_dir": library.root,
     });
     write_json(&root, &format!("h-{count}.json"), &result);
@@ -714,6 +867,11 @@ fn perf_h_scan_cascade() {
         validation["passed"].as_bool().unwrap_or(false),
         "per-image truth mismatch: {}",
         validation["mismatches"]
+    );
+    assert!(
+        management["passed"].as_bool().unwrap_or(false),
+        "management plan truth mismatch: {}",
+        management["mismatches"]
     );
 }
 
