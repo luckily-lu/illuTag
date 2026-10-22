@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory=$true)][ValidateSet('H','M','M-sql','X','boundary','native')][string]$Layer,
   [int]$Count = 1000,
   [int]$Width = 640,
@@ -10,7 +10,8 @@ param(
   [double]$TestMaxPrivateGb = 4,
   [switch]$Reuse,
   [switch]$ForceFailure,
-  [switch]$ForceCrash
+  [switch]$ForceCrash,
+  [switch]$TestTerminationFailure
 )
 $ErrorActionPreference = 'Stop'
 if ($Count -le 0) { throw 'Count must be positive' }
@@ -18,6 +19,42 @@ if ($MaxMinutes -le 0) { throw 'MaxMinutes must be positive' }
 if ($TestStopAfterSeconds -lt 0) { throw 'TestStopAfterSeconds must be non-negative' }
 if ($TestBuildSleepSeconds -lt 0) { throw 'TestBuildSleepSeconds must be non-negative' }
 if ($Reuse) { throw 'reuse mode is not implemented; hot/incremental runs must use a new isolated root' }
+$memProbeReady = $false
+try {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class MemProbe {
+  [StructLayout(LayoutKind.Sequential)]
+  private struct MEMORYSTATUSEX {
+    public uint dwLength;
+    public uint dwMemoryLoad;
+    public ulong ullTotalPhys;
+    public ulong ullAvailPhys;
+    public ulong ullTotalPageFile;
+    public ulong ullAvailPageFile;
+    public ulong ullTotalVirtual;
+    public ulong ullAvailVirtual;
+    public ulong ullAvailExtendedVirtual;
+  }
+  [DllImport("kernel32.dll", SetLastError=true)]
+  private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX buffer);
+  public static double AvailableGB() {
+    var status = new MEMORYSTATUSEX();
+    status.dwLength = (uint)Marshal.SizeOf(status);
+    if (!GlobalMemoryStatusEx(ref status)) return -1;
+    return status.ullAvailPhys / 1073741824.0;
+  }
+}
+'@ -ErrorAction Stop
+  $memProbeReady = $true
+} catch {
+  $memProbeReady = $false
+}
+function Get-FreeMemGb {
+  if ($memProbeReady) { return [math]::Round([MemProbe]::AvailableGB(), 1) }
+  return [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory * 1KB / 1GB, 1)
+}
 $perfRoot = 'D:\Ai\illuTag-refactor-work\perf-million-hires'
 $repo = 'D:\Ai\illuTag-src'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -70,8 +107,10 @@ $volumeBytes = [int64]$disk.Size
 $freeBytes = [int64]$disk.FreeSpace
 $reserveBytes = [int64][math]::Max(40GB, [double]$volumeBytes * 0.05)
 $qaCapBytes = [int64]120GB
+$existingMeasure = [System.Diagnostics.Stopwatch]::StartNew()
 $existingBytes = [int64]((Get-ChildItem $perfRootFull -Recurse -File -ErrorAction SilentlyContinue |
   Measure-Object Length -Sum).Sum)
+$existingMeasure.Stop()
 if ($existingBytes -lt 0 -or $null -eq $existingBytes) { $existingBytes = 0 }
 $os = Get-CimInstance Win32_OperatingSystem
 $freeMemGb = [math]::Round($os.FreePhysicalMemory * 1KB / 1GB, 1)
@@ -126,6 +165,8 @@ $envInfo = [ordered]@{
   reserve_gb = [math]::Round($reserveBytes/1GB, 2)
   qa_cap_gb = [math]::Round($qaCapBytes/1GB, 2)
   existing_qa_bytes = $existingBytes; estimated_data_bytes = $estimatedBytes
+  existing_qa_measure_ms = [math]::Round($existingMeasure.Elapsed.TotalMilliseconds, 1)
+  qa_sampling_mode = 'background-job'
   temp_root = $temp; start = (Get-Date).ToString('o')
 }
 $envInfo | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $runDir 'environment.json')
@@ -137,7 +178,9 @@ $envInfo | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $runDir 'environment
   test_stop_after_seconds=$TestStopAfterSeconds
   test_build_sleep_seconds=$TestBuildSleepSeconds
   existing_qa_bytes=$existingBytes; estimated_data_bytes=$estimatedBytes
+  qa_sampling_mode='background-job'; qa_sample_interval_seconds=5; qa_sample_max_age_seconds=20
   cold_run=(-not $Reuse); force_failure=[bool]$ForceFailure; force_crash=[bool]$ForceCrash
+  test_termination_failure=[bool]$TestTerminationFailure
 } | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $runDir 'run-config.json')
 
 $test = switch ($Layer) {
@@ -185,7 +228,8 @@ exit /b %RC%
 
 $res = Join-Path $runDir 'resources.jsonl'
 $stopFile = Join-Path $runDir 'STOP'
-Remove-Item $res, $stopFile, $out, $err, $exitCodeFile -ErrorAction SilentlyContinue
+$qaSampleFile = Join-Path $runDir 'qa-sample.json'
+Remove-Item $res, $stopFile, $out, $err, $exitCodeFile, $qaSampleFile -ErrorAction SilentlyContinue
 $started = Get-Date
 $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', $cmdPath) -WorkingDirectory $repo -NoNewWindow -PassThru
 $peakWs = 0L; $peakPrivate = 0L; $last = Get-Date
@@ -237,6 +281,7 @@ function Track-Descendants {
 
 function Stop-OwnedTree {
   Track-Descendants
+  if ($TestTerminationFailure) { return }
   $pids = @($knownPids)
   if ($ownedPid -gt 0) { $pids += $ownedPid }
   foreach ($id in ($pids | Sort-Object -Descending -Unique)) {
@@ -256,20 +301,58 @@ function Request-Stop([string]$reason) {
 }
 
 $qaUsed = $existingBytes
-$lastQaCheck = $started
+$qaSampleAge = $null
+$lastQaRead = $started
+$qaJob = Start-Job -ScriptBlock {
+  param($root, $out, $interval)
+  while ($true) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $sum = 0L
+    $measureErrors = @()
+    try {
+      $files = Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue -ErrorVariable measureErrors
+      $sum = [int64](($files | Measure-Object Length -Sum).Sum)
+    } catch {
+      $measureErrors += $_
+    }
+    $sw.Stop()
+    $payload = [pscustomobject]@{
+      ts = (Get-Date).ToString('o')
+      bytes = $sum
+      duration_ms = [math]::Round($sw.Elapsed.TotalMilliseconds, 1)
+      ok = ($measureErrors.Count -eq 0)
+      error_count = $measureErrors.Count
+    }
+    $tmp = "$out.tmp"
+    $payload | ConvertTo-Json -Compress | Set-Content -LiteralPath $tmp
+    Move-Item -LiteralPath $tmp -Destination $out -Force
+    Start-Sleep -Seconds $interval
+  }
+} -ArgumentList $perfRootFull, $qaSampleFile, 5
 while (-not $proc.HasExited) {
   $now = Get-Date
-  Track-Descendants
   if (($now - $started).TotalSeconds -gt $maxSeconds) { Request-Stop 'wall-time limit' }
   if ($TestStopAfterSeconds -gt 0 -and ($now - $started).TotalSeconds -gt $TestStopAfterSeconds) {
     Request-Stop 'test stop threshold'
   }
-  $freeNow = [int64](Get-PSDrive D).Free
+  $freeNow = [int64]([System.IO.DriveInfo]::new("D")).AvailableFreeSpace
   if ($freeNow -lt $reserveBytes) { Request-Stop 'disk reserve threshold' }
-  if (($now - $lastQaCheck).TotalSeconds -ge 5) {
-    $qaUsed = Get-QaBytes
-    $lastQaCheck = $now
-    $freeMemNow = [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory * 1KB / 1GB, 1)
+  if (($now - $lastQaRead).TotalSeconds -ge 1) {
+    $lastQaRead = $now
+    if (Test-Path $qaSampleFile) {
+      try {
+        $qaSample = Get-Content $qaSampleFile -Raw | ConvertFrom-Json
+        $qaUsed = [int64]$qaSample.bytes
+        $qaSampleAge = ((Get-Date) - [datetime]$qaSample.ts).TotalSeconds
+        if (-not [bool]$qaSample.ok) { Request-Stop 'QA sample incomplete' }
+        if ($null -ne $qaSampleAge -and $qaSampleAge -gt 20) { Request-Stop 'QA sample stale' }
+      } catch {
+        Request-Stop 'QA sample unreadable'
+      }
+    } elseif (($now - $started).TotalSeconds -gt 20) {
+      Request-Stop 'QA sample missing'
+    }
+    $freeMemNow = Get-FreeMemGb
     if ($qaUsed -gt $qaCapBytes) { Request-Stop 'QA actual-usage cap' }
     if ($freeMemNow -lt 8) { Request-Stop 'free physical memory < 8 GiB' }
   }
@@ -287,10 +370,10 @@ while (-not $proc.HasExited) {
         if ($ws -gt $peakWs) { $peakWs = $ws }
         if ($priv -gt $peakPrivate) { $peakPrivate = $priv }
         if ($priv -gt $maxPrivateBytes) { Request-Stop 'private bytes threshold' }
-        if (((Get-Date) - $last).TotalMilliseconds -ge 1000) {
+        if (((Get-Date) - $last).TotalMilliseconds -ge 900) {
           [pscustomobject]@{
             ts=(Get-Date).ToString('o'); pid=$testPid; working_set=$ws
-            private_bytes=$priv; cpu_seconds=$p.CPU; free_bytes=$freeNow; qa_used_bytes=$qaUsed
+            private_bytes=$priv; cpu_seconds=$p.CPU; free_bytes=$freeNow; qa_used_bytes=$qaUsed; qa_sample_age_seconds=$(if ($null -eq $qaSampleAge) { $null } else { [math]::Round($qaSampleAge,2) })
           } | ConvertTo-Json -Compress | Add-Content $res
           $last = Get-Date
         }
@@ -302,7 +385,6 @@ while (-not $proc.HasExited) {
     Stop-OwnedTree
     $deadline = (Get-Date).AddSeconds(10)
     while ((Get-Date) -lt $deadline) {
-      Track-Descendants
       $alive = @()
       foreach ($id in $knownPids) {
         try {
@@ -315,7 +397,6 @@ while (-not $proc.HasExited) {
       if ($alive.Count -eq 0) { break }
       Start-Sleep -Milliseconds 200
     }
-    Track-Descendants
     $residualPids = @()
     foreach ($id in $knownPids) {
       try {
@@ -328,12 +409,30 @@ while (-not $proc.HasExited) {
     $residualPids = @($residualPids | Sort-Object -Unique)
     break
   }
-  Start-Sleep -Milliseconds 100
+  Start-Sleep -Milliseconds 20
+}
+if ($qaJob) {
+  Stop-Job -Job $qaJob -ErrorAction SilentlyContinue
+  Remove-Job -Job $qaJob -Force -ErrorAction SilentlyContinue
+}
+$qaEnd = $qaUsed
+$qaSampleDuration = $null
+$qaSampleAgeEnd = $qaSampleAge
+if (Test-Path $qaSampleFile) {
+  try {
+    $lastSample = Get-Content $qaSampleFile -Raw | ConvertFrom-Json
+    $qaEnd = [int64]$lastSample.bytes
+    $qaSampleDuration = $lastSample.duration_ms
+    $qaSampleAgeEnd = ((Get-Date) - [datetime]$lastSample.ts).TotalSeconds
+  } catch {}
 }
 if (-not $proc.HasExited) {
-  $proc.WaitForExit()
+  $proc.WaitForExit(30000) | Out-Null
 }
-$proc.WaitForExit()
+if (-not $proc.HasExited) {
+  $residualPids = @($residualPids + $proc.Id | Sort-Object -Unique)
+  $unknownExit = $true
+}
 $proc.Refresh()
 $exit = $null
 if (Test-Path $exitCodeFile) {
@@ -346,11 +445,11 @@ if ($stopReason) { $exit = 124 }
 $elapsed = (Get-Date) - $started
 
 $jsonFiles = @(Get-ChildItem $runDir -Filter '*.json' -Recurse |
-  Where-Object { $_.Name -notin @('environment.json','run-config.json','summary.json') })
+  Where-Object { $_.Name -notin @('environment.json','run-config.json','summary.json','qa-sample.json') })
 $manifest = Get-ChildItem $runDir -Filter 'manifest.jsonl' -Recurse | Select-Object -First 1
 $manifestHash = if ($manifest) { (Get-FileHash $manifest.FullName -Algorithm SHA256).Hash } else { $null }
 $usedBytes = [int64]((Get-ChildItem $runDir -Recurse -File | Measure-Object Length -Sum).Sum)
-$freeEnd = [int64](Get-PSDrive D).Free
+$freeEnd = [int64]([System.IO.DriveInfo]::new("D")).AvailableFreeSpace
 $failure = $null
 if ($stopReason -and $residualPids.Count -gt 0) {
   $failure = "stopped with residual PIDs: $($residualPids -join ',') ($stopReason)"
@@ -360,7 +459,6 @@ elseif ($unknownExit) { $failure = 'unknown child exit code' }
 elseif ($exit -ne 0) { $failure = "child exit code $exit" }
 elseif ($jsonFiles.Count -eq 0) { $failure = 'required result JSON is missing' }
 $passed = ($null -eq $failure)
-$qaEnd = Get-QaBytes
 $summary = [ordered]@{
   run_id = $RunId; layer = $Layer; count = $Count; resolution = "$Width x $Height"
   exit_code = $exit; passed = $passed; failure_reason = $failure
@@ -371,6 +469,9 @@ $summary = [ordered]@{
   peak_sampling_note = 'sampled every <=100ms/1s; value is a lower bound, not OS peak'
   manifest_sha256 = $manifestHash; run_bytes = $usedBytes
   qa_bytes_at_end = $qaEnd
+  qa_sample_duration_ms = $qaSampleDuration
+  qa_sample_age_seconds_at_end = $(if ($null -eq $qaSampleAgeEnd) { $null } else { [math]::Round($qaSampleAgeEnd, 2) })
+  qa_sampling_mode = 'background job; main loop reads sample every 1s'
   disk_free_gb_at_end = [math]::Round($freeEnd/1GB, 2)
   budget = [ordered]@{ max_seconds=$maxSeconds; reserve_gb=[math]::Round($reserveBytes/1GB,2); qa_cap_gb=[math]::Round($qaCapBytes/1GB,2); max_private_bytes=$maxPrivateBytes; qa_sampling_seconds=5 }
   result_files = @($jsonFiles | ForEach-Object { $_.FullName })

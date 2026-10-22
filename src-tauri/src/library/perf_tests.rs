@@ -665,17 +665,58 @@ fn validate_relations(state: &AppState, assets: &Path) -> Value {
     })
 }
 
+fn plan_target_violations(
+    members: &HashSet<i64>,
+    keeper: i64,
+    protected: &HashSet<i64>,
+    targets: &[i64],
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    let actual: HashSet<i64> = targets.iter().copied().collect();
+    if actual.len() != targets.len() {
+        errors.push("duplicate target ids".to_string());
+    }
+    if actual.contains(&keeper) {
+        errors.push(format!("keeper {keeper} appears as target"));
+    }
+    for id in protected {
+        if actual.contains(id) {
+            errors.push(format!("protected {id} appears as target"));
+        }
+    }
+    let expected: HashSet<i64> = members
+        .iter()
+        .copied()
+        .filter(|id| *id != keeper && !protected.contains(id))
+        .collect();
+    for id in expected.difference(&actual) {
+        errors.push(format!("missing target {id}"));
+    }
+    for id in actual.difference(&expected) {
+        errors.push(format!("unexpected target {id}"));
+    }
+    errors
+}
+
 fn validate_management_plans(state: &AppState, _assets: &Path, generation: &str) -> Value {
     let db = open_database(&state.database_path).unwrap();
     let mut path_to_pk = HashMap::<String, i64>::new();
+    let mut pk_to_id = HashMap::<i64, String>::new();
     {
-        let mut stmt = db.prepare("SELECT image_pk,path FROM images").unwrap();
+        let mut stmt = db.prepare("SELECT image_pk,id,path FROM images").unwrap();
         for row in stmt
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
             .unwrap()
         {
-            let (pk, path) = row.unwrap();
+            let (pk, id, path) = row.unwrap();
             path_to_pk.insert(path, pk);
+            pk_to_id.insert(pk, id);
         }
     }
     let cache_conn = cache::open_existing(state, false).unwrap();
@@ -698,23 +739,73 @@ fn validate_management_plans(state: &AppState, _assets: &Path, generation: &str)
             pairs.insert((a.min(b), a.max(b)), kind);
         }
     }
-    let groups = cache::query_groups(
-        DuplicateQuery {
-            generation: generation.to_string(),
-            kind: "exact".to_string(),
-            cursor: None,
-            limit: 200,
-        },
-        state,
-    )
-    .unwrap()
-    .groups;
+    let mut groups = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut total_groups = 0i64;
+    loop {
+        let page = cache::query_groups(
+            DuplicateQuery {
+                generation: generation.to_string(),
+                kind: "exact".to_string(),
+                cursor: cursor.clone(),
+                limit: 100,
+            },
+            state,
+        )
+        .unwrap();
+        if total_groups == 0 {
+            total_groups = page.total_groups;
+        }
+        groups.extend(page.groups);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+        assert!(groups.len() < 100_000, "pagination did not terminate");
+    }
+    let journal_path = state
+        .data_dir
+        .join("operations/duplicate-management.sqlite");
     let mut mismatches = Vec::<Value>::new();
+    if groups.len() as i64 != total_groups {
+        mismatches.push(json!({
+            "kind": "group_page_count",
+            "total_groups": total_groups,
+            "paged_groups": groups.len(),
+        }));
+    }
     let mut targets_checked = 0u64;
     let mut protected_checked = 0u64;
+    let mut groups_checked = 0u64;
     for group in &groups {
+        groups_checked += 1;
         let keeper = group.reference.image.id.clone();
-        let Some(other) = group.members.iter().find(|member| member.image.id != keeper) else {
+        let keeper_pk = path_to_pk.get(&group.reference.image.path).copied();
+        let Some(keeper_pk) = keeper_pk else {
+            mismatches.push(json!({"group": group.id, "kind": "keeper_pk_missing"}));
+            continue;
+        };
+        let mut group_pks = HashSet::<i64>::new();
+        {
+            let Ok(group_no) = group.id.parse::<i64>() else {
+                mismatches.push(json!({"group": group.id, "kind": "group_number_invalid"}));
+                continue;
+            };
+            let mut stmt = cache_conn
+                .prepare("SELECT image_pk FROM members WHERE generation=?1 AND group_no=?2")
+                .unwrap();
+            for row in stmt.query_map([generation, &group_no.to_string()], |row| {
+                row.get::<_, i64>(0)
+            }).unwrap()
+            {
+                group_pks.insert(row.unwrap());
+            }
+        }
+        if group_pks.is_empty() || !group_pks.contains(&keeper_pk) {
+            mismatches.push(json!({"group": group.id, "kind": "group_members_missing"}));
+            continue;
+        }
+        let Some(protected_pk) = group_pks.iter().copied().find(|pk| *pk != keeper_pk) else {
             continue;
         };
         let request = DuplicateManagementRequest {
@@ -734,45 +825,56 @@ fn validate_management_plans(state: &AppState, _assets: &Path, generation: &str)
                 continue;
             }
         };
-        let expected_targets = group.total_members.saturating_sub(1);
-        if preview.target_count != expected_targets {
+        let operation_id: i64 = preview.operation_id.parse().unwrap_or(-1);
+        let journal = Connection::open(&journal_path).unwrap();
+        let mut full_targets = Vec::<i64>::new();
+        {
+            let mut stmt = journal
+                .prepare("SELECT image_pk FROM items WHERE operation=?1 ORDER BY ordinal")
+                .unwrap();
+            for row in stmt.query_map([operation_id], |row| row.get::<_, i64>(0)).unwrap() {
+                full_targets.push(row.unwrap());
+            }
+        }
+        targets_checked += full_targets.len() as u64;
+        let expected_targets = group_pks.len().saturating_sub(1) as i64;
+        if full_targets.len() as i64 != expected_targets
+            || preview.target_count != expected_targets
+        {
             mismatches.push(json!({
                 "group": group.id, "kind": "target_count",
-                "expected": expected_targets, "actual": preview.target_count,
+                "expected": expected_targets, "preview": preview.target_count,
+                "items": full_targets.len(),
             }));
         }
-        let keeper_pk = path_to_pk.get(&group.reference.image.path).copied();
-        for target in &preview.sample {
-            if target.image.id == keeper {
-                continue;
-            }
-            targets_checked += 1;
-            let target_pk = path_to_pk.get(&target.image.path).copied();
-            let relation = match (keeper_pk, target_pk) {
-                (Some(a), Some(b)) => pairs
-                    .get(&(a.min(b), a.max(b)))
-                    .cloned()
-                    .unwrap_or_else(|| "none".to_string()),
-                _ => "missing_pk".to_string(),
-            };
+        for error in plan_target_violations(&group_pks, keeper_pk, &HashSet::new(), &full_targets) {
+            mismatches.push(json!({"group": group.id, "kind": "target_set", "error": error}));
+        }
+        for target_pk in &full_targets {
+            let target_pk = *target_pk;
+            let relation = pairs
+                .get(&(target_pk.min(keeper_pk), target_pk.max(keeper_pk)))
+                .cloned()
+                .unwrap_or_else(|| "none".to_string());
             if relation != "exact" {
                 mismatches.push(json!({
                     "group": group.id, "kind": "target_without_exact_keeper_evidence",
-                    "target": target.image.path, "relation": relation,
+                    "target_pk": target_pk, "relation": relation,
                 }));
             }
         }
-        if group.total_members < 3 {
+        if group_pks.len() < 3 {
             // A two-member group cannot both keep one member and protect the
             // only target; protected exclusion is exercised on larger groups.
             continue;
         }
+        let protected_set: HashSet<i64> = [protected_pk].into_iter().collect();
         let request = DuplicateManagementRequest {
             generation: generation.to_string(),
             group_id: group.id.clone(),
             mode: "exactOthers".to_string(),
             keep_ids: vec![keeper],
-            protected_ids: vec![other.image.id.clone()],
+            protected_ids: vec![pk_to_id.get(&protected_pk).cloned().unwrap_or_default()],
             image_ids: vec![],
             action: "trash".to_string(),
             source_operation_id: None,
@@ -785,24 +887,50 @@ fn validate_management_plans(state: &AppState, _assets: &Path, generation: &str)
             }
         };
         protected_checked += 1;
-        if protected_preview.protected_count == 0
-            || protected_preview.target_count > group.total_members.saturating_sub(2)
+        let protected_operation: i64 = protected_preview.operation_id.parse().unwrap_or(-1);
+        let journal = Connection::open(&journal_path).unwrap();
+        let mut protected_targets = Vec::<i64>::new();
         {
+            let mut stmt = journal
+                .prepare("SELECT image_pk FROM items WHERE operation=?1 ORDER BY ordinal")
+                .unwrap();
+            for row in stmt.query_map([protected_operation], |row| row.get::<_, i64>(0)).unwrap()
+            {
+                protected_targets.push(row.unwrap());
+            }
+        }
+        targets_checked += protected_targets.len() as u64;
+        if protected_preview.protected_count == 0 {
+            mismatches.push(json!({"group": group.id, "kind": "protected_count_zero"}));
+        }
+        for error in plan_target_violations(
+            &group_pks,
+            keeper_pk,
+            &protected_set,
+            &protected_targets,
+        ) {
+            mismatches.push(json!({"group": group.id, "kind": "protected_target_set", "error": error}));
+        }
+        if protected_targets.len() as i64 != group_pks.len() as i64 - 2 {
             mismatches.push(json!({
-                "group": group.id, "kind": "protected_targeted",
-                "protected_count": protected_preview.protected_count,
-                "target_count": protected_preview.target_count,
-                "members": group.total_members,
+                "group": group.id, "kind": "protected_target_count",
+                "expected": group_pks.len() as i64 - 2,
+                "items": protected_targets.len(),
+                "operation": protected_preview.operation_id,
+                "parsed_operation": protected_operation,
+                "targets": protected_targets,
             }));
         }
     }
     json!({
         "passed": mismatches.is_empty(),
+        "total_groups": total_groups,
+        "groups_checked": groups_checked,
         "groups": groups.len(),
         "targets_checked": targets_checked,
         "protected_checked": protected_checked,
         "mismatches": mismatches,
-        "scope": "exact groups: keeper/target direct evidence and protected exclusion; near/similar/uncertain not auto-planned",
+        "scope": "all exact groups via pagination; full persisted target sets; keeper/protected exclusion; near/similar/uncertain not auto-planned",
     })
 }
 
@@ -1012,6 +1140,17 @@ fn perf_truth_rejects_cross_family_exact_or_near_edges() {
         "correct same-family edges must not hide wrong cross-family edges"
     );
     assert!(!validation_ok(2, 4, "generation"));
+}
+
+#[test]
+fn perf_truth_rejects_keeper_or_protected_in_full_plan() {
+    let members: HashSet<i64> = [1, 2, 3, 4].into_iter().collect();
+    let protected: HashSet<i64> = [2].into_iter().collect();
+    assert!(plan_target_violations(&members, 1, &protected, &[3, 4]).is_empty());
+    assert!(!plan_target_violations(&members, 1, &protected, &[2, 3, 4]).is_empty());
+    assert!(!plan_target_violations(&members, 1, &protected, &[1, 3, 4]).is_empty());
+    assert!(!plan_target_violations(&members, 1, &protected, &[3, 4, 4]).is_empty());
+    assert!(!plan_target_violations(&members, 1, &protected, &[3]).is_empty());
 }
 
 #[test]
