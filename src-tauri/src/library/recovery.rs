@@ -513,7 +513,6 @@ pub fn restore_package(
     maintenance.keep = true;
     *state.library.lock().map_err(|e| e.to_string())? = None;
     invalidate_all_similarity_caches(state);
-    crate::duplicates::invalidate(state);
     Ok(manifest)
 }
 
@@ -537,26 +536,6 @@ pub struct OperationLogMigration {
     pub rows_migrated: u64,
     pub unresolved: Vec<OperationLogIssue>,
     pub message: String,
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    hex_encode(&Sha256::digest(bytes))
-}
-
-fn canonical_journal_path(path: &Path) -> Result<String, String> {
-    let value = fs::canonicalize(path)
-        .map_err(|error| format!("文件无法访问：{error}"))?
-        .to_string_lossy()
-        .into_owned();
-    Ok(if cfg!(windows) {
-        value.to_lowercase()
-    } else {
-        value
-    })
 }
 
 fn journal_is_supported(conn: &Connection, tables: &[&str]) -> Result<(), String> {
@@ -614,152 +593,8 @@ fn snapshot_operation_journal(source: &Path, destination: &Path) -> Result<(), S
     Ok(())
 }
 
-fn repaired_item_payload(
-    db: &Connection,
-    payload: &str,
-) -> Result<String, (Option<i64>, String)> {
-    let mut value: serde_json::Value =
-        serde_json::from_str(payload).map_err(|error| (None, format!("记录无法解析：{error}")))?;
-    let pk = value
-        .get("pk")
-        .and_then(|value| value.as_i64())
-        .ok_or((None, "记录缺少 image_pk".to_string()))?;
-    let image = crate::duplicates::management::main_image(db, pk)
-        .map_err(|error| (Some(pk), error))?
-        .ok_or((Some(pk), "图库记录已移除".to_string()))?;
-    let signature = crate::duplicates::fingerprint::source_signature(Path::new(&image.path))
-        .map_err(|error| (Some(pk), format!("源文件不可用：{error}")))?;
-    let canonical = canonical_journal_path(Path::new(&image.path))
-        .map_err(|error| (Some(pk), error))?;
-    value["image"] = serde_json::to_value(&image)
-        .map_err(|error| (Some(pk), format!("图片记录无法序列化：{error}")))?;
-    value["public_hash"] = serde_json::json!(hex_digest(image.id.as_bytes()));
-    value["signature"] = serde_json::json!(hex_encode(&crate::duplicates::cache::signature(
-        &image.id,
-        &signature
-    )));
-    value["canonical"] = serde_json::json!(canonical);
-    value["identity"] = serde_json::json!(signature.identity);
-    serde_json::to_string(&value)
-        .map_err(|error| (Some(pk), format!("记录无法序列化：{error}")))
-}
-
-fn remap_duplicate_request_ids(
-    request: &mut crate::duplicates::DuplicateManagementRequest,
-    db: &Connection,
-    mappings: &[BackupPathMapping],
-    operation: i64,
-    issues: &mut Vec<OperationLogIssue>,
-) -> Result<(), String> {
-    for ids in [
-        &mut request.keep_ids,
-        &mut request.protected_ids,
-        &mut request.image_ids,
-    ] {
-        for id in ids.iter_mut() {
-            let old = id.clone();
-            let next = remap_backup_path(&old, mappings);
-            let exists: bool = db
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM images WHERE id=?1)",
-                    [&next],
-                    |row| row.get(0),
-                )
-                .map_err(|error| error.to_string())?;
-            if !exists {
-                issues.push(OperationLogIssue {
-                    kind: "operationRequest".into(),
-                    operation: operation.to_string(),
-                    image_pk: None,
-                    image_id: Some(old),
-                    reason: format!("请求中的图片不存在：{next}"),
-                });
-            }
-            *id = next;
-        }
-    }
-    Ok(())
-}
-
-fn migrate_duplicate_plan(
-    id: i64,
-    raw: &str,
-    db: &Connection,
-    mappings: &[BackupPathMapping],
-) -> Result<(String, Vec<OperationLogIssue>), String> {
-    let mut value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|error| format!("请求无法解析：{error}"))?;
-    let mut issues = Vec::<OperationLogIssue>::new();
-
-    let request_value = value
-        .get("request")
-        .cloned()
-        .ok_or_else(|| "请求缺少 Plan.request".to_string())?;
-    let mut request: crate::duplicates::DuplicateManagementRequest =
-        serde_json::from_value(request_value)
-            .map_err(|error| format!("Plan.request 结构不兼容：{error}"))?;
-    remap_duplicate_request_ids(&mut request, db, mappings, id, &mut issues)?;
-    value["request"] = serde_json::to_value(&request).map_err(|error| error.to_string())?;
-
-    let keepers = value
-        .get_mut("keepers")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or_else(|| "请求缺少 Plan.keepers".to_string())?;
-    for keeper in keepers.iter_mut() {
-        let payload = serde_json::to_string(&*keeper).map_err(|error| error.to_string())?;
-        match repaired_item_payload(db, &payload) {
-            Ok(next) => {
-                *keeper =
-                    serde_json::from_str(&next).map_err(|error| format!("保留图修复失败：{error}"))?;
-            }
-            Err((image_pk, reason)) => issues.push(OperationLogIssue {
-                kind: "operationKeeper".into(),
-                operation: id.to_string(),
-                image_pk,
-                image_id: keeper
-                    .get("image")
-                    .and_then(|image| image.get("id"))
-                    .and_then(|image| image.as_str())
-                    .map(str::to_string),
-                reason,
-            }),
-        }
-    }
-
-    if let Some(batches) = value
-        .get_mut("batches")
-        .and_then(serde_json::Value::as_array_mut)
-    {
-        for batch in batches.iter_mut() {
-            let mut request: crate::duplicates::DuplicateManagementRequest =
-                serde_json::from_value(batch.clone())
-                    .map_err(|error| format!("Plan.batches 结构不兼容：{error}"))?;
-            remap_duplicate_request_ids(&mut request, db, mappings, id, &mut issues)?;
-            *batch = serde_json::to_value(&request).map_err(|error| error.to_string())?;
-        }
-    }
-
-    let next = serde_json::to_string(&value).map_err(|error| error.to_string())?;
-    Ok((next, issues))
-}
-
-fn mark_duplicate_item_unavailable(
-    conn: &Connection,
-    operation: i64,
-    ordinal: i64,
-    reason: &str,
-) -> Result<(), String> {
-    conn.execute(
-        "UPDATE items SET state='skipped',code='migrationUnavailable',message=?3
-         WHERE operation=?1 AND ordinal=?2 AND state='pending'",
-        params![operation, ordinal, reason.chars().take(400).collect::<String>()],
-    )
-    .map_err(|error| format!("标记未迁移记录失败：{error}"))?;
-    Ok(())
-}
-
 fn recycle_signature(path: &Path) -> Result<String, String> {
-    let source = crate::duplicates::fingerprint::source_signature(path)?;
+    let source = file_integrity::source_signature(path)?;
     serde_json::to_string(&(source.file_size, source.modified_ns, source.identity))
         .map_err(|error| error.to_string())
 }
@@ -992,239 +827,12 @@ fn migrate_recycle_journal(path: &Path, db: &Connection) -> Result<OperationLogM
     Ok(report)
 }
 
-fn migrate_duplicate_journal(
-    path: &Path,
-    db: &Connection,
-    mappings: &[BackupPathMapping],
-) -> Result<OperationLogMigration, String> {
-    let mut conn = Connection::open(path).map_err(|error| format!("打开整理日志失败：{error}"))?;
-    let mut report = OperationLogMigration {
-        journal: "duplicate-management.sqlite".into(),
-        status: "migrated".into(),
-        ..Default::default()
-    };
-    let tx = conn
-        .transaction()
-        .map_err(|error| format!("打开整理日志事务失败：{error}"))?;
-
-    let items = tx
-        .prepare("SELECT operation,ordinal,image_pk,payload,state FROM items ORDER BY operation,ordinal")
-        .map_err(|error| error.to_string())?
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    for (operation, ordinal, pk, payload, state) in items {
-        report.rows_total += 1;
-        match repaired_item_payload(db, &payload) {
-            Ok(next) => {
-                tx.execute(
-                    "UPDATE items SET payload=?3 WHERE operation=?1 AND ordinal=?2",
-                    params![operation, ordinal, next],
-                )
-                .map_err(|error| error.to_string())?;
-                report.rows_migrated += 1;
-            }
-            Err((_, reason)) => {
-                report.unresolved.push(OperationLogIssue {
-                    kind: "managementItem".into(),
-                    operation: operation.to_string(),
-                    image_pk: Some(pk),
-                    image_id: None,
-                    reason: reason.clone(),
-                });
-                if state == "pending" {
-                    mark_duplicate_item_unavailable(&tx, operation, ordinal, &reason)?;
-                }
-            }
-        }
-    }
-
-    for table in ["bulk_candidates", "bulk_keepers"] {
-        let exists: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-                [table],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        if !exists {
-            continue;
-        }
-        let key = if table == "bulk_candidates" {
-            "operation,image_pk,payload FROM bulk_candidates"
-        } else {
-            "operation,image_pk,payload FROM bulk_keepers"
-        };
-        let rows = tx
-            .prepare(&format!("SELECT {key}"))
-            .map_err(|error| error.to_string())?
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        for (operation, pk, payload) in rows {
-            report.rows_total += 1;
-            match repaired_item_payload(db, &payload) {
-                Ok(next) => {
-                    tx.execute(
-                        &format!(
-                            "UPDATE {table} SET payload=?3 WHERE operation=?1 AND image_pk=?2"
-                        ),
-                        params![operation, pk, next],
-                    )
-                    .map_err(|error| error.to_string())?;
-                    report.rows_migrated += 1;
-                }
-                Err((_, reason)) => {
-                    report.unresolved.push(OperationLogIssue {
-                        kind: table.into(),
-                        operation: operation.to_string(),
-                        image_pk: Some(pk),
-                        image_id: None,
-                        reason: reason.clone(),
-                    });
-                    if table == "bulk_candidates" {
-                        tx.execute(
-                            "UPDATE bulk_candidates SET state=2 WHERE operation=?1 AND image_pk=?2",
-                            params![operation, pk],
-                        )
-                        .map_err(|error| error.to_string())?;
-                    }
-                }
-            }
-        }
-    }
-
-    let operations = tx
-        .prepare("SELECT id,request FROM operations ORDER BY id")
-        .map_err(|error| error.to_string())?
-        .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    for (id, request) in operations {
-        report.rows_total += 1;
-        match migrate_duplicate_plan(id, &request, db, mappings) {
-            Ok((next, issues)) => {
-                tx.execute(
-                    "UPDATE operations SET request=?2 WHERE id=?1",
-                    params![id, next],
-                )
-                .map_err(|error| error.to_string())?;
-                if issues.is_empty() {
-                    report.rows_migrated += 1;
-                } else {
-                    // Keep the operation row but make it explicit that this plan
-                    // is not fully migrated. Continuing it will fail at the
-                    // keeper/identity check instead of silently using old data.
-                    let reasons: Vec<String> = issues
-                        .iter()
-                        .map(|issue| {
-                            format!(
-                                "{}: {}",
-                                issue
-                                    .image_id
-                                    .as_deref()
-                                    .unwrap_or("keeper"),
-                                issue.reason
-                            )
-                        })
-                        .collect();
-                    let existing: String = tx
-                        .query_row("SELECT errors FROM operations WHERE id=?1", [id], |row| {
-                            row.get(0)
-                        })
-                        .map_err(|error| error.to_string())?;
-                    let mut errors: Vec<String> =
-                        serde_json::from_str(&existing).unwrap_or_default();
-                    errors.extend(reasons);
-                    tx.execute(
-                        "UPDATE operations SET errors=?2 WHERE id=?1",
-                        params![id, serde_json::to_string(&errors).unwrap_or_default()],
-                    )
-                    .map_err(|error| error.to_string())?;
-                    report.unresolved.extend(issues);
-                }
-            }
-            Err(reason) => report.unresolved.push(OperationLogIssue {
-                kind: "operationRequest".into(),
-                operation: id.to_string(),
-                image_pk: None,
-                image_id: None,
-                reason,
-            }),
-        }
-    }
-
-    let owner_rows = tx
-        .prepare("SELECT image_pk FROM owners")
-        .map_err(|error| error.to_string())?
-        .query_map([], |row| row.get::<_, i64>(0))
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    for pk in owner_rows {
-        report.rows_total += 1;
-        let image_id = db
-            .query_row("SELECT id FROM images WHERE image_pk=?1", [pk], |row| {
-                row.get::<_, String>(0)
-            })
-            .optional()
-            .map_err(|error| error.to_string())?;
-        match image_id {
-            Some(image_id) => {
-                tx.execute(
-                    "UPDATE owners SET public_hash=?2 WHERE image_pk=?1",
-                    params![pk, hex_digest(image_id.as_bytes())],
-                )
-                .map_err(|error| error.to_string())?;
-                report.rows_migrated += 1;
-            }
-            None => report.unresolved.push(OperationLogIssue {
-                kind: "owner".into(),
-                operation: String::new(),
-                image_pk: Some(pk),
-                image_id: None,
-                reason: "图库记录已移除".into(),
-            }),
-        }
-    }
-
-    tx.commit().map_err(|error| error.to_string())?;
-    if !report.unresolved.is_empty() {
-        report.status = "partial".into();
-        report.message = format!("{} 条整理记录无法完整迁移", report.unresolved.len());
-    }
-    Ok(report)
-}
-
 fn rebind_operation_journals(data_dir: &Path, binding: &str) -> Result<Vec<String>, String> {
     let mut warned = Vec::new();
     for (name, tables) in [
         (
             "recycle-management.sqlite",
             vec!["meta", "items", "selections"],
-        ),
-        (
-            "duplicate-management.sqlite",
-            vec!["meta", "items", "operations", "owners"],
         ),
     ] {
         let path = data_dir.join("operations").join(name);
@@ -1280,7 +888,7 @@ pub fn prepare_data_directory_migration(
             to: reference_target.clone(),
         },
     ];
-    let source_binding = crate::duplicates::cache::db_binding(state)?;
+    let source_binding = file_integrity::db_binding(state)?;
     let stage = target.join("migration-staging");
     fs::create_dir(&stage).map_err(|e| e.to_string())?;
     sqlite_snapshot(&state.database_path, &stage.join("illutag.sqlite"))?;
@@ -1312,10 +920,6 @@ pub fn prepare_data_directory_migration(
             (
                 "recycle-management.sqlite",
                 vec!["meta", "items", "selections"],
-            ),
-            (
-                "duplicate-management.sqlite",
-                vec!["meta", "items", "operations", "owners"],
             ),
         ] {
             let from = operations_source.join(name);
@@ -1396,11 +1000,7 @@ pub fn prepare_data_directory_migration(
     .map_err(|error| format!("打开迁移后主库失败：{error}"))?;
     for name in &copied_journals {
         let path = target.join("operations").join(name);
-        let result = if *name == "recycle-management.sqlite" {
-            migrate_recycle_journal(&path, &migrated_db)
-        } else {
-            migrate_duplicate_journal(&path, &migrated_db, &mappings)
-        };
+        let result = migrate_recycle_journal(&path, &migrated_db);
         match result {
             Ok(report) => reports.push(report),
             Err(error) => reports.push(OperationLogMigration {
@@ -1415,7 +1015,7 @@ pub fn prepare_data_directory_migration(
 
     // Rebind the copied journals to the final database identity only after the
     // files have reached their final path.
-    let target_binding = crate::duplicates::cache::db_binding_for(&target.join("illutag.sqlite"))?;
+    let target_binding = file_integrity::db_binding_for(&target.join("illutag.sqlite"))?;
     let warnings = rebind_operation_journals(&target, &target_binding)?;
     if !warnings.is_empty() {
         reports.push(OperationLogMigration {
@@ -1437,6 +1037,5 @@ pub fn prepare_data_directory_migration(
     }
 
     guard.keep = true;
-    crate::duplicates::invalidate(state);
     Ok((files, bytes, reports))
 }

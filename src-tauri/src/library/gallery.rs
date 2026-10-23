@@ -295,7 +295,6 @@ pub fn remove_gallery_folder(folder_path: String, state: &AppState) -> Result<()
 
     invalidate_library_metadata(state)?;
     invalidate_all_similarity_caches(state);
-    crate::duplicates::invalidate(state);
     Ok(())
 }
 
@@ -643,7 +642,6 @@ pub(super) fn remove_synced_user_folder_tree_for_root(
 }
 
 pub fn remove_image_from_index(image_id: String, state: &AppState) -> Result<LibraryStore, String> {
-    crate::duplicates::management::revoke_for_ids(std::slice::from_ref(&image_id),state)?;
     super::recycle::revoke_for_ids(std::slice::from_ref(&image_id),state)?;
     let mut library = state
         .library
@@ -657,7 +655,6 @@ pub fn remove_image_from_index(image_id: String, state: &AppState) -> Result<Lib
         params![image_id],
     )
     .map_err(|error| format!("Failed to move image to trash: {error}"))?;
-    crate::duplicates::invalidate(state);
 
     let store = load_store(&conn)?;
     *library = Some(store.clone());
@@ -669,7 +666,6 @@ pub fn restore_image_from_trash(
     image_id: String,
     state: &AppState,
 ) -> Result<LibraryStore, String> {
-    crate::duplicates::management::revoke_for_ids(std::slice::from_ref(&image_id),state)?;
     super::recycle::revoke_for_ids(std::slice::from_ref(&image_id),state)?;
     let mut library = state
         .library
@@ -683,7 +679,6 @@ pub fn restore_image_from_trash(
         params![image_id],
     )
     .map_err(|error| format!("Failed to restore image from trash: {error}"))?;
-    crate::duplicates::invalidate(state);
 
     let store = load_store(&conn)?;
     *library = Some(store.clone());
@@ -765,7 +760,6 @@ pub fn move_image_to_system_trash(
     image_id: String,
     state: &AppState,
 ) -> Result<LibraryStore, String> {
-    crate::duplicates::management::revoke_for_ids(std::slice::from_ref(&image_id),state)?;
     super::recycle::revoke_for_ids(std::slice::from_ref(&image_id),state)?;
     let mut library = state
         .library
@@ -813,7 +807,6 @@ pub fn move_image_to_system_trash(
 
     conn.execute("DELETE FROM images WHERE id = ?1", params![image_id])
         .map_err(|error| format!("Failed to remove image index after recycle-bin move: {error}"))?;
-    crate::duplicates::invalidate(state);
 
     let store = load_store(&conn)?;
     *library = Some(store.clone());
@@ -825,7 +818,6 @@ pub fn move_images_to_system_trash(
     image_ids: Vec<String>,
     state: &AppState,
 ) -> Result<BatchSystemTrashResult, String> {
-    crate::duplicates::management::revoke_for_ids(&image_ids,state)?;
     super::recycle::revoke_for_ids(&image_ids,state)?;
     let image_ids = normalize_batch_image_ids(image_ids);
     if image_ids.is_empty() {
@@ -926,7 +918,6 @@ pub fn move_images_to_system_trash(
     for image_id in &removed_image_ids {
         remove_clip_vector_cache_entry(&state.clip_vector_cache, image_id)?;
     }
-    if moved_count > 0 { crate::duplicates::invalidate(state); }
 
     Ok(BatchSystemTrashResult {
         store,
@@ -1044,7 +1035,6 @@ pub fn remove_images_from_index(
     image_ids: Vec<String>,
     state: &AppState,
 ) -> Result<LibraryStore, String> {
-    crate::duplicates::management::revoke_for_ids(&image_ids,state)?;
     super::recycle::revoke_for_ids(&image_ids,state)?;
     let image_ids = normalize_batch_image_ids(image_ids);
     if image_ids.is_empty() {
@@ -1082,7 +1072,6 @@ pub fn remove_images_from_index(
     })?;
     tx.commit()
         .map_err(|error| format!("Failed to commit batch trash transaction: {error}"))?;
-    crate::duplicates::invalidate(state);
 
     let store = load_store(&conn)?;
     *library = Some(store.clone());
@@ -1096,7 +1085,6 @@ pub fn restore_images_from_trash(
     image_ids: Vec<String>,
     state: &AppState,
 ) -> Result<LibraryStore, String> {
-    crate::duplicates::management::revoke_for_ids(&image_ids,state)?;
     super::recycle::revoke_for_ids(&image_ids,state)?;
     let image_ids = normalize_batch_image_ids(image_ids);
     if image_ids.is_empty() {
@@ -1134,7 +1122,6 @@ pub fn restore_images_from_trash(
     })?;
     tx.commit()
         .map_err(|error| format!("Failed to commit batch restore transaction: {error}"))?;
-    crate::duplicates::invalidate(state);
 
     let store = load_store(&conn)?;
     *library = Some(store.clone());

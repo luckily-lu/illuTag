@@ -144,11 +144,17 @@ try {
         1,
         "deletion must retain the tag intersection",
       );
+      const nextFilename = await viewer
+        .locator(".viewer-file-name")
+        .textContent();
       await page.keyboard.press("Control+z");
-      await page.waitForFunction(
-        (name) =>
-          document.querySelector(".viewer-file-name")?.textContent === name,
-        filename,
+      await page
+        .getByRole("button", { name: `查看图片：${filename}`, exact: true })
+        .waitFor({ state: "attached" });
+      assert.equal(
+        await viewer.locator(".viewer-file-name").textContent(),
+        nextFilename,
+        "undo must restore the result without replacing the currently viewed image",
       );
       await page.evaluate(() =>
         window.dispatchEvent(
@@ -161,7 +167,7 @@ try {
       );
       assert.equal(
         await viewer.locator(".viewer-file-name").textContent(),
-        filename,
+        nextFilename,
         "held Delete must not delete another image",
       );
       await noOverflow();

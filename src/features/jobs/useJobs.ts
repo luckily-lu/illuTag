@@ -3,13 +3,9 @@ import { isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, errorMessage } from "../../shared/ipc";
 import type { JobRecord } from "../../shared/contracts/JobRecord";
-import type { DuplicateOptions } from "../../shared/contracts/DuplicateOptions";
 import { acceptsJob, isActive } from "./jobPresentation";
 
-export function useJobs(
-  changed: () => void,
-  terminal?: (job: JobRecord) => void,
-) {
+export function useJobs(changed: () => void) {
   const rows = ref<JobRecord[]>([]),
     error = ref("");
   const controlling = ref(new Set<string>());
@@ -18,15 +14,13 @@ export function useJobs(
     disposed = false,
     refreshEpoch = 0;
   const active = computed(() => rows.value.filter(isActive));
-  function merge(incoming: JobRecord[], notify = false) {
+  function merge(incoming: JobRecord[]) {
     if (disposed) return;
     const map = new Map(rows.value.map((j) => [j.id, j]));
     for (const next of incoming) {
       const previous = map.get(next.id);
       if (!acceptsJob(previous, next)) continue;
       map.set(next.id, next);
-      if (notify && previous?.state !== next.state && !isActive(next))
-        terminal?.(next);
     }
     const all = [...map.values()].sort(
       (a, b) => b.updatedAt - a.updatedAt || b.id.localeCompare(a.id),
@@ -45,8 +39,6 @@ export function useJobs(
     kind: string,
     thumbnails = true,
     sourceFolderId: number | null = null,
-    duplicateOptions: DuplicateOptions | null = null,
-    duplicateOperationId: string | null = null,
   ) {
     try {
       error.value = "";
@@ -54,8 +46,6 @@ export function useJobs(
         kind,
         thumbnails,
         sourceFolderId,
-        duplicateOptions,
-        duplicateOperationId,
       });
       merge([record]);
       await refresh().catch((e) => (error.value = errorMessage(e)));
@@ -97,9 +87,7 @@ export function useJobs(
   }
   onMounted(async () => {
     if (isTauri()) {
-      off = await listen<JobRecord>("jobs:changed", (e) =>
-        merge([e.payload], true),
-      );
+      off = await listen<JobRecord>("jobs:changed", (e) => merge([e.payload]));
       offLibrary = await listen("library:changed", changed);
     }
     if (disposed) {

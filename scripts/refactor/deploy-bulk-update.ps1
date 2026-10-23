@@ -51,7 +51,7 @@ try{
     $taskFile=Join-Path $taskLive $taskName
     if(Test-Path -LiteralPath $taskFile){Copy-Item -LiteralPath $taskFile -Destination (Join-Path $taskBackup $taskName)}
   }
-  foreach($taskJournalName in @('duplicate-management','recycle-management')){
+  foreach($taskJournalName in @('recycle-management')){
   foreach($taskSuffix in @('','-wal','-shm')){
     $taskJournal=Join-Path $taskLive ('operations\'+$taskJournalName+'.sqlite'+$taskSuffix)
     if(Test-Path -LiteralPath $taskJournal){Copy-Item -LiteralPath $taskJournal -Destination (Join-Path $taskBackup ($taskJournalName+'.sqlite'+$taskSuffix))}
@@ -82,7 +82,6 @@ try{
   @"
 illuTag $taskVersion portable
 Start illutag.exe. Existing absolute data directory and runtime/model resources are preserved.
-Duplicate search has global exact/random and near/highest-resolution actions. Both move records to the application recycle bin and support bulk undo; original files remain in place.
 Recycle bin has dedicated restore and cleanup actions. Source-file cleanup only starts after explicit confirmation.
 Rollback program: $taskBackup\illutag.exe.backup
 Native acceptance: $taskReport

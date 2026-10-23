@@ -14,23 +14,6 @@ import type { JobRecord } from "./contracts/JobRecord";
 import type { JobRequest } from "./contracts/JobRequest";
 import type { JobHistoryQuery } from "./contracts/JobHistoryQuery";
 import type { JobHistoryPage } from "./contracts/JobHistoryPage";
-import type { DuplicateStatus } from "./contracts/DuplicateStatus";
-import type { DuplicateQuery } from "./contracts/DuplicateQuery";
-import type { DuplicateGroupPage } from "./contracts/DuplicateGroupPage";
-import type { DuplicateMemberQuery } from "./contracts/DuplicateMemberQuery";
-import type { DuplicateMemberPage } from "./contracts/DuplicateMemberPage";
-import type { DuplicateGroup } from "./contracts/DuplicateGroup";
-import type { DuplicateWorkflowStatus } from "./contracts/DuplicateWorkflowStatus";
-import type { DuplicateWorkflowQuery } from "./contracts/DuplicateWorkflowQuery";
-import type { DuplicateWorkflowPage } from "./contracts/DuplicateWorkflowPage";
-import type { DuplicateReviewEdit } from "./contracts/DuplicateReviewEdit";
-import type { DuplicateWorkflowRequest } from "./contracts/DuplicateWorkflowRequest";
-import type { DuplicateManagementRequest } from "./contracts/DuplicateManagementRequest";
-import type { DuplicateActionPreview } from "./contracts/DuplicateActionPreview";
-import type { DuplicateApplyRequest } from "./contracts/DuplicateApplyRequest";
-import type { DuplicateOperationStatus } from "./contracts/DuplicateOperationStatus";
-import type { DuplicateOperationQuery } from "./contracts/DuplicateOperationQuery";
-import type { DuplicateOperationPage } from "./contracts/DuplicateOperationPage";
 import type { RecycleSelection } from "./contracts/RecycleSelection";
 import type { RecycleSelectionRequest } from "./contracts/RecycleSelectionRequest";
 import type { RecycleApplyRequest } from "./contracts/RecycleApplyRequest";
@@ -99,46 +82,6 @@ export const api = {
     invoke<JobRecord>("start_job", { request }),
   controlJob: (id: string, action: string) =>
     invoke<void>("control_job", { id, action }),
-  duplicateStatus: () => invoke<DuplicateStatus>("duplicate_status"),
-  duplicateWorkflow: (retry = false) =>
-    invoke<DuplicateWorkflowStatus>(
-      "duplicate_workflow_status",
-      retry ? { retry: true } : {},
-    ),
-  duplicateWorkflowGroups: (query: DuplicateWorkflowQuery) =>
-    invoke<DuplicateWorkflowPage>("query_duplicate_workflow", { query }),
-  editDuplicateReview: (request: DuplicateReviewEdit) =>
-    invoke<DuplicateWorkflowStatus>("edit_duplicate_review", { request }),
-  prepareDuplicateWorkflow: (
-    request: DuplicateWorkflowRequest,
-    kind?: "exact" | "near",
-  ) =>
-    invoke<DuplicateActionPreview>(
-      "prepare_duplicate_workflow",
-      kind ? { request, kind } : { request },
-    ),
-  duplicateGroups: (query: DuplicateQuery) =>
-    invoke<DuplicateGroupPage>("query_duplicate_groups", { query }),
-  duplicateMembers: (query: DuplicateMemberQuery) =>
-    invoke<DuplicateMemberPage>("query_duplicate_members", { query }),
-  clearDuplicateCache: () => invoke<void>("clear_duplicate_cache"),
-  duplicateGroup: (
-    query: Pick<DuplicateMemberQuery, "generation" | "groupId">,
-  ) => invoke<DuplicateGroup | null>("query_duplicate_group", { query }),
-  prepareDuplicateAction: (request: DuplicateManagementRequest) =>
-    invoke<DuplicateActionPreview>("prepare_duplicate_action", { request }),
-  applyDuplicateAction: (request: DuplicateApplyRequest) =>
-    invoke<JobRecord>("apply_duplicate_action", { request }),
-  duplicateOperationStatus: (operationId: string) =>
-    invoke<DuplicateOperationStatus>("duplicate_operation_status", {
-      operationId,
-    }),
-  duplicateOperationResults: (query: DuplicateOperationQuery) =>
-    invoke<DuplicateOperationPage>("duplicate_operation_results", { query }),
-  undoDuplicateAction: (operationId: string) =>
-    invoke<JobRecord>("undo_duplicate_action", { operationId }),
-  clearDuplicateManagementRecords: () =>
-    invoke<void>("clear_duplicate_management_records", { confirmed: true }),
   prepareRecycleSelection: (request: RecycleSelectionRequest) =>
     invoke<RecycleSelection>("prepare_recycle_selection", { request }),
   applyRecycleAction: (request: RecycleApplyRequest) =>

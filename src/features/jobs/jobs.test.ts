@@ -25,8 +25,6 @@ function job(state = "running", revision = 1): JobRecord {
       kind: "scan",
       thumbnails: false,
       sourceFolderId: 7,
-      duplicateOptions: null,
-      duplicateOperationId: null,
     },
     state,
     stage: "scan",

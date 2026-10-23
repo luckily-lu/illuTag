@@ -1890,11 +1890,6 @@ pub(super) fn flush_scanned_image_batch(
     }
     tx.commit()
         .map_err(|error| format!("Failed to commit scan upsert transaction: {error}"))?;
-    if !committed_new_images.is_empty() || committed_updates > 0 {
-        if let Some(path) = conn.path() {
-            crate::duplicates::cache::invalidate_database(Path::new(path));
-        }
-    }
     // Publish queue and progress changes only after the whole batch is durable.
     // A failed transaction must not make a retry believe uncommitted paths exist.
     known_paths.extend(committed_new_paths);

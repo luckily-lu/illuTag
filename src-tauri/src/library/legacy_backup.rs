@@ -27,7 +27,6 @@ pub fn import_data_migration_backup(
     path_mappings: Vec<BackupPathMapping>,
     state: &AppState,
 ) -> Result<LibraryStore, String> {
-    crate::duplicates::management::revoke_all(state)?;
     let backup = read_data_migration_backup(&backup_path)?;
     if backup.format != "illutag-data-migration-backup" {
         return Err("Invalid illuTag backup format".to_string());
@@ -59,7 +58,6 @@ pub fn import_data_migration_backup(
 
     tx.commit()
         .map_err(|error| format!("Failed to commit migration import: {error}"))?;
-    crate::duplicates::invalidate(state);
 
     let store = load_store(&conn)?;
     *library = Some(store.clone());

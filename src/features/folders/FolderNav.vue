@@ -12,7 +12,6 @@ const navigation: Array<[string, string, IconName]> = [
   ["trash", "回收站", "trash"],
 ];
 const utilities: Array<[string, string, IconName]> = [
-  ["duplicates", "重复检索", "duplicates"],
   ["tasks", "任务中心", "tasks"],
   ["settings", "设置", "settings"],
 ];

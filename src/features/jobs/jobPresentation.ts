@@ -14,9 +14,6 @@ export const jobNames: Record<string, string> = {
   tagging: "自动打标",
   cleanup: "清理缺失索引",
   rules: "重新应用分类规则",
-  duplicates: "重复图片检索",
-  duplicateManagement: "整理重复图片",
-  duplicateUndo: "撤销重复图片整理",
   recycleRestore: "还原回收站图片",
   recycleDelete: "清理回收站原文件",
 };
@@ -58,6 +55,8 @@ export function capability(
   job: JobRecord,
   action: "Pause" | "Resume" | "Cancel" | "Retry",
 ) {
+  if (!Object.prototype.hasOwnProperty.call(jobNames, job.request.kind))
+    return false;
   const supplied = job.meta?.[`can${action}`];
   if (supplied !== undefined) return supplied;
   if (action === "Pause")
@@ -81,8 +80,6 @@ export function unitLabel(job: JobRecord) {
         image: "张",
         files: "个文件",
         file: "个文件",
-        pairs: "对",
-        pair: "对",
         items: "项",
         item: "项",
       } as Record<string, string>

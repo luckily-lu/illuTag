@@ -20,9 +20,6 @@ import TagManager from "./features/tags/TagWorkbench.vue";
 import { useTagWorkbench } from "./features/tags/useTagWorkbench";
 import TaskCenter from "./features/jobs/TaskCenter.vue";
 import SettingsPage from "./features/settings/SettingsPage.vue";
-import DuplicatePage from "./features/duplicates/DuplicatePage.vue";
-import { useDuplicates } from "./features/duplicates/useDuplicates";
-import { useDuplicateBatches } from "./features/duplicates/useDuplicateBatches";
 import { useRecycleBin } from "./features/gallery/useRecycleBin";
 import RecycleBinPanel from "./features/gallery/RecycleBinPanel.vue";
 import SoftDialog from "./shared/ui/SoftDialog.vue";
@@ -31,7 +28,6 @@ import type { GalleryImage } from "./shared/contracts/GalleryImage";
 import type { LibraryFolder } from "./shared/contracts/LibraryFolder";
 import type { ImageMutation } from "./shared/contracts/ImageMutation";
 import type { UserFolderRuleCondition } from "./shared/contracts/UserFolderRuleCondition";
-import type { DuplicateOptions } from "./shared/contracts/DuplicateOptions";
 const gallery = useGallery(),
   tagWorkspace = useTagWorkbench(),
   selection = useSelection(),
@@ -50,26 +46,10 @@ const page = ref("gallery"),
   error = ref(""),
   notice = ref(""),
   pinned = ref(false);
-const duplicateRefreshVersion = ref(0);
-const duplicates = useDuplicates(),
-  duplicateBatches = useDuplicateBatches();
-const jobs = useJobs(
-  () => {
-    duplicateRefreshVersion.value++;
-    void refresh();
-    if (page.value === "gallery") void gallery.search();
-  },
-  (job) => {
-    if (
-      ["duplicates", "duplicateManagement", "duplicateUndo"].includes(
-        job.request.kind,
-      )
-    ) {
-      duplicateBatches.observe(job);
-      duplicateRefreshVersion.value++;
-    }
-  },
-);
+const jobs = useJobs(() => {
+  void refresh();
+  if (page.value === "gallery") void gallery.search();
+});
 const recycleJob = computed(() =>
   jobs.rows.value.find((j) =>
     ["recycleRestore", "recycleDelete"].includes(j.request.kind),
@@ -97,7 +77,6 @@ const viewerRemoval = useViewerRemoval(
     };
   },
   () => {
-    duplicateRefreshVersion.value++;
     void refresh();
   },
 );
@@ -363,25 +342,9 @@ async function rule(id: number) {
     error.value = errorMessage(e);
   }
 }
-async function start(
-  kind: string,
-  sourceFolderId: number | null = null,
-  duplicateOptions: DuplicateOptions | null = null,
-) {
+async function start(kind: string, sourceFolderId: number | null = null) {
   page.value = "tasks";
-  await jobs.start(
-    kind,
-    preferences.thumbnails.value,
-    sourceFolderId,
-    duplicateOptions,
-  );
-}
-async function startDuplicates(options: DuplicateOptions) {
-  return jobs.start("duplicates", preferences.thumbnails.value, null, options);
-}
-function openDuplicateOperation(operationId?: string | null) {
-  if (operationId) duplicateBatches.activeOperationId.value = operationId;
-  page.value = "duplicates";
+  await jobs.start(kind, preferences.thumbnails.value, sourceFolderId);
 }
 function tagSearch(tag: string) {
   viewer.value = null;
@@ -485,8 +448,6 @@ function key(e: KeyboardEvent) {
   if (drawer.value) {
     drawer.value = false;
     e.preventDefault();
-  } else if (page.value === "duplicates") {
-    return;
   } else if (selection.active.value) {
     selection.clear();
     e.preventDefault();
@@ -506,9 +467,6 @@ function startWindowDrag(event: PointerEvent) {
   windowAction("window_start_dragging_command");
 }
 onMounted(async () => {
-  void duplicateBatches.connect().catch((e) => {
-    error.value = errorMessage(e);
-  });
   window.addEventListener("keydown", key);
   window.addEventListener("pointermove", dragMove);
   window.addEventListener("pointerup", dragEnd);
@@ -529,8 +487,6 @@ onMounted(async () => {
   );
 });
 onUnmounted(() => {
-  duplicates.dispose();
-  duplicateBatches.dispose();
   clearTimeout(dragTimer);
   window.removeEventListener("keydown", key);
   window.removeEventListener("pointermove", dragMove);
@@ -763,22 +719,10 @@ onUnmounted(() => {
             :controlling="jobs.controlling.value"
             @retry="jobs.retry"
             @history-cleared="jobs.forgetHistory"
-            @start="(kind, options) => start(kind, null, options ?? null)"
-            @duplicates="openDuplicateOperation"
+            @start="start"
             @recycle-bin="go('trash')"
             @recycle-retry="retryRecycleOperation"
-            @control="jobs.control" /><DuplicatePage
-            v-else-if="page === 'duplicates'"
-            :jobs="jobs.rows.value"
-            :refresh-version="duplicateRefreshVersion"
-            :task-error="jobs.error.value"
-            :start-job="startDuplicates"
-            :workspace="duplicates"
-            :batches="duplicateBatches"
-            :folders="folders.folders.value"
-            :control-job="jobs.control"
-            @job-created="jobs.refresh()"
-            @tasks="page = 'tasks'" /><TagManager
+            @control="jobs.control" /><TagManager
             v-else-if="page === 'tags'"
             :workspace="tagWorkspace"
             @browse="browseTags"
@@ -968,10 +912,10 @@ onUnmounted(() => {
     >
     <ErrorDialog
       v-if="!dialog"
-      :errors="[error, page === 'duplicates' ? '' : jobs.error.value]"
+      :errors="[error, jobs.error.value]"
       @close="
         error = '';
-        page !== 'duplicates' && (jobs.error.value = '');
+        jobs.error.value = '';
       "
     />
     <div

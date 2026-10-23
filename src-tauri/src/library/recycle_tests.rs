@@ -36,7 +36,7 @@ impl Fixture {
         for n in 0..count {
             let path = root.join(format!("synthetic-{n:05}.txt"));
             fs::write(&path, b"recycle-test-fixture").unwrap();
-            let sig = fingerprint::source_signature(&path).unwrap();
+            let sig = file_integrity::source_signature(&path).unwrap();
             let ident = path.to_string_lossy().into_owned();
             tx.execute("INSERT INTO images(image_pk,id,path,file_name,ext,width,height,file_size,modified_at,imported_at,folder_id,trashed,is_favorite) VALUES(?1,?2,?2,?3,'txt',1,1,?4,?5,0,1,1,1)",
                 params![n as i64+1,ident,format!("synthetic-{n:05}.txt"),sig.file_size as i64,sig.modified_ns/1_000_000]).unwrap();
@@ -254,7 +254,7 @@ fn recycle_system_move_retains_changed_missing_and_active_aliases() {
     let log = journal(&f.state).unwrap();
     log.execute("UPDATE items SET state='pending',signature='old-file-identity' WHERE selection=?1 AND pk=2",[&selected.selection_id]).unwrap();
     fs::write(&f.ids[1], b"recycle-test-fixture").unwrap();
-    let sig = fingerprint::source_signature(Path::new(&f.ids[1])).unwrap();
+    let sig = file_integrity::source_signature(Path::new(&f.ids[1])).unwrap();
     c.execute(
         "UPDATE images SET modified_at=?1 WHERE image_pk=2",
         [sig.modified_ns / 1_000_000],

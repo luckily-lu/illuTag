@@ -121,7 +121,6 @@ pub(super) fn cleanup_missing_library_images_batched(
                 .map_err(|error| {
                     format!("Failed to delete missing image during startup cleanup: {error}")
                 })?;
-            crate::duplicates::cache::invalidate_database(database_path);
             removed_total += 1;
         }
 

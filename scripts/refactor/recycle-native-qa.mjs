@@ -259,8 +259,6 @@ try {
       kind: "scan",
       thumbnails: false,
       sourceFolderId: null,
-      duplicateOptions: null,
-      duplicateOperationId: null,
       recycleOperationId: null,
     },
   });

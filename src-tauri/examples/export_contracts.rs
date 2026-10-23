@@ -1,6 +1,5 @@
 use illutag_core::{jobs::*, library::*};
 use ts_rs::{Config, TS};
-use illutag_core::duplicates::*;
 fn main() {
     let config = Config::from_env();
     use illutag_core::library::recycle::*;
@@ -31,22 +30,4 @@ fn main() {
     TagDictionaryBrowserState::export_all(&config).unwrap();
     UserFolderRule::export_all(&config).unwrap();
     KnownAutoTagSuggestion::export_all(&config).unwrap();
-    DuplicateOptions::export_all(&config).unwrap();
-    DuplicateStatus::export_all(&config).unwrap();
-    DuplicateQuery::export_all(&config).unwrap();
-    DuplicateGroupPage::export_all(&config).unwrap();
-    DuplicateMemberQuery::export_all(&config).unwrap();
-    DuplicateMemberPage::export_all(&config).unwrap();
-    DuplicateManagementRequest::export_all(&config).unwrap();
-    DuplicateActionPreview::export_all(&config).unwrap();
-    DuplicateApplyRequest::export_all(&config).unwrap();
-    DuplicateOperationStatus::export_all(&config).unwrap();
-    DuplicateOperationQuery::export_all(&config).unwrap();
-    DuplicateOperationPage::export_all(&config).unwrap();
-    DuplicateGroupQuery::export_all(&config).unwrap();
-    DuplicateWorkflowStatus::export_all(&config).unwrap();
-    DuplicateWorkflowQuery::export_all(&config).unwrap();
-    DuplicateWorkflowPage::export_all(&config).unwrap();
-    DuplicateReviewEdit::export_all(&config).unwrap();
-    DuplicateWorkflowRequest::export_all(&config).unwrap();
 }

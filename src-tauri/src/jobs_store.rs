@@ -82,9 +82,9 @@ pub(super) fn decorate(record: &mut JobRecord) {
     meta.can_resume = record.state == "paused" && controllable;
     meta.can_cancel = record.state == "queued"
         || (matches!(record.state.as_str(), "running" | "pausing" | "paused") && controllable);
-    let batch = record.request.duplicate_operation_id.is_some()
-        || record.request.recycle_operation_id.is_some();
-    meta.can_retry = terminal(&record.state) && (!batch || record.state != "completed");
+    let batch = record.request.recycle_operation_id.is_some();
+    meta.can_retry = supported_kind(&record.request.kind)
+        && terminal(&record.state) && (!batch || record.state != "completed");
     if meta.persistence_error.is_some() {
         meta.can_pause = false;
         meta.can_resume = false;
@@ -151,9 +151,9 @@ impl JobRuntime {
         let conn = database(state)?;
         conn.execute_batch("CREATE INDEX IF NOT EXISTS task_runs_history ON task_runs(updated_at DESC,id DESC); CREATE INDEX IF NOT EXISTS task_runs_state_history ON task_runs(state,updated_at DESC,id DESC)")
             .map_err(|e| e.to_string())?;
-        // Recover every unfinished record, including ones outside the recent-history window.
+        // Recover supported unfinished tasks, including ones outside recent history.
         loop {
-            let mut stmt = conn.prepare("SELECT payload FROM task_runs WHERE state IN ('queued','running','pausing','paused','cancelling') LIMIT 100")
+            let mut stmt = conn.prepare(&format!("SELECT payload FROM task_runs WHERE {} AND state IN ('queued','running','pausing','paused','cancelling') LIMIT 100", supported_kinds_clause()))
                 .map_err(|e| e.to_string())?;
             let pending = stmt
                 .query_map([], |row| row.get::<_, String>(0))
@@ -470,6 +470,10 @@ impl JobRuntime {
     }
 }
 
+fn supported_kinds_clause() -> String {
+    format!("kind IN ({})", JOB_KINDS.iter().map(|kind| format!("'{kind}'")).collect::<Vec<_>>().join(","))
+}
+
 pub fn history(query: JobHistoryQuery, state: &AppState) -> Result<JobHistoryPage, String> {
     let limit = query.limit.unwrap_or(30).clamp(1, RECENT_LIMIT as u32) as usize;
     let cursor: Option<(i64, String)> = query
@@ -495,7 +499,7 @@ pub fn history(query: JobHistoryQuery, state: &AppState) -> Result<JobHistoryPag
     } else {
         ""
     };
-    let sql = format!("SELECT payload FROM task_runs WHERE {state_clause}{boundary} ORDER BY updated_at DESC,id DESC LIMIT ?3");
+    let sql = format!("SELECT payload FROM task_runs WHERE {} AND {state_clause}{boundary} ORDER BY updated_at DESC,id DESC LIMIT ?3", supported_kinds_clause());
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let payloads = stmt
         .query_map(

@@ -34,8 +34,6 @@ fn row(id: &str, state: &str) -> JobRecord {
             kind: "rules".into(),
             thumbnails: false,
             source_folder_id: None,
-            duplicate_options: None,
-            duplicate_operation_id: None,
             recycle_operation_id: None,
         },
         state: state.into(),
@@ -520,7 +518,7 @@ fn clearing_history_requires_confirmation_and_preserves_active_work_and_journals
     f.add(row("active", "pausing"));
     let operations = f.root.join("operations");
     std::fs::create_dir_all(&operations).unwrap();
-    let journal = operations.join("duplicate-management.sqlite");
+    let journal = operations.join("recycle-management.sqlite");
     std::fs::write(&journal, b"synthetic undo journal").unwrap();
     assert!(clear_history(false, &f.state).is_err());
     assert_eq!(
@@ -540,16 +538,10 @@ fn clearing_history_requires_confirmation_and_preserves_active_work_and_journals
 #[test]
 fn retry_preserves_the_original_scope_options_and_batch_identity() {
     let mut original = row("original", "interrupted");
-    original.request.kind = "duplicates".into();
+    original.request.kind = "recycleRestore".into();
     original.request.thumbnails = true;
     original.request.source_folder_id = Some(77);
-    original.request.duplicate_options = Some(crate::duplicates::DuplicateOptions {
-        sensitivity: "strict".into(),
-        force_recompute: false,
-        regroup_only: true,
-        verification_mode: "organize".into(),
-    });
-    original.request.duplicate_operation_id = Some("frozen-operation".into());
+    original.request.recycle_operation_id = Some("frozen-operation".into());
     let expected = serde_json::to_value(&original.request).unwrap();
     assert_eq!(
         serde_json::to_value(retry_request(original).unwrap()).unwrap(),
@@ -719,4 +711,32 @@ fn terminal_write_lock_failure_keeps_the_queue_and_retry_saves_without_reexecuti
             .id,
         "next"
     );
+}
+
+#[test]
+fn retired_task_kinds_do_not_fill_history_or_resume_on_restart() {
+    let f = Fixture::new();
+    for n in 0..105 {
+        let mut record = row(&format!("retired-{n}"), "completed");
+        record.request.kind = "retiredFeature".into();
+        record.updated_at = 1000 + n;
+        persist(&record, &f.state).unwrap();
+    }
+    let mut pending = row("retired-active", "queued");
+    pending.request.kind = "retiredFeature".into();
+    persist(&pending, &f.state).unwrap();
+    persist(&row("current", "completed"), &f.state).unwrap();
+    let page = history(query(None, None, 1), &f.state).unwrap();
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].id, "current");
+    assert!(page.next_cursor.is_none());
+    f.state.jobs.hydrate(&f.state).unwrap();
+    assert_eq!(f.state.jobs.list().unwrap().len(), 1);
+    assert_eq!(store::load("retired-active", &f.state).unwrap().state, "queued");
+    let old = store::load("retired-0", &f.state).unwrap();
+    let mut presented = old.clone();
+    store::decorate(&mut presented);
+    assert!(!presented.meta.unwrap().can_retry);
+    assert!(retry_request(old).is_err());
+    assert!(f.state.jobs.queue.lock().unwrap().is_empty());
 }

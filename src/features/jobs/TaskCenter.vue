@@ -2,7 +2,6 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { api, errorMessage } from "../../shared/ipc";
 import type { JobRecord } from "../../shared/contracts/JobRecord";
-import type { DuplicateOptions } from "../../shared/contracts/DuplicateOptions";
 import type { LibraryFolder } from "../../shared/contracts/LibraryFolder";
 import SoftSelect from "../../shared/ui/SoftSelect.vue";
 import SoftDialog from "../../shared/ui/SoftDialog.vue";
@@ -27,8 +26,7 @@ const props = defineProps<{
   controlling?: Set<string>;
 }>();
 const emit = defineEmits<{
-  start: [kind: string, options?: DuplicateOptions | null];
-  duplicates: [operationId?: string | null];
+  start: [kind: string];
   control: [id: string, action: string];
   retry: [id: string];
   historyCleared: [];
@@ -87,9 +85,7 @@ function created(j: JobRecord) {
   return new Date(j.meta?.createdAt ?? j.updatedAt).toLocaleString();
 }
 function retryLabel(j: JobRecord) {
-  return j.request.duplicateOperationId || j.request.recycleOperationId
-    ? "继续原批次"
-    : "重新运行";
+  return j.request.recycleOperationId ? "继续原批次" : "重新运行";
 }
 async function readHistory(append = false) {
   if (append && (!cursor.value || loading.value)) return;
@@ -196,15 +192,7 @@ onUnmounted(() => {
                 emit('start', kind);
               "
             >
-              {{ jobNames[kind] }}</button
-            ><button
-              class="text-button"
-              @click="
-                launcher = false;
-                emit('duplicates');
-              "
-            >
-              重复检索
+              {{ jobNames[kind] }}
             </button>
           </div>
         </div>
@@ -398,16 +386,6 @@ onUnmounted(() => {
               @click="emit('retry', job.id)"
             >
               {{ retryLabel(job) }}</button
-            ><button
-              v-if="
-                ['duplicates', 'duplicateManagement', 'duplicateUndo'].includes(
-                  job.request.kind,
-                )
-              "
-              class="text-button"
-              @click="emit('duplicates', job.request.duplicateOperationId)"
-            >
-              查看结果</button
             ><button
               v-if="
                 ['recycleRestore', 'recycleDelete'].includes(job.request.kind)

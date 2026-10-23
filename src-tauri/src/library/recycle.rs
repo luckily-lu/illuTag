@@ -1,6 +1,6 @@
 //! Frozen, disk-backed recycle-bin selections; bounded background operations.
 use super::*;
-use crate::duplicates::{cache, fingerprint};
+use super::file_integrity;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use ts_rs::TS;
 
@@ -85,7 +85,7 @@ fn journal(state: &AppState) -> Result<Connection, String> {
       signature TEXT NOT NULL DEFAULT '',message TEXT NOT NULL DEFAULT '',revoked INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(selection,pk),UNIQUE(selection,id)) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS recycle_pending ON items(selection,state,pk);
       CREATE INDEX IF NOT EXISTS recycle_revoke ON items(id,state);").map_err(|e|e.to_string())?;
-    let binding = cache::db_binding(state)?;
+    let binding = file_integrity::db_binding(state)?;
     c.execute(
         "INSERT OR IGNORE INTO meta VALUES('binding',?1)",
         [&binding],
@@ -121,7 +121,7 @@ pub fn prepare(
         return Err("请选择一种回收站操作范围".into());
     }
     let mut log = journal(state)?;
-    let db = cache::library(state)?;
+    let db = file_integrity::library(state)?;
     let selection = id();
     let tx = log.transaction().map_err(|e| e.to_string())?;
     tx.execute(
@@ -328,8 +328,6 @@ fn apply_request(
             .into(),
             thumbnails: false,
             source_folder_id: None,
-            duplicate_options: None,
-            duplicate_operation_id: None,
             recycle_operation_id: Some(request.selection_id),
         }),
         state,
@@ -507,7 +505,7 @@ fn prepare_path_lookup(log: &Connection, db: &Connection, operation: &str) -> Re
     db.execute_batch("COMMIT").map_err(|e| e.to_string())
 }
 fn physical(item: &Item) -> Result<String, String> {
-    let s = fingerprint::source_signature(Path::new(&item.path))?;
+    let s = file_integrity::source_signature(Path::new(&item.path))?;
     if s.file_size != item.bytes as u64 || s.modified_ns / 1_000_000 != item.modified {
         return Err("原文件已变化，已保留此回收项".into());
     }
@@ -541,7 +539,6 @@ fn delete_chunk(
     operation: &str,
     log: &mut Connection,
     db: &Connection,
-    state: &AppState,
     mover: &mut dyn FnMut(&[PathBuf]) -> Result<(), String>,
     committed: &std::cell::Cell<bool>,
 ) -> Result<(), String> {
@@ -578,7 +575,6 @@ fn delete_chunk(
         }
     }
     if !ready.is_empty() {
-        crate::duplicates::management::revoke_for_ids(&ready.iter().map(|(i,_)| i.id.clone()).collect::<Vec<_>>(), state)?;
         let intent = log.transaction().map_err(|e|e.to_string())?;
         for (item, signature) in &ready {
             intent.execute("UPDATE items SET phase='intent',signature=?3 WHERE selection=?1 AND pk=?2", params![operation, item.pk, signature]).map_err(|e|e.to_string())?;
@@ -639,7 +635,7 @@ fn restore_chunk(
 ) -> Result<(), String> {
     let _guard = state.write_lock.lock().map_err(|e| e.to_string())?;
     writable(state)?;
-    if cache::db_binding(state)? != binding {
+    if file_integrity::db_binding(state)? != binding {
         return Err("图库已替换，停止此回收批次".into());
     }
     let mut ready = Vec::new();
@@ -651,10 +647,6 @@ fn restore_chunk(
         else if item.phase=="restoreIntent" && db.query_row("SELECT EXISTS(SELECT 1 FROM images WHERE image_pk=?1 AND id=?2 AND path=?3 AND source='library' AND trashed=0)",params![item.pk,item.id,item.path],|r|r.get::<_,bool>(0)).map_err(|e|e.to_string())?{recovered.push(item);}
         else{skipped.push(item);}
     }
-    crate::duplicates::management::revoke_for_ids(
-        &ready.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
-        state,
-    )?;
     let intent = log.transaction().map_err(|e| e.to_string())?;
     for item in &ready {
         intent
@@ -722,10 +714,9 @@ impl Drop for MembershipCommitGuard<'_> {
         if self.committed.get() {
             // The batch may have failed after a chunk was already durable
             // (journal status, progress, final state). Invalidate exactly once
-            // here so stale gallery/vector/duplicate caches cannot survive.
+            // here so stale gallery/vector caches cannot survive.
             let _ = api::invalidate_library_metadata(self.state);
             invalidate_all_similarity_caches(self.state);
-            crate::duplicates::membership_invalidated(self.state);
         }
     }
 }
@@ -758,7 +749,7 @@ fn run_with_batches(
         params![operation, now_ms()],
     )
     .map_err(|e| e.to_string())?;
-    let binding = cache::db_binding(state)?;
+    let binding = file_integrity::db_binding(state)?;
     let mut stamp = Instant::now() - Duration::from_secs(1);
     let work = (|| -> Result<(), String> {
         control()?;
@@ -779,7 +770,7 @@ fn run_with_batches(
             if rows.is_empty() {
                 break;
             }
-            if cache::db_binding(state)? != binding {
+            if file_integrity::db_binding(state)? != binding {
                 return Err("图库已替换，停止此回收批次".into());
             }
             if action == "restore" {
@@ -794,10 +785,10 @@ fn run_with_batches(
                 control()?;
                 let _guard = state.write_lock.lock().map_err(|e| e.to_string())?;
                 writable(state)?;
-                if cache::db_binding(state)? != binding {
+                if file_integrity::db_binding(state)? != binding {
                     return Err("图库已替换，停止此回收批次".into());
                 }
-                delete_chunk(chunk, operation, &mut log, &db, state, mover, &committed)?;
+                delete_chunk(chunk, operation, &mut log, &db, mover, &committed)?;
                 drop(_guard);
                 if stamp.elapsed() >= Duration::from_millis(200) {
                     progress(&status(operation, state)?);

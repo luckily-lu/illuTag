@@ -45,13 +45,12 @@ async function finish(id) {
   }
   throw Error("Isolated job timeout");
 }
-async function start(kind, duplicateOptions = null) {
+async function start(kind) {
   const j = await session.invoke("start_job", {
     request: {
       kind,
       thumbnails: false,
       sourceFolderId: null,
-      duplicateOptions,
     },
   });
   return finish(j.id);
@@ -94,48 +93,6 @@ try {
     await session.invoke("add_gallery_folder_command", { folderPath: dir });
   await start("scan");
   assert.equal(py(seed).images, 16);
-  // No new fingerprint computation is needed to synchronise a completed cleanup.
-  await start("duplicates", {
-    sensitivity: "standard",
-    forceRecompute: false,
-    regroupOnly: false,
-  });
-  const before = await session.invoke("duplicate_status");
-  assert.equal(before.exactGroups, 6);
-  const plan = await session.invoke("prepare_duplicate_action", {
-    request: {
-      generation: before.generation,
-      groupId: "all-exact",
-      mode: "autoExactAll",
-      keepIds: [],
-      protectedIds: [],
-      imageIds: [],
-      action: "trash",
-      sourceOperationId: null,
-    },
-  });
-  await finish(
-    (
-      await session.invoke("apply_duplicate_action", {
-        request: { operationId: plan.operationId, confirmed: true },
-      })
-    ).id,
-  );
-  const after = await session.invoke("duplicate_status");
-  assert.equal(after.exactGroups, 0);
-  assert.equal(after.generation, before.generation);
-  assert.equal(after.needsUpdate, false);
-  await finish(
-    (
-      await session.invoke("undo_duplicate_action", {
-        operationId: plan.operationId,
-      })
-    ).id,
-  );
-  assert.equal((await session.invoke("duplicate_status")).exactGroups, 6);
-  report.checks.push(
-    "Cleanup and undo automatically update all exact counts in the existing generation without a rescan",
-  );
   await session.page.reload();
   await session.page.waitForSelector(".app");
   await session.page

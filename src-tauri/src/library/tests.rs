@@ -618,12 +618,12 @@ fn migration_reports_an_unsupported_operation_journal() {
 }
 
 fn recycle_signature_text(path: &Path) -> String {
-    let source = crate::duplicates::fingerprint::source_signature(path).unwrap();
+    let source = file_integrity::source_signature(path).unwrap();
     serde_json::to_string(&(source.file_size, source.modified_ns, source.identity)).unwrap()
 }
 
 fn register_recycle_file(f: &Fixture, pk: i64, path: &Path) {
-    let source = crate::duplicates::fingerprint::source_signature(path).unwrap();
+    let source = file_integrity::source_signature(path).unwrap();
     let id = path.to_string_lossy().into_owned();
     let conn = open_database(&f.state.database_path).unwrap();
     conn.execute(
@@ -919,7 +919,7 @@ fn migration_rebinds_recycle_journal_and_restores_inside_clipboard() {
     image::RgbaImage::from_pixel(4, 4, image::Rgba([9, 8, 7, 255]))
         .save(&old_path)
         .unwrap();
-    let signature = crate::duplicates::fingerprint::source_signature(&old_path).unwrap();
+    let signature = file_integrity::source_signature(&old_path).unwrap();
     let old_id = old_path.to_string_lossy().into_owned();
     let conn = open_database(&f.state.database_path).unwrap();
     conn.execute(
@@ -2092,8 +2092,6 @@ fn restart_marks_incomplete_jobs_interrupted() {
         id: "old".into(),
         request: crate::jobs::JobRequest {
             recycle_operation_id: None,
-            duplicate_operation_id: None,
-            duplicate_options: None,
             kind: "scan".into(),
             thumbnails: false,
             source_folder_id: None,

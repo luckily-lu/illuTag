@@ -12,10 +12,6 @@ pub struct JobRequest {
     pub thumbnails: bool,
     #[serde(default)]
     pub source_folder_id: Option<i64>,
-    #[serde(default)]
-    pub duplicate_options: Option<crate::duplicates::DuplicateOptions>,
-    #[serde(default)]
-    pub duplicate_operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub recycle_operation_id: Option<String>,
@@ -80,6 +76,14 @@ pub struct JobHistoryPage {
     #[ts(optional)]
     pub next_cursor: Option<String>,
 }
+const JOB_KINDS: &[&str] = &[
+    "pipeline", "scan", "thumbnails", "semantic", "tagging", "cleanup", "rules",
+    "recycleRestore", "recycleDelete",
+];
+fn supported_kind(kind: &str) -> bool {
+    JOB_KINDS.contains(&kind)
+}
+
 #[derive(Default)]
 pub struct JobRuntime {
     // Serialize state, durable snapshots and event publication, including controls.
@@ -129,7 +133,7 @@ pub fn start_job(
 
 // Caller holds write_lock, including the journal confirmation/enqueue transaction.
 pub(crate) fn start_job_locked(
-    mut request: JobRequest,
+    request: JobRequest,
     state: &AppState,
     app: AppHandle,
 ) -> Result<JobRecord, String> {
@@ -139,70 +143,13 @@ pub(crate) fn start_job_locked(
     if state.maintenance.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("数据维护中，请稍后或重启后启动任务".into());
     }
-    // Public duplicate jobs, including retries of retired workflows, always use
-    // the current three-round controller. Internal fingerprint preparation does
-    // not enter the public job queue.
-    if request.kind=="duplicates"{
-        let options=request.duplicate_options.get_or_insert(crate::duplicates::DuplicateOptions{sensitivity:"standard".into(),force_recompute:false,regroup_only:false,verification_mode:"cascade".into()});
-        options.verification_mode="cascade".into();options.regroup_only=false;
-    }
     let _gate = state.jobs.gate.lock().map_err(|e| e.to_string())?;
-    if ![
-        "pipeline",
-        "scan",
-        "thumbnails",
-        "semantic",
-        "tagging",
-        "cleanup",
-        "rules",
-        "duplicates",
-        "duplicateManagement",
-        "duplicateUndo",
-        "recycleRestore",
-        "recycleDelete",
-    ]
-    .contains(&request.kind.as_str())
-    {
+    if !supported_kind(&request.kind) {
         return Err("不支持的任务类型".into());
     }
     if let Some(existing) = state.jobs.active_request(&request)? {
         ensure_dispatch(state, app);
         return Ok(existing);
-    }
-    if request.kind == "duplicates" {
-        let options =
-            request
-                .duplicate_options
-                .clone()
-                .unwrap_or(crate::duplicates::DuplicateOptions {
-                    sensitivity: "standard".into(),
-                    force_recompute: false,
-                    regroup_only: false,
-                    verification_mode: "candidate".into(),
-                });
-        if !["strict", "standard", "loose"].contains(&options.sensitivity.as_str()) {
-            return Err("不支持的近似检索档位".into());
-        }
-        if state
-            .jobs
-            .list()?
-            .iter()
-            .any(|r| r.request.kind == "duplicates" && store::ACTIVE.contains(&r.state.as_str()))
-        {
-            return Err("已有重复检索任务，请等待或取消当前任务".into());
-        }
-    }
-    if ["duplicateManagement", "duplicateUndo"].contains(&request.kind.as_str()) {
-        let operation = request
-            .duplicate_operation_id
-            .as_ref()
-            .ok_or("整理批次编号缺失")?;
-        if state.jobs.list()?.iter().any(|r| {
-            r.request.duplicate_operation_id.as_ref() == Some(operation)
-                && store::ACTIVE.contains(&r.state.as_str())
-        }) {
-            return Err("该整理批次已经提交，不能重复应用".into());
-        }
     }
     if ["recycleRestore", "recycleDelete"].contains(&request.kind.as_str()) {
         let operation = request
@@ -469,19 +416,10 @@ fn dispatch(state: AppState, app: AppHandle) {
             }
         }
         let saved = retry_terminal_save(&id, &state, &app).is_ok();
-        if ["duplicates", "duplicateManagement", "duplicateUndo"]
-            .contains(&record.request.kind.as_str())
-        {
-            let _ = app.emit("duplicates:changed", ());
-            if record.request.kind != "duplicates" {
-                let _ = app.emit("library:changed", ());
-            }
-        } else {
-            if let Ok(mut revision) = state.startup_cleanup_generation.lock() {
-                *revision += 1;
-            }
-            let _ = app.emit("library:changed", ());
+        if let Ok(mut revision) = state.startup_cleanup_generation.lock() {
+            *revision += 1;
         }
+        let _ = app.emit("library:changed", ());
         if !saved && stop_for_pending(&state) {
             return;
         }
@@ -558,12 +496,6 @@ fn checkpoint(state: &AppState, id: &str, app: &AppHandle) -> Result<(), String>
 fn run_stage(stage: &str, id: &str, state: &AppState, app: &AppHandle) -> Result<(), String> {
     if ["recycleRestore", "recycleDelete"].contains(&stage) {
         return run_recycle(id, state, app);
-    }
-    if stage == "duplicates" {
-        return run_duplicates(id, state, app);
-    }
-    if ["duplicateManagement", "duplicateUndo"].contains(&stage) {
-        return run_duplicate_management(id, state, app);
     }
     if stage == "rules" {
         return run_rules(id, state, app);
@@ -694,7 +626,7 @@ enum JobControlTarget {
 fn job_control_target(kind: &str, stage: &str) -> Result<JobControlTarget, String> {
     let stage = if matches!(
         kind,
-        "duplicates" | "duplicateManagement" | "duplicateUndo" | "recycleRestore" | "recycleDelete"
+        "recycleRestore" | "recycleDelete"
     ) {
         kind
     } else {
@@ -702,9 +634,6 @@ fn job_control_target(kind: &str, stage: &str) -> Result<JobControlTarget, Strin
     };
     match stage {
         "rules"
-        | "duplicates"
-        | "duplicateManagement"
-        | "duplicateUndo"
         | "recycleRestore"
         | "recycleDelete" => Ok(JobControlTarget::Record),
         "scan" | "tagging" => Ok(JobControlTarget::Scan),
@@ -800,19 +729,6 @@ pub fn retry_job(id: String, state: &AppState, app: AppHandle) -> Result<JobReco
     }
     let request = retry_request(store::load(&id, state)?)?;
     match request.kind.as_str() {
-        "duplicateManagement" | "duplicateUndo" => {
-            crate::duplicates::management::validate_apply(
-                &crate::duplicates::DuplicateApplyRequest {
-                    operation_id: request
-                        .duplicate_operation_id
-                        .clone()
-                        .ok_or("整理批次缺失")?,
-                    confirmed: true,
-                },
-                state,
-            )?;
-            start_job(request, state, app)
-        }
         "recycleRestore" | "recycleDelete" => crate::library::recycle::retry(request, state, app),
         _ => start_job(request, state, app),
     }
@@ -821,6 +737,9 @@ pub fn retry_job(id: String, state: &AppState, app: AppHandle) -> Result<JobReco
 fn retry_request(record: JobRecord) -> Result<JobRequest, String> {
     if !store::terminal(&record.state) {
         return Err("请先等待当前任务结束".into());
+    }
+    if !supported_kind(&record.request.kind) {
+        return Err("不支持的任务类型".into());
     }
     Ok(record.request)
 }
@@ -843,162 +762,6 @@ fn run_rules(id: &str, state: &AppState, app: &AppHandle) -> Result<(), String> 
         thread::sleep(Duration::from_millis(200));
     }
     Ok(())
-}
-
-fn run_duplicates(id: &str, state: &AppState, app: &AppHandle) -> Result<(), String> {
-    let request = state
-        .jobs
-        .list()?
-        .into_iter()
-        .find(|r| r.id == id)
-        .ok_or("任务不存在")?
-        .request;
-    let options = request
-        .duplicate_options
-        .unwrap_or(crate::duplicates::DuplicateOptions {
-            sensitivity: "standard".into(),
-            force_recompute: false,
-            regroup_only: false,
-            verification_mode: "candidate".into(),
-        });
-    let progress_error = std::cell::RefCell::new(None::<String>);
-    let mut check = || -> Result<(), String> {
-        loop {
-            if let Some(error) = progress_error.borrow_mut().take() {
-                return Err(error);
-            }
-            checkpoint(state, id, app)?;
-            if state
-                .foreground_queries
-                .load(std::sync::atomic::Ordering::Relaxed)
-                == 0
-            {
-                return Ok(());
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    };
-    let mut last_emit = std::time::Instant::now() - Duration::from_millis(200);
-    let mut last_stage = String::new();
-    let mut progress = |stage: &str, coverage: &crate::duplicates::DuplicateCoverage| {
-        if last_emit.elapsed() < Duration::from_millis(200) && stage == last_stage {
-            return;
-        }
-        last_emit = std::time::Instant::now();
-        last_stage = stage.into();
-        let update = state.jobs.update(id, state, app, |record| {
-            record.stage = if stage.contains("复核候选") || stage.contains("逐字节确认") {
-                format!(
-                    "{stage} · 通过 {} 对 / 差异 {} 对 / 无法确认 {} 对",
-                    coverage.verified_pairs, coverage.content_variants, coverage.uncertain_pairs
-                )
-            } else {
-                stage.into()
-            };
-            record.processed = coverage.processed;
-            record.total = coverage.total;
-            record.failures = coverage.failed + coverage.too_dense;
-            if let Some(meta) = record.meta.as_mut() {
-                meta.stage_code = if stage.starts_with("第一轮") {"cascadeRecall"}
-                else if stage.starts_with("第二轮") {"cascadeContent"}
-                else if stage.starts_with("第三轮") {"cascadePixels"}
-                else if stage.contains("计划") || stage.contains("合并") {
-                    "planning"
-                } else if stage.contains("验证")
-                    || stage.contains("复核")
-                    || stage.contains("逐字节")
-                {
-                    "verification"
-                } else if stage.contains("指纹") {
-                    "fingerprints"
-                } else {
-                    "discovery"
-                }
-                .into();
-                meta.unit = if stage=="第二轮：载入候选指纹" || stage=="第三轮：核对原生像素摘要" { "images" }
-                else if stage.starts_with("第二轮")||stage.starts_with("第三轮")||stage=="三轮检索完成"||stage=="生成分类整理计划"||[
-                    "检索直接替代关系",
-                    "验证候选原图（比较关系）",
-                    "整理验证缓存",
-                    "恢复检索断点",
-                    "构建候选索引",
-                    "生成全量整理计划",
-                    "合并最新人工选择",
-                    "副本检索完成",
-                    "复检近似候选",
-                    "合并整理计划",
-                    "近似复检完成",
-                ]
-                .contains(&stage)
-                {
-                    "pairs"
-                } else {
-                    "images"
-                }
-                .into();
-            }
-        });
-        if let Err(error) = update {
-            eprintln!("[duplicates-progress] {error}");
-            *progress_error.borrow_mut() = Some(format!(
-                "保存查重任务进度失败，检索已停止并保留已提交结果：{error}"
-            ));
-        }
-    };
-    let result = crate::duplicates::run_job(options, state, &mut check, &mut progress);
-    let result = result.and_then(|_| progress_error.into_inner().map_or(Ok(()), Err));
-    if is_cancelled(state, id) {
-        Ok(())
-    } else {
-        result
-    }
-}
-
-fn run_duplicate_management(id: &str, state: &AppState, app: &AppHandle) -> Result<(), String> {
-    let request = state
-        .jobs
-        .list()?
-        .into_iter()
-        .find(|r| r.id == id)
-        .ok_or("任务不存在")?
-        .request;
-    let operation = request.duplicate_operation_id.ok_or("整理批次缺失")?;
-    let mut control = || checkpoint(state, id, app);
-    let mut last = std::time::Instant::now() - Duration::from_secs(1);
-    let mut progress = |status: &crate::duplicates::DuplicateOperationStatus| {
-        if last.elapsed() < Duration::from_millis(200) && status.state == "running" {
-            return;
-        }
-        last = std::time::Instant::now();
-        let _ = state.jobs.update(id, state, app, |r| {
-            r.processed = status.processed;
-            r.total = status.total;
-            r.failures = status.failed;
-            r.errors = status.errors.clone();
-            if let Some(meta) = r.meta.as_mut() {
-                meta.stage_code = status.stage.clone();
-            }
-            r.stage = match status.stage.as_str() {
-                "snapshot" | "workflowSnapshot" => format!(
-                    "复用已扫描结果 {}/{}",
-                    status.stage_processed, status.stage_total
-                ),
-                "planning" => format!(
-                    "选择保留图片 {}/{}",
-                    status.stage_processed, status.stage_total
-                ),
-                "undoSnapshot" => format!(
-                    "准备整批还原 {}/{}",
-                    status.stage_processed, status.stage_total
-                ),
-                _ if status.action == "restore" => "还原本次软回收".into(),
-                _ if status.action == "systemTrash" => "移入系统回收站".into(),
-                _ => "核实源文件并整理重复图片".into(),
-            };
-        });
-        let _ = app.emit("duplicate-management:changed", status);
-    };
-    crate::duplicates::management::run_operation(&operation, state, &mut control, &mut progress)
 }
 
 fn run_recycle(id: &str, state: &AppState, app: &AppHandle) -> Result<(), String> {

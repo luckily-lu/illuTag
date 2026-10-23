@@ -149,37 +149,6 @@ try {
   await list.getByRole("option").first().click();
   assert.equal(await page.locator(".tag-query-chip").count(), 1);
   await page.screenshot({ path: path.join(output, "tag-selected.png") });
-  for (const mode of ["loading", "error"]) {
-    await page.goto(origin + `/?preview=1&duplicates=refined&snapshot=${mode}`);
-    await nav("重复检索");
-    if (mode === "loading") {
-      await page
-        .getByRole("heading", { name: "正在读取检索结果", exact: true })
-        .waitFor();
-      assert.equal(
-        await page.getByRole("button", { name: "查看", exact: true }).count(),
-        0,
-      );
-      await page.screenshot({
-        path: path.join(output, "duplicates-loading.png"),
-      });
-    } else {
-      await page
-        .getByRole("heading", { name: "检索结果暂未读取完成", exact: true })
-        .waitFor();
-      await page.screenshot({
-        path: path.join(output, "duplicates-error.png"),
-      });
-      await page
-        .locator(".error-dialog")
-        .getByRole("button", { name: "刷新结果", exact: true })
-        .click();
-    }
-    await page
-      .getByRole("heading", { name: "整理结果", exact: true })
-      .waitFor();
-    checks.push({ snapshot: mode, recovery: true });
-  }
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ checks }));
 } finally {

@@ -39,7 +39,7 @@ for n in range(40):
 print(json.dumps({'images':40,'bytes':sum(f.stat().st_size for f in (p/'assets').glob('*.png'))}))
 `);
   await session.invoke('add_gallery_folder_command',{folderPath:path.join(root,'assets')});
-  const job = await session.invoke('start_job',{request:{kind:'scan',thumbnails:false,sourceFolderId:null,duplicateOptions:null}});
+  const job = await session.invoke('start_job',{request:{kind:'scan',thumbnails:false,sourceFolderId:null}});
   const until = Date.now()+60000;
   while (true) {
     const record = (await session.invoke('list_jobs')).find(j=>j.id===job.id);

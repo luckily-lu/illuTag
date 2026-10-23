@@ -321,7 +321,6 @@ fn mutate_images_locked(
     let mut conn = open_database(&state.database_path)?;
     let image_ids = normalize_batch_image_ids(request.image_ids);
     if ["trash", "restore", "systemTrash"].contains(&request.action.as_str()) {
-        crate::duplicates::management::revoke_for_ids(&image_ids, state)?;
         super::recycle::revoke_for_ids(&image_ids, state)?;
     }
     let mut successful_ids = Vec::new();
@@ -418,9 +417,6 @@ fn mutate_images_locked(
     let revision = invalidate_library_metadata(state)?;
     if ["trash", "restore", "systemTrash"].contains(&request.action.as_str()) {
         invalidate_all_similarity_caches(state);
-        if !successful_ids.is_empty() {
-            crate::duplicates::membership_invalidated(state);
-        }
     }
     Ok(MutationResult {
         images,

@@ -1232,59 +1232,6 @@ pub(super) async fn clear_job_history(confirmed: bool, app: tauri::AppHandle) ->
 }
 
 #[tauri::command]
-pub(super) async fn duplicate_status(app: tauri::AppHandle) -> Result<illutag_core::duplicates::DuplicateStatus, AppError> {
-    off_main(app, |state| illutag_core::duplicates::status(&state)).await.map_err(Into::into)
-}
-
-#[tauri::command]
-pub(super) async fn duplicate_workflow_status(retry:Option<bool>,app:tauri::AppHandle)->Result<illutag_core::duplicates::DuplicateWorkflowStatus,AppError>{
-    off_main(app,move |s|if retry.unwrap_or(false) {illutag_core::duplicates::workflow::retry_status_snapshot(&s)} else {illutag_core::duplicates::workflow::status_snapshot(&s)}).await.map_err(Into::into)
-}
-#[tauri::command]
-pub(super) async fn query_duplicate_workflow(query:illutag_core::duplicates::DuplicateWorkflowQuery,app:tauri::AppHandle)->Result<illutag_core::duplicates::DuplicateWorkflowPage,AppError>{
-    off_main(app,move|s|illutag_core::duplicates::workflow::query(query,&s)).await.map_err(Into::into)
-}
-#[tauri::command]
-pub(super) async fn edit_duplicate_review(request:illutag_core::duplicates::DuplicateReviewEdit,app:tauri::AppHandle)->Result<illutag_core::duplicates::DuplicateWorkflowStatus,AppError>{
-    off_main(app,move|s|illutag_core::duplicates::workflow::edit(request,&s)).await.map_err(Into::into)
-}
-#[tauri::command]
-pub(super) async fn prepare_duplicate_workflow(request:illutag_core::duplicates::DuplicateWorkflowRequest,kind:Option<String>,app:tauri::AppHandle)->Result<illutag_core::duplicates::DuplicateActionPreview,AppError>{
-    off_main(app,move|s|illutag_core::duplicates::workflow::prepare_category(request,kind.as_deref(),&s)).await.map_err(Into::into)
-}
-
-#[tauri::command]
-pub(super) async fn query_duplicate_groups(query: illutag_core::duplicates::DuplicateQuery, app: tauri::AppHandle) -> Result<illutag_core::duplicates::DuplicateGroupPage, AppError> {
-    off_main(app, move |state| illutag_core::duplicates::query_groups(query, &state)).await.map_err(Into::into)
-}
-
-#[tauri::command]
-pub(super) async fn query_duplicate_members(query: illutag_core::duplicates::DuplicateMemberQuery, app: tauri::AppHandle) -> Result<illutag_core::duplicates::DuplicateMemberPage, AppError> {
-    off_main(app, move |state| illutag_core::duplicates::query_members(query, &state)).await.map_err(Into::into)
-}
-
-#[tauri::command]
-pub(super) async fn clear_duplicate_cache(app: tauri::AppHandle) -> Result<(), AppError> {
-    off_main(app, |state| illutag_core::duplicates::clear_cache(&state)).await.map_err(Into::into)
-}
-
-#[tauri::command]
-pub(super) async fn query_duplicate_group(query: illutag_core::duplicates::DuplicateGroupQuery, app: tauri::AppHandle) -> Result<Option<illutag_core::duplicates::DuplicateGroup>, AppError> {
-    off_main(app, move |state| illutag_core::duplicates::cache::query_group(query, &state)).await.map_err(Into::into)
-}
-
-#[tauri::command]
-pub(super) async fn prepare_duplicate_action(request: illutag_core::duplicates::DuplicateManagementRequest, app: tauri::AppHandle) -> Result<illutag_core::duplicates::DuplicateActionPreview, AppError> {
-    off_main(app, move |state| illutag_core::duplicates::management::prepare(request, &state)).await.map_err(Into::into)
-}
-
-#[tauri::command]
-pub(super) async fn apply_duplicate_action(request: illutag_core::duplicates::DuplicateApplyRequest, app: tauri::AppHandle) -> Result<illutag_core::jobs::JobRecord, AppError> {
-    let handle = app.clone();
-    off_main(app, move |state| illutag_core::duplicates::management::apply(request, &state, handle)).await.map_err(Into::into)
-}
-
-#[tauri::command]
 pub(super) async fn prepare_recycle_selection(request:illutag_core::library::recycle::RecycleSelectionRequest,app:tauri::AppHandle)->Result<illutag_core::library::recycle::RecycleSelection,AppError>{
     off_main(app,move|s|illutag_core::library::recycle::prepare(request,&s)).await.map_err(Into::into)
 }
@@ -1299,27 +1246,6 @@ pub(super) async fn recycle_operation_status(operation_id:String,app:tauri::AppH
 #[tauri::command]
 pub(super) async fn recycle_operation_results(query:illutag_core::library::recycle::RecycleOperationQuery,app:tauri::AppHandle)->Result<illutag_core::library::recycle::RecycleOperationPage,AppError>{
     off_main(app,move|s|illutag_core::library::recycle::results(query,&s)).await.map_err(Into::into)
-}
-
-#[tauri::command]
-pub(super) async fn duplicate_operation_status(operation_id: String, app: tauri::AppHandle) -> Result<illutag_core::duplicates::DuplicateOperationStatus, AppError> {
-    off_main(app, move |state| illutag_core::duplicates::management::operation_status(&operation_id, &state)).await.map_err(Into::into)
-}
-
-#[tauri::command]
-pub(super) async fn duplicate_operation_results(query: illutag_core::duplicates::DuplicateOperationQuery, app: tauri::AppHandle) -> Result<illutag_core::duplicates::DuplicateOperationPage, AppError> {
-    off_main(app, move |state| illutag_core::duplicates::management::operation_results(query, &state)).await.map_err(Into::into)
-}
-
-#[tauri::command]
-pub(super) async fn undo_duplicate_action(operation_id: String, app: tauri::AppHandle) -> Result<illutag_core::jobs::JobRecord, AppError> {
-    let handle = app.clone();
-    off_main(app, move |state| illutag_core::duplicates::management::undo(operation_id, &state, handle)).await.map_err(Into::into)
-}
-
-#[tauri::command]
-pub(super) async fn clear_duplicate_management_records(confirmed: bool, app: tauri::AppHandle) -> Result<(), AppError> {
-    off_main(app, move |state| illutag_core::duplicates::management::clear_records(confirmed, &state)).await.map_err(Into::into)
 }
 
 pub(super) async fn off_main_write<T, F>(app: tauri::AppHandle, work: F) -> Result<T, String>
