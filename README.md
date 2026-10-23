@@ -1,4 +1,4 @@
-# illuTag 1.13.2
+# illuTag 1.13.3
 
 illuTag 是本地图片画廊与标签管理工具，使用 Vue 3、TypeScript、Tauri 2、Rust、SQLite 和 Python ONNX。图片处理和搜索在本机运行。
 
